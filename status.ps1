@@ -1,42 +1,8 @@
 #Requires -Version 5.1
 # Remote Service Status Checker (Parallel with Logging)
 # Checks Tomcat, Content Server, and Content Server Admin on remote Windows servers
-# v3.2 -- refined HTML UI: no red, monochrome toggle, critical inline, collapsed zones/informant
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  DEVELOPER NOTES — READ BEFORE EDITING                                      ║
-# ╠══════════════════════════════════════════════════════════════════════════════╣
-# ║  HERE-STRING RULES (PowerShell is strict — violations cause parse errors)   ║
-# ║                                                                              ║
-# ║  1. The OPENING delimiter  @"  must be the LAST thing on its line.           ║
-# ║       OK  →  $x = @"                                                        ║
-# ║       BAD →  $x = @"  # comment          (nothing after @")                 ║
-# ║                                                                              ║
-# ║  2. The CLOSING delimiter  "@  must be:                                      ║
-# ║       a) On its OWN line                                                     ║
-# ║       b) At COLUMN 1 — NO leading spaces or tabs                            ║
-# ║       c) Nothing else on that line (no comments, no semicolons)             ║
-# ║                                                                              ║
-# ║       OK  →  "@           (first character on the line)                     ║
-# ║       BAD →      "@       (indented — THIS was the original bug)            ║
-# ║       BAD →  "@ # end     (trailing comment)                                ║
-# ║                                                                              ║
-# ║  3. AVOID complex subexpressions inside here-strings.                        ║
-# ║     Pre-compute values into variables BEFORE the @" block, then             ║
-# ║     reference the variable inside it.                                        ║
-# ║       BAD inside @" ... "@  →  $(if ($x) { 'On' } else { 'Off' })          ║
-# ║       OK  →  $autoRestartLabel = if ($AutoRestartStopped) {'On'} else {'Off'}║
-# ║              then use  $autoRestartLabel  inside the here-string             ║
-# ║                                                                              ║
-# ║  4. When editing the HTML/CSS/JS section near the bottom of this file,      ║
-# ║     make sure you do NOT accidentally indent the closing  "@  line.          ║
-# ║     Most editors auto-indent — double-check after pasting or reformatting.  ║
-# ║                                                                              ║
-# ║  5. Save this file as UTF-8 (with or without BOM). Mixed CRLF/LF line       ║
-# ║     endings can cause here-string parse failures on some PS versions.       ║
-# ║     Normalize with:  (Get-Content .\status.ps1 -Raw) -replace "`r`n","`n"  ║
-# ║                       | Set-Content .\status.ps1 -NoNewline                 ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+# v3.3 -- UI overhaul: no page headers, collapsible zones, zero-padded counts,
+#          critical error summary per server, multi-instance CS grouping
 
 #region Parameters
 param(
@@ -54,10 +20,10 @@ param(
 #region Configuration
 $configFile = Join-Path $PSScriptRoot "servers.txt"
 if (-not (Test-Path $configFile)) {
-    Write-Host "ERROR: Server config file not found: $configFile" -ForegroundColor Yellow
-    Write-Host "Create a servers.txt file in the same directory as this script," -ForegroundColor White
-    Write-Host "with one server FQDN per line. Lines starting with # are comments." -ForegroundColor White
-    Write-Host "Group servers with [ZoneName] section headers." -ForegroundColor White
+    Write-Host "ERROR: Server config file not found: $configFile" -ForegroundColor Red
+    Write-Host "Create a servers.txt file in the same directory as this script," -ForegroundColor Yellow
+    Write-Host "with one server FQDN per line. Lines starting with # are comments." -ForegroundColor Yellow
+    Write-Host "Group servers with [ZoneName] section headers." -ForegroundColor Yellow
     exit 1
 }
 
@@ -81,7 +47,7 @@ foreach ($line in (Get-Content $configFile)) {
 
 $serverCount = ($serverGroups.Values | Measure-Object -Property Count -Sum).Sum
 if ($serverCount -eq 0) {
-    Write-Host "ERROR: No servers found in $configFile" -ForegroundColor Yellow
+    Write-Host "ERROR: No servers found in $configFile" -ForegroundColor Red
     exit 1
 }
 
@@ -122,6 +88,11 @@ function Get-ThresholdTag {
     return ""
 }
 
+function FmtChip {
+    param([string]$Text, [string]$Class)
+    return "<span class='chip $Class'>$Text</span>"
+}
+
 function Send-TeamsAlert {
     param([string]$WebhookUrl, [string]$Title, [string]$Body)
     if (-not $WebhookUrl) { return }
@@ -144,7 +115,7 @@ function Send-TeamsAlert {
         Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $payload `
             -ContentType "application/json" -ErrorAction Stop | Out-Null
     } catch {
-        Write-Log "Teams webhook failed: $_" -Color Yellow
+        Write-Log "Teams webhook failed: $_" -Color Red
     }
 }
 #endregion
@@ -201,8 +172,8 @@ $checkServicesScript = {
         $count = ($info | Select-String "RESTART" | Measure-Object).Count
         if ($count -ne 3) {
             $priorState = if ($count -eq 0) { "Not configured" } else { "$count restart action(s) configured" }
-            $fix        = sc.exe "\\$ScHost" failure $ServiceName reset= 86400 `
-                              actions= restart/60000/restart/60000/restart/60000 2>&1
+            $fix = sc.exe "\\$ScHost" failure $ServiceName reset= 86400 `
+                       actions= restart/60000/restart/60000/restart/60000 2>&1
             if ($LASTEXITCODE -eq 0) {
                 $verify     = sc.exe "\\$ScHost" qfailure $ServiceName 2>&1
                 $finalCount = ($verify | Select-String "RESTART" | Measure-Object).Count
@@ -228,7 +199,7 @@ $checkServicesScript = {
                 Id        = 7034
                 StartTime = (Get-Date).AddDays(-1)
             } -ErrorAction SilentlyContinue | Where-Object { $_.Message -like "*$ServiceName*" }
-            return if ($evts) { $evts.Count } else { 0 }
+            if ($evts) { return $evts.Count } else { return 0 }
         } catch { return "N/A" }
     }
 
@@ -254,9 +225,9 @@ $checkServicesScript = {
 
     function Get-ThresholdTag {
         param([double]$Pct)
-        if ($Pct -ge 90) { return " [CRITICAL]" }
+        if ($Pct -ge 90)     { return " [CRITICAL]" }
         elseif ($Pct -ge 75) { return " [WARN]" }
-        else { return "" }
+        else                 { return "" }
     }
 
     function Invoke-AutoRestart {
@@ -316,26 +287,40 @@ $checkServicesScript = {
         return $results
     }
 
+    function New-DownResult {
+        param([string]$Computer, [string]$Group, [string]$Reason,
+              [System.Collections.Generic.List[string]]$Log)
+        $o = [System.Collections.Generic.List[string]]::new()
+        $o.Add(""); $o.Add("========================================")
+        $o.Add("Zone     : $Group"); $o.Add("Server   : $Computer")
+        $o.Add("  ERROR: $Reason")
+        $o.Add("========================================")
+        return [PSCustomObject]@{
+            ComputerName     = $Computer;  GroupName        = $Group
+            InstanceLabel    = "N/A";      Output           = $o
+            CsvRows          = $null;      OverallStatus    = "DOWN"
+            TomcatVersion    = $null;      EventLines       = [System.Collections.Generic.List[string]]::new()
+            DriveErrors      = [System.Collections.Generic.List[string]]::new()
+            DriveWarnings    = [System.Collections.Generic.List[string]]::new()
+            InformantResults = [ordered]@{}
+            CriticalErrors   = [System.Collections.Generic.List[string]]::new()
+            GcCollector      = "N/A";      GcWarnings       = [System.Collections.Generic.List[string]]::new()
+            GcRecommend      = [System.Collections.Generic.List[string]]::new()
+            MemPct           = 0;          CpuAvg           = 0
+            MemUsedGB        = 0;          MemTotalGB       = 0
+            MemFreeGB        = 0;          DrivesSummary    = ""
+            Uptime           = "N/A";      JobLog           = $Log
+        }
+    }
+
     $instanceResults = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $jobLog = [System.Collections.Generic.List[string]]::new()
-    $scHost = $ComputerName -replace "\..*", ""
+    $jobLog          = [System.Collections.Generic.List[string]]::new()
+    $scHost          = $ComputerName -replace "\..*", ""
 
     $pingOk = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
     if (-not $pingOk) {
-        $out = [System.Collections.Generic.List[string]]::new()
-        $out.Add(""); $out.Add("========================================")
-        $out.Add("Zone     : $GroupName"); $out.Add("Server   : $ComputerName")
-        $out.Add("  ERROR: Host unreachable (no ping response) - skipping.")
-        $out.Add("========================================")
-        $instanceResults.Add([PSCustomObject]@{
-            ComputerName = $ComputerName; GroupName = $GroupName
-            InstanceLabel = "N/A"; Output = $out; CsvRows = $null
-            OverallStatus = "DOWN"; TomcatVersion = $null
-            EventLines = @(); DriveErrors = @(); DriveWarnings = @(); InformantResults = @{}
-            GcCollector = "N/A"; GcWarnings = @(); GcRecommend = @()
-            MemPct = 0; CpuAvg = 0; MemUsedGB = 0; MemTotalGB = 0
-            MemFreeGB = 0; DrivesSummary = ""; Uptime = "N/A"; JobLog = $jobLog
-        })
+        $instanceResults.Add((New-DownResult -Computer $ComputerName -Group $GroupName `
+            -Reason "Host unreachable (no ping response) - skipping." -Log $jobLog))
         return $instanceResults
     }
 
@@ -343,20 +328,8 @@ $checkServicesScript = {
     if ($Credential) { $cimParams["Credential"] = $Credential }
     try { $session = New-CimSession @cimParams }
     catch {
-        $out = [System.Collections.Generic.List[string]]::new()
-        $out.Add(""); $out.Add("========================================")
-        $out.Add("Zone     : $GroupName"); $out.Add("Server   : $ComputerName")
-        $out.Add("  ERROR: Could not open CIM session - $_")
-        $out.Add("========================================")
-        $instanceResults.Add([PSCustomObject]@{
-            ComputerName = $ComputerName; GroupName = $GroupName
-            InstanceLabel = "N/A"; Output = $out; CsvRows = $null
-            OverallStatus = "DOWN"; TomcatVersion = $null
-            EventLines = @(); DriveErrors = @(); DriveWarnings = @(); InformantResults = @{}
-            GcCollector = "N/A"; GcWarnings = @(); GcRecommend = @()
-            MemPct = 0; CpuAvg = 0; MemUsedGB = 0; MemTotalGB = 0
-            MemFreeGB = 0; DrivesSummary = ""; Uptime = "N/A"; JobLog = $jobLog
-        })
+        $instanceResults.Add((New-DownResult -Computer $ComputerName -Group $GroupName `
+            -Reason "Could not open CIM session - $_" -Log $jobLog))
         return $instanceResults
     }
 
@@ -373,14 +346,17 @@ $checkServicesScript = {
     $uptimeStr  = Get-UptimeString -LastBootTime $os.LastBootUpTime
     $recentTag  = if (((Get-Date) - $os.LastBootUpTime).TotalHours -lt 24) { "  [WARN - Recent Reboot]" } else { "" }
 
-    $driveErrors    = [System.Collections.Generic.List[string]]::new()
-    $driveWarnings  = [System.Collections.Generic.List[string]]::new()
+    $driveErrors   = [System.Collections.Generic.List[string]]::new()
+    $driveWarnings = [System.Collections.Generic.List[string]]::new()
+    # Collect critical errors for the server-level summary banner
+    $criticalErrors = [System.Collections.Generic.List[string]]::new()
+
     $drivesSummaryForCsv = ($allDisks | ForEach-Object {
         $t = [math]::Round($_.Size / 1GB, 2)
         $f = [math]::Round($_.FreeSpace / 1GB, 2)
         $u = [math]::Round($t - $f, 2)
         $p = if ($t -gt 0) { [math]::Round(($u / $t) * 100, 1) } else { 0 }
-        if    ($p -ge 90) { $driveErrors.Add(  "$($_.DeviceID) $p% used ($u/$t GB)") }
+        if    ($p -ge 90)  { $driveErrors.Add(  "$($_.DeviceID) $p% used ($u/$t GB)") }
         elseif ($p -ge 75) { $driveWarnings.Add("$($_.DeviceID) $p% used ($u/$t GB)") }
         "$($_.DeviceID) $p% ($u/$t GB)"
     }) -join " | "
@@ -399,6 +375,11 @@ $checkServicesScript = {
         }) -join "`n"
     } else { "    No fixed drives found." }
 
+    # Populate critical errors from drives
+    foreach ($de in $driveErrors) { $criticalErrors.Add("Drive: $de") }
+    if ($memPct -ge 90)  { $criticalErrors.Add("Memory: $memPct% used ($usedMemGB/$totalMemGB GB)") }
+    if ($cpuAvg -ge 90)  { $criticalErrors.Add("CPU: $cpuAvg%") }
+
     $eventLines = [System.Collections.Generic.List[string]]::new()
     try {
         $recentEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
@@ -409,7 +390,7 @@ $checkServicesScript = {
         Where-Object { $_.Message -match "Tomcat|catalina|Content Server" } |
         Select-Object -First $EventLogCount
         foreach ($ev in $recentEvents) {
-            $lvl = switch ($ev.Level) { 1{"CRITICAL"} 2{"ERROR"} 3{"WARN"} default{"INFO"} }
+            $lvl = switch ($ev.Level) { 1 {"CRITICAL"} 2 {"ERROR"} 3 {"WARN"} default {"INFO"} }
             $msg = ($ev.Message -split "`n")[0].Trim()
             if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) + "..." }
             $eventLines.Add("[$lvl] $($ev.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))  $($ev.ProviderName): $msg")
@@ -463,31 +444,21 @@ $checkServicesScript = {
                     if ($jvmDll -and (Test-Path $jvmDll)) {
                         $candidate = Split-Path (Split-Path (Split-Path $jvmDll -Parent) -Parent) -Parent
                         $jrePath   = if (Test-Path (Join-Path $candidate "bin\java.exe")) {
-                                         $candidate
-                                     } else {
-                                         Split-Path $jvmDll -Parent
-                                     }
+                                         $candidate } else { Split-Path $jvmDll -Parent }
                     }
                     if ($regProps.Options) {
                         $optFlat = if ($regProps.Options -is [array]) {
-                            $regProps.Options -join ' '
-                        } else {
-                            [string]$regProps.Options
-                        }
+                            $regProps.Options -join ' ' } else { [string]$regProps.Options }
                         if ($optFlat -match '(?:^|\s)-Xms(\d+)([kmgKMG])') {
                             $val = [long]$Matches[1]
                             $heapInitMB = switch ($Matches[2].ToUpper()) {
-                                'K' { [math]::Round($val / 1KB, 0) }
-                                'M' { $val }
-                                'G' { $val * 1024 }
+                                'K' { [math]::Round($val / 1KB, 0) } 'M' { $val } 'G' { $val * 1024 }
                             }
                         }
                         if ($optFlat -match '(?:^|\s)-Xmx(\d+)([kmgKMG])') {
                             $val = [long]$Matches[1]
                             $heapMaxMB = switch ($Matches[2].ToUpper()) {
-                                'K' { [math]::Round($val / 1KB, 0) }
-                                'M' { $val }
-                                'G' { $val * 1024 }
+                                'K' { [math]::Round($val / 1KB, 0) } 'M' { $val } 'G' { $val * 1024 }
                             }
                         }
                     }
@@ -542,12 +513,12 @@ $checkServicesScript = {
                     }
                 }
 
-                $gcCollector = "Unknown"
-                $gcFlags     = @{}
-                $gcWarnings  = [System.Collections.Generic.List[string]]::new()
-                $gcRecommend = [System.Collections.Generic.List[string]]::new()
-                $flagLines   = @()
-                $jcmdPath    = $null
+                $gcCollector     = "Unknown"
+                $gcFlags         = @{}
+                $gcWarningsList  = [System.Collections.Generic.List[string]]::new()
+                $gcRecommendList = [System.Collections.Generic.List[string]]::new()
+                $flagLines       = @()
+                $jcmdPath        = $null
 
                 if ($jrePath -and $jrePath -ne "N/A") {
                     $c = Join-Path $jrePath "bin\jcmd.exe"
@@ -580,60 +551,57 @@ $checkServicesScript = {
 
                 $totalRamMB = $null
                 try {
-                    $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
-                    if ($cs) { $totalRamMB = [math]::Round($cs.TotalPhysicalMemory / 1MB, 0) }
+                    $csInfo = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
+                    if ($csInfo) { $totalRamMB = [math]::Round($csInfo.TotalPhysicalMemory / 1MB, 0) }
                 } catch { }
 
                 if ($gcCollector -in @("CMS","SerialGC","ParallelGC")) {
-                    $gcWarnings.Add("Active GC collector is $gcCollector -- not recommended for Content Server")
-                    $gcRecommend.Add("Switch to G1GC: add -XX:+UseG1GC and remove -XX:+Use$gcCollector")
+                    $gcWarningsList.Add("Active GC collector is $gcCollector -- not recommended for Content Server")
+                    $gcRecommendList.Add("Switch to G1GC: add -XX:+UseG1GC and remove -XX:+Use$gcCollector")
                 }
                 if ($gcCollector -in @("G1GC","G1GC (default)")) {
                     if (-not $gcFlags.ContainsKey("MaxGCPauseMillis")) {
-                        $gcRecommend.Add("Set -XX:MaxGCPauseMillis=200 (G1GC pause target; default is 250ms)")
+                        $gcRecommendList.Add("Set -XX:MaxGCPauseMillis=200 (G1GC pause target; default is 250ms)")
                     }
                     $regionSize = $gcFlags["G1HeapRegionSize"]
                     if (-not $regionSize -or [int]$regionSize -lt 8388608) {
-                        $gcRecommend.Add("Set -XX:G1HeapRegionSize=16m (Content Server creates large objects; small regions cause humongous allocations)")
+                        $gcRecommendList.Add("Set -XX:G1HeapRegionSize=16m (Content Server creates large objects; small regions cause humongous allocations)")
                     }
                     $ihop = $gcFlags["InitiatingHeapOccupancyPercent"]
                     if (-not $ihop -or [int]$ihop -gt 45) {
-                        $gcRecommend.Add("Set -XX:InitiatingHeapOccupancyPercent=35 (triggers concurrent marking earlier, avoids full GC)")
+                        $gcRecommendList.Add("Set -XX:InitiatingHeapOccupancyPercent=35 (triggers concurrent marking earlier, avoids full GC)")
                     }
                 }
                 if ($heapInitMB -and $heapMaxMB -and $heapInitMB -ne $heapMaxMB) {
-                    $gcWarnings.Add("Xms ($heapInitMB MB) != Xmx ($heapMaxMB MB) -- JVM will resize heap at runtime")
-                    $gcRecommend.Add("Set Xms = Xmx to pre-allocate the full heap and avoid resize pauses")
+                    $gcWarningsList.Add("Xms ($heapInitMB MB) != Xmx ($heapMaxMB MB) -- JVM will resize heap at runtime")
+                    $gcRecommendList.Add("Set Xms = Xmx to pre-allocate the full heap and avoid resize pauses")
                 }
                 if ($heapMaxMB -and $totalRamMB) {
                     $heapPct = [math]::Round(($heapMaxMB / $totalRamMB) * 100, 0)
                     if ($heapPct -gt 55) {
-                        $gcWarnings.Add("Xmx ($heapMaxMB MB) is $heapPct% of total RAM ($totalRamMB MB)")
-                        $gcRecommend.Add("Consider reducing Xmx to ~$([math]::Round($totalRamMB * 0.45,0)) MB (~45% of RAM)")
+                        $gcWarningsList.Add("Xmx ($heapMaxMB MB) is $heapPct% of total RAM ($totalRamMB MB)")
+                        $gcRecommendList.Add("Consider reducing Xmx to ~$([math]::Round($totalRamMB * 0.45,0)) MB (~45% of RAM)")
                     } elseif ($heapMaxMB -lt 1024) {
-                        $gcWarnings.Add("Xmx is only $heapMaxMB MB -- likely undersized for Content Server")
-                        $gcRecommend.Add("Increase Xmx to at least 2048 MB for a production Content Server instance")
+                        $gcWarningsList.Add("Xmx is only $heapMaxMB MB -- likely undersized for Content Server")
+                        $gcRecommendList.Add("Increase Xmx to at least 2048 MB for a production Content Server instance")
                     }
                 }
                 $hasGcLog = $gcFlags.ContainsKey("Xlog") -or ($flagLines | Select-String "Xlog:gc")
                 if (-not $hasGcLog) {
-                    $gcRecommend.Add("Enable GC logging: -Xlog:gc*:file=C:\logs\gc.log:time,uptime:filecount=5,filesize=20m")
+                    $gcRecommendList.Add("Enable GC logging: -Xlog:gc*:file=C:\logs\gc.log:time,uptime:filecount=5,filesize=20m")
                 }
                 if ($gcFlags["HeapDumpOnOutOfMemoryError"] -ne $true) {
-                    $gcRecommend.Add("Add -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=C:\logs\tomcat-heap.hprof")
+                    $gcRecommendList.Add("Add -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=C:\logs\tomcat-heap.hprof")
                 }
                 if (-not $gcFlags.ContainsKey("MaxMetaspaceSize")) {
-                    $gcRecommend.Add("Set -XX:MaxMetaspaceSize=256m to prevent unbounded metaspace growth")
+                    $gcRecommendList.Add("Set -XX:MaxMetaspaceSize=256m to prevent unbounded metaspace growth")
                 }
 
                 return [PSCustomObject]@{
-                    Version     = $tomcatVersion
-                    JrePath     = $jrePath
-                    HeapInitMB  = $heapInitMB
-                    HeapMaxMB   = $heapMaxMB
-                    GcCollector = $gcCollector
-                    GcWarnings  = $gcWarnings
-                    GcRecommend = $gcRecommend
+                    Version     = $tomcatVersion; JrePath     = $jrePath
+                    HeapInitMB  = $heapInitMB;    HeapMaxMB   = $heapMaxMB
+                    GcCollector = $gcCollector;   GcWarnings  = $gcWarningsList
+                    GcRecommend = $gcRecommendList
                 }
             }
         }
@@ -665,12 +633,12 @@ $checkServicesScript = {
     $overallStatus = "OK"
     $allInformant  = [ordered]@{}
 
-    if ($driveErrors.Count -gt 0)   { $overallStatus = "CRITICAL" }
+    if ($driveErrors.Count  -gt 0)  { $overallStatus = "CRITICAL" }
     if ($memPct -ge 90)             { $overallStatus = "CRITICAL" }
     if ($cpuAvg -ge 90)             { if ($overallStatus -ne "CRITICAL") { $overallStatus = "WARN" } }
-    if ($memPct -ge 75)             { if ($overallStatus -eq "OK") { $overallStatus = "WARN" } }
-    if ($driveWarnings.Count -gt 0) { if ($overallStatus -eq "OK") { $overallStatus = "WARN" } }
-    if ($recentTag -ne "")          { if ($overallStatus -eq "OK") { $overallStatus = "WARN" } }
+    if ($memPct -ge 75)             { if ($overallStatus -eq "OK")       { $overallStatus = "WARN" } }
+    if ($driveWarnings.Count -gt 0) { if ($overallStatus -eq "OK")       { $overallStatus = "WARN" } }
+    if ($recentTag -ne "")          { if ($overallStatus -eq "OK")       { $overallStatus = "WARN" } }
 
     $out = [System.Collections.Generic.List[string]]::new()
     $out.Add(""); $out.Add("========================================")
@@ -680,8 +648,8 @@ $checkServicesScript = {
     $out.Add("  CPU          : $(Get-VisualBar -Pct $cpuAvg) $cpuAvg%$(Get-ThresholdTag -Pct $cpuAvg)")
     $out.Add("  Drives:")
     foreach ($dline in ($driveSummary -split "`n")) { $out.Add($dline) }
-    if ($driveErrors.Count -gt 0) { $out.Add("  [ERROR] Drive critical: " + ($driveErrors -join "; ")) }
-    if ($driveWarnings.Count -gt 0) { $out.Add("  [WARN] Drive warning: " + ($driveWarnings -join "; ")) }
+    if ($driveErrors.Count   -gt 0) { $out.Add("  [ERROR] Drive critical: " + ($driveErrors   -join "; ")) }
+    if ($driveWarnings.Count -gt 0) { $out.Add("  [WARN]  Drive warning:  " + ($driveWarnings -join "; ")) }
     $out.Add("========================================")
 
     $out.Add(""); $out.Add("Tomcat Service:")
@@ -700,7 +668,10 @@ $checkServicesScript = {
         if ($tRestartResult.LogNote) { $jobLog.Add("[LOG] $($tRestartResult.LogNote)") }
         $tRestart      = $tRestartResult.Display
         $tRestartCount = Get-ServiceRestartCount -ServiceName $tomcatSvc.Name -Computer $ComputerName
-        if ($tomcatSvc.State -ne "Running") { $overallStatus = "DOWN" }
+        if ($tomcatSvc.State -ne "Running") {
+            $overallStatus = "DOWN"
+            $criticalErrors.Add("Tomcat: STOPPED")
+        }
 
         $out.Add("  Name:               $($tomcatSvc.Name)")
         $out.Add("  Status:             $tState")
@@ -755,7 +726,10 @@ $checkServicesScript = {
             if ($csRestartResult.LogNote) { $jobLog.Add("[LOG] $($csRestartResult.LogNote)") }
             $csRestart      = $csRestartResult.Display
             $csRestartCount = Get-ServiceRestartCount -ServiceName $cs.Name -Computer $ComputerName
-            if ($cs.State -ne "Running") { $overallStatus = "DOWN" }
+            if ($cs.State -ne "Running") {
+                $overallStatus = "DOWN"
+                $criticalErrors.Add("CS $($cs.Name): STOPPED")
+            }
 
             $out.Add(""); $out.Add("  Instance:           $($cs.Name)")
             $out.Add("  Status:             $csState")
@@ -780,6 +754,7 @@ $checkServicesScript = {
                     if ($ir.Error) {
                         $out.Add("    $comp : [ERROR] - $($ir.Error) $msLabel")
                         if ($overallStatus -eq "OK") { $overallStatus = "WARN" }
+                        $criticalErrors.Add("Informant $($cs.Name)/$comp : ERROR - $($ir.Error)")
                         $csInformant[$comp] = [PSCustomObject]@{
                             Status = "ERROR"; Detail = $ir.Error; Ms = $ir.Ms; Slow = ($ir.Ms -ge $InformantWarnMs)
                         }
@@ -788,7 +763,10 @@ $checkServicesScript = {
                                   elseif ($ir.Content -match "=\s*failure") { "FAILURE" }
                                   else { "OTHER" }
                         $detail = if ($tag -eq "OTHER") { $ir.Content } else { "" }
-                        if ($tag -eq "FAILURE") { $overallStatus = "CRITICAL" }
+                        if ($tag -eq "FAILURE") {
+                            $overallStatus = "CRITICAL"
+                            $criticalErrors.Add("Informant $($cs.Name)/$comp : FAILURE")
+                        }
                         $out.Add("    $comp : [$tag] $msLabel$slowTag")
                         $csInformant[$comp] = [PSCustomObject]@{
                             Status = $tag; Detail = $detail; Ms = $ir.Ms; Slow = ($ir.Ms -ge $InformantWarnMs)
@@ -839,7 +817,10 @@ $checkServicesScript = {
         if ($caRestartResult.LogNote) { $jobLog.Add("[LOG] $($caRestartResult.LogNote)") }
         $caRestart      = $caRestartResult.Display
         $caRestartCount = Get-ServiceRestartCount -ServiceName $csAdmin.Name -Computer $ComputerName
-        if ($csAdmin.State -ne "Running") { $overallStatus = "DOWN" }
+        if ($csAdmin.State -ne "Running") {
+            $overallStatus = "DOWN"
+            $criticalErrors.Add("CS Admin: STOPPED")
+        }
 
         $out.Add("  Name:               $($csAdmin.Name)")
         $out.Add("  Status:             $caState")
@@ -880,15 +861,16 @@ $checkServicesScript = {
     $instanceResults.Add([PSCustomObject]@{
         ComputerName     = $ComputerName;  GroupName        = $GroupName
         InstanceLabel    = $ComputerName;  Output           = $out
-        CsvRows          = $csvRows;       OverallStatus     = $overallStatus
-        TomcatVersion    = $tomcatVersion; EventLines        = $eventLines
-        DriveErrors      = $driveErrors;   DriveWarnings     = $driveWarnings
+        CsvRows          = $csvRows;       OverallStatus    = $overallStatus
+        TomcatVersion    = $tomcatVersion; EventLines       = $eventLines
+        DriveErrors      = $driveErrors;   DriveWarnings    = $driveWarnings
+        CriticalErrors   = $criticalErrors
         InformantResults = $allInformant
-        GcCollector      = $gcCollector;   GcWarnings        = $gcWarnings
-        GcRecommend      = $gcRecommend;   MemPct            = $memPct
-        CpuAvg           = $cpuAvg;        MemUsedGB         = $usedMemGB
-        MemTotalGB       = $totalMemGB;    MemFreeGB         = $freeMemGB
-        DrivesSummary    = $drivesSummaryForCsv; Uptime      = $uptimeStr
+        GcCollector      = $gcCollector;   GcWarnings       = $gcWarnings
+        GcRecommend      = $gcRecommend;   MemPct           = $memPct
+        CpuAvg           = $cpuAvg;        MemUsedGB        = $usedMemGB
+        MemTotalGB       = $totalMemGB;    MemFreeGB        = $freeMemGB
+        DrivesSummary    = $drivesSummaryForCsv; Uptime     = $uptimeStr
         JobLog           = $jobLog
     })
     return $instanceResults
@@ -899,30 +881,29 @@ $checkServicesScript = {
 $Credential = $null
 
 $consoleAvailable = $false
-try {
-    $null = [System.Console]::KeyAvailable
-    $consoleAvailable = $true
-} catch { }
+try { $null = [System.Console]::KeyAvailable; $consoleAvailable = $true } catch { }
 
 if ($consoleAvailable) {
-    try { while ([System.Console]::KeyAvailable) { [System.Console]::ReadKey($true) | Out-Null } } catch { }
+    $keepDraining = $true
+    while ($keepDraining) {
+        $avail = $false
+        try { $avail = [System.Console]::KeyAvailable } catch { $keepDraining = $false; break }
+        if ($avail) { try { [System.Console]::ReadKey($true) | Out-Null } catch { } } else { break }
+    }
     Write-Host "Use alternate credentials? (y/n)  [auto-skipping in 10 seconds]" -ForegroundColor Cyan
     $useCreds = ""; $deadline = (Get-Date).AddSeconds(10)
     while ((Get-Date) -lt $deadline) {
         $keyAvail = $false
         try { $keyAvail = [System.Console]::KeyAvailable } catch { break }
         if ($keyAvail) {
-            $key      = [System.Console]::ReadKey($true)
-            $useCreds = $key.KeyChar.ToString().ToLower()
-            Write-Host $useCreds; break
+            try { $key = [System.Console]::ReadKey($true); $useCreds = $key.KeyChar.ToString().ToLower(); Write-Host $useCreds } catch { }
+            break
         }
         Start-Sleep -Milliseconds 100
     }
-    if ($useCreds -eq "y") {
-        $Credential = Get-Credential -Message "Enter credentials for remote servers"
-    }
+    if ($useCreds -eq "y") { $Credential = Get-Credential -Message "Enter credentials for remote servers" }
 } else {
-    Write-Host "Non-interactive session detected - skipping credential prompt, using default credentials." -ForegroundColor Gray
+    Write-Host "Non-interactive session detected - skipping credential prompt." -ForegroundColor Gray
 }
 
 $startTime = Get-Date
@@ -934,9 +915,7 @@ Write-Log ""
 $jobs = [System.Collections.Generic.List[hashtable]]::new()
 foreach ($group in $serverGroups.Keys) {
     foreach ($server in $serverGroups[$group]) {
-        while ((Get-Job -State Running).Count -ge $MaxParallelJobs) {
-            Start-Sleep -Milliseconds 200
-        }
+        while ((Get-Job -State Running).Count -ge $MaxParallelJobs) { Start-Sleep -Milliseconds 200 }
         $j = Start-Job -ScriptBlock $checkServicesScript `
                  -ArgumentList $server, $group, $Credential, $webTimeoutSec, $InformantWarnMs,
                                $eventLogCount, $portCheckTimeout, ($AutoRestartStopped.IsPresent)
@@ -950,7 +929,7 @@ Write-Log "Checking $serverCount server(s) in parallel (max $MaxParallelJobs con
 foreach ($entry in $jobs) {
     $finished = $entry.Job | Wait-Job -Timeout $jobTimeoutSec
     if (-not $finished) {
-        Write-Log "TIMEOUT: [$($entry.Group)] $($entry.Server) - skipping." -Color Yellow
+        Write-Log "TIMEOUT: [$($entry.Group)] $($entry.Server) - skipping." -Color Red
         Stop-Job  $entry.Job
         Remove-Job $entry.Job -Force
         $entry.Job = $null
@@ -967,9 +946,7 @@ foreach ($entry in $jobs) {
 }
 
 foreach ($result in $results) {
-    if ($result.JobLog -and $result.JobLog.Count -gt 0) {
-        Add-Content -Path $logFile -Value $result.JobLog
-    }
+    if ($result.JobLog -and $result.JobLog.Count -gt 0) { Add-Content -Path $logFile -Value $result.JobLog }
 }
 
 $prevData = @{}
@@ -978,9 +955,7 @@ $prevCsvs = Get-ChildItem -Path $PSScriptRoot -Filter "ServiceCheck_*.csv" -Erro
             Sort-Object LastWriteTime -Descending
 if ($prevCsvs) {
     $prevRows = Import-Csv -Path $prevCsvs[0].FullName -ErrorAction SilentlyContinue
-    foreach ($row in $prevRows) {
-        $prevData["$($row.Server)|$($row.ServiceName)"] = $row
-    }
+    foreach ($row in $prevRows) { $prevData["$($row.Server)|$($row.ServiceName)"] = $row }
     Write-Log "Comparing against previous run: $($prevCsvs[0].Name)" -Color Gray
 }
 
@@ -990,20 +965,16 @@ $allVersions = @{}
 
 foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
     $grp = $result.GroupName
-    if (-not $zoneSummary.Contains($grp)) {
-        $zoneSummary[$grp] = @{ OK = 0; WARN = 0; DOWN = 0; CRITICAL = 0 }
-    }
+    if (-not $zoneSummary.Contains($grp)) { $zoneSummary[$grp] = @{ OK = 0; WARN = 0; DOWN = 0; CRITICAL = 0 } }
     $zoneSummary[$grp][$result.OverallStatus]++
 
-    if ($result.TomcatVersion -and
-        $result.TomcatVersion -notin @("N/A","Unknown","Unable to retrieve")) {
+    if ($result.TomcatVersion -and $result.TomcatVersion -notin @("N/A","Unknown","Unable to retrieve")) {
         if (-not $allVersions.Contains($grp)) { $allVersions[$grp] = @{} }
         $allVersions[$grp][$result.ComputerName] = $result.TomcatVersion
     }
 
     if ($grp -ne $prevGroup) {
-        Write-Log ""
-        Write-Log "########################################" -Color Magenta
+        Write-Log ""; Write-Log "########################################" -Color Magenta
         Write-Log "# Zone: $grp" -Color Magenta
         Write-Log "########################################" -Color Magenta
         $prevGroup = $grp
@@ -1015,9 +986,7 @@ foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
             $key  = "$($row.Server)|$($row.ServiceName)"
             $prev = $prevData[$key]
             if ($prev) {
-                if ($prev.Status -ne $row.Status) {
-                    $deltaDetails.Add("$($row.ServiceName): Status $($prev.Status) -> $($row.Status)")
-                }
+                if ($prev.Status -ne $row.Status) { $deltaDetails.Add("$($row.ServiceName): Status $($prev.Status) -> $($row.Status)") }
                 if ($prev.Version -and $row.Version -and $prev.Version -ne $row.Version) {
                     $deltaDetails.Add("$($row.ServiceName): Version $($prev.Version) -> $($row.Version)")
                 }
@@ -1027,10 +996,7 @@ foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
     $hasDelta = $deltaDetails.Count -gt 0
     $isClean  = ($result.OverallStatus -eq "OK") -and (-not $hasDelta)
 
-    if ($QuietOK -and $isClean) {
-        Write-Log "  $($result.ComputerName) : OK" -Color Green
-        continue
-    }
+    if ($QuietOK -and $isClean) { Write-Log "  $($result.ComputerName) : OK" -Color Green; continue }
 
     foreach ($line in $result.Output) {
         $color = "White"
@@ -1038,8 +1004,9 @@ foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
         elseif ($line -match "Zone     :")                                                                { $color = "Magenta" }
         elseif ($line -match "Recent Reboot")                                                             { $color = "Yellow"  }
         elseif ($line -match "Tomcat Service:|Content Server Service|Informant Health|System Resources") { $color = "Yellow"  }
+        elseif ($line -match "^\[DRIVE_CRITICAL\]")                                                      { $color = "Red"     }
         elseif ($line -match "\[RUNNING\]|\[SUCCESS\]")                                                  { $color = "Green"   }
-        elseif ($line -match "\[STOPPED\]|ERROR:|NOT FOUND|\[FAILURE\]|\[ERROR\]|\[CRITICAL\]")         { $color = "Yellow"  }
+        elseif ($line -match "\[STOPPED\]|ERROR:|NOT FOUND|\[FAILURE\]|\[ERROR\]|\[CRITICAL\]")         { $color = "Red"     }
         elseif ($line -match "\[WARN\]|\[OTHER\]|\[SLOW\]")                                              { $color = "Yellow"  }
         elseif ($line -match "\[AUTO-RESTART\]")                                                         { $color = "Cyan"    }
         elseif ($line -match "Working Set:|Auto-Restarts:|CPU|Memory|Drive")                             { $color = "Cyan"    }
@@ -1054,14 +1021,11 @@ foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
     }
 }
 
-Write-Log ""
-Write-Log "======== Zone Rollup ========" -Color Cyan
+Write-Log ""; Write-Log "======== Zone Rollup ========" -Color Cyan
 foreach ($grp in $zoneSummary.Keys) {
     $s   = $zoneSummary[$grp]
     $tot = $s.OK + $s.WARN + $s.DOWN + $s.CRITICAL
-    $col = if ($s.DOWN -gt 0 -or $s.CRITICAL -gt 0) { "Yellow" }
-           elseif ($s.WARN -gt 0) { "Yellow" }
-           else { "Green" }
+    $col = if ($s.DOWN -gt 0 -or $s.CRITICAL -gt 0) { "Red" } elseif ($s.WARN -gt 0) { "Yellow" } else { "Green" }
     Write-Log ("  {0,-40} : {1} OK, {2} WARN, {3} CRITICAL, {4} DOWN  (of {5})" -f `
         $grp, $s.OK, $s.WARN, $s.CRITICAL, $s.DOWN, $tot) -Color $col
 
@@ -1086,7 +1050,7 @@ if ($allCsvRows) {
     Write-Log "No CSV data to export." -Color Yellow
 }
 
-# ── HTML ───────────────────────────────────────────────────────────────────────
+#region HTML Generation
 $htmlRows = $allCsvRows | Sort-Object Zone, Server, ServiceType
 $htmlBody = ""
 
@@ -1101,6 +1065,10 @@ $htmlRows | Group-Object Zone | ForEach-Object {
     $zoneWarn   = ($zoneRows | Where-Object { $_.OverallStatus -eq "WARN"     }).Count
     $zoneCrit   = ($zoneRows | Where-Object { $_.OverallStatus -eq "CRITICAL" }).Count
     $zoneDown   = ($zoneRows | Where-Object { $_.OverallStatus -eq "DOWN"     }).Count
+
+    # Zero-pad counts in zone pill
+    $pillCounts = "$zoneOK OK / $zoneWarn W / $zoneCrit C / $('{0:D2}' -f $zoneDown) D"
+
     $serverHtml = ""
 
     $zoneRows | Group-Object Server | ForEach-Object {
@@ -1112,235 +1080,215 @@ $htmlRows | Group-Object Zone | ForEach-Object {
         $serverId     = $zoneId + "_" + ($serverName -replace '[^a-zA-Z0-9]', '_')
         $serverResult = $results | Where-Object { $_.ComputerName -eq $serverName } | Select-Object -First 1
 
+        # ── Critical error summary banner (shown inside collapsed server row) ──
+        $critBanner = ""
+        if ($serverResult -and $serverResult.CriticalErrors -and $serverResult.CriticalErrors.Count -gt 0) {
+            $critItems = ($serverResult.CriticalErrors | ForEach-Object {
+                "<span class='crit-item'>&#9888; $(HtmlEncode $_)</span>"
+            }) -join ""
+            $critBanner = "<div class='crit-banner'>$critItems</div>"
+        }
+
+        # ── Server label: zone / instances / hostname ──
         $csInstanceNames = ($serverRows |
-                            Where-Object { $_.ServiceType -eq "ContentServer" } |
-                            ForEach-Object { HtmlEncode $_.ServiceName }) -join ", "
-        $instSpan = if ($csInstanceNames) { "<span class='srv-inst'>$csInstanceNames</span><span class='srv-sep'>/</span>" } else { "" }
+            Where-Object { $_.ServiceType -eq "ContentServer" } |
+            ForEach-Object { HtmlEncode $_.ServiceName } |
+            Select-Object -Unique) -join " &bull; "
+        $instSpan = if ($csInstanceNames) {
+            "<span class='srv-inst'>$csInstanceNames</span><span class='srv-sep'>/</span>"
+        } else { "" }
         $serverHeaderLabel =
             "<span class='srv-zone'>$(HtmlEncode $zoneName)</span>" +
-            "<span class='srv-sep'>/</span>" +
-            $instSpan +
+            "<span class='srv-sep'>/</span>" + $instSpan +
             "<span class='srv-name'>$(HtmlEncode $serverName)</span>"
 
-        $instanceHtml = ""
-        $csRows     = $serverRows | Where-Object { $_.ServiceType -eq "ContentServer" }
+        # ── Group rows by type ────────────────────────────────────────────────
+        $csRows     = @($serverRows | Where-Object { $_.ServiceType -eq "ContentServer" })
         $tomcatRow  = $serverRows | Where-Object { $_.ServiceType -eq "Tomcat" }             | Select-Object -First 1
         $csAdminRow = $serverRows | Where-Object { $_.ServiceType -eq "ContentServerAdmin" } | Select-Object -First 1
 
-        $csRows | ForEach-Object {
-            $primary  = $_
-            $instName = $primary.ServiceName
-            $sc       = switch ($primary.OverallStatus) {
-                "OK"{"ok"} "WARN"{"warn"} "CRITICAL"{"critical"} "DOWN"{"down"} default {""}
+        # ── Shared server-level detail cells (rendered once, above CS tabs) ──
+        $sharedCells = ""
+        if ($serverResult) {
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>Server Uptime</div><div class='d-value'>$(HtmlEncode $serverResult.Uptime)</div></div>"
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>Memory</div><div class='d-value'>$($serverResult.MemUsedGB) GB / $($serverResult.MemTotalGB) GB ($($serverResult.MemPct)%)</div></div>"
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>CPU (avg)</div><div class='d-value'>$($serverResult.CpuAvg)%</div></div>"
+            $sharedCells += "<div class='detail-cell full-width'><div class='d-label'>Drives</div><div class='d-value'>$(HtmlEncode $serverResult.DrivesSummary)</div></div>"
+            foreach ($de in $serverResult.DriveErrors) {
+                $sharedCells += "<div class='detail-cell critical-cell full-width'><div class='d-label'>&#9888; Drive Critical</div><div class='d-value'>$(HtmlEncode $de)</div></div>"
             }
-            $instId = $serverId + "_" + ($instName -replace '[^a-zA-Z0-9]', '_')
-            $detId  = $instId + "_det"
-            $infId  = $instId + "_inf"
-
-            function fmtChip { param($t,$c) "<span class='chip $c'>$t</span>" }
-            function fmtVal  {
-                param([string]$v)
-                $skip = @("","N/A","n/a","null","none","0","unknown")
-                if ($skip -contains $v.Trim()) { return $null }
-                return $v
+            foreach ($dw in $serverResult.DriveWarnings) {
+                $sharedCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>Drive Warning</div><div class='d-value'>$(HtmlEncode $dw)</div></div>"
             }
-
-            $statusChip  = if ($primary.Status -eq "Running") { fmtChip "RUNNING" "running" }
-                           else { fmtChip "STOPPED" "stopped" }
-            $overallChip = switch ($primary.OverallStatus) {
-                "OK"       { fmtChip "OK"       "ok"       }
-                "WARN"     { fmtChip "WARN"      "warn"     }
-                "CRITICAL" { fmtChip "CRITICAL"  "critical" }
-                "DOWN"     { fmtChip "DOWN"       "down"    }
-                default    { fmtChip (HtmlEncode $primary.OverallStatus) "na" }
-            }
-
-            $cpuChipClass = if ([double]$primary.CpuPct -ge 90) {"critical"} elseif ([double]$primary.CpuPct -ge 75) {"warn"} else {"ok"}
-            $memChipClass = if ([double]$primary.MemPct -ge 90) {"critical"} elseif ([double]$primary.MemPct -ge 75) {"warn"} else {"ok"}
-
-            # ── Inline critical alerts shown on main row ────────────────────────
-            $inlineAlerts = ""
-            if ($serverResult) {
-                foreach ($de in $serverResult.DriveErrors) {
-                    $inlineAlerts += "<span class='inline-alert'>&#9632; Drive: $(HtmlEncode $de)</span>"
-                }
-            }
+        }
+        if ($tomcatRow) {
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>Tomcat Service</div><div class='d-value'>$(HtmlEncode $tomcatRow.ServiceName) [$(HtmlEncode $tomcatRow.Status)]</div></div>"
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>Tomcat Version</div><div class='d-value'>$(HtmlEncode $tomcatRow.Version)</div></div>"
+            $sharedCells += "<div class='detail-cell full-width'><div class='d-label'>JRE Path</div><div class='d-value'>$(HtmlEncode $tomcatRow.JrePath)</div></div>"
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>Heap Xms</div><div class='d-value'>$(if($tomcatRow.HeapInitMB){"$($tomcatRow.HeapInitMB) MB"}else{"N/A"})</div></div>"
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>Heap Xmx</div><div class='d-value'>$(if($tomcatRow.HeapMaxMB){"$($tomcatRow.HeapMaxMB) MB"}else{"N/A"})</div></div>"
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>Working Set</div><div class='d-value'>$(HtmlEncode $tomcatRow.WorkingSetMB)</div></div>"
+            $gcCls = if ($serverResult -and $serverResult.GcWarnings -and $serverResult.GcWarnings.Count -gt 0) { "warn-cell" } else { "" }
+            $sharedCells += "<div class='detail-cell $gcCls'><div class='d-label'>GC Collector</div><div class='d-value'>$(HtmlEncode $tomcatRow.GcCollector)</div></div>"
             if ($serverResult -and $serverResult.GcWarnings) {
                 foreach ($gw in $serverResult.GcWarnings) {
-                    $inlineAlerts += "<span class='inline-alert'>&#9632; GC: $(HtmlEncode $gw)</span>"
+                    $sharedCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>GC Warning</div><div class='d-value'>$(HtmlEncode $gw)</div></div>"
                 }
             }
-            if ($serverResult -and $serverResult.EventLines -and $serverResult.EventLines.Count -gt 0) {
-                $inlineAlerts += "<span class='inline-alert'>&#9632; $($serverResult.EventLines.Count) event log issue(s) in last 24h</span>"
+            if ($serverResult -and $serverResult.GcRecommend -and $serverResult.GcRecommend.Count -gt 0) {
+                $recHtml = "<ol style='margin:4px 0 0 16px;padding:0'>"
+                foreach ($gr in $serverResult.GcRecommend) { $recHtml += "<li style='margin-bottom:4px'>$(HtmlEncode $gr)</li>" }
+                $recHtml += "</ol>"
+                $sharedCells += "<div class='detail-cell full-width' style='background:#0d1320;border-left:3px solid #1f6feb'>" +
+                                "<div class='d-label' style='color:#79c0ff'>GC Recommendations</div>" +
+                                "<div class='d-value' style='color:#c9d1d9;font-family:inherit'>$recHtml</div></div>"
             }
-            # Stopped informant checks
-            if ($serverResult -and $serverResult.InformantResults -and $serverResult.InformantResults.Contains($instName)) {
-                $failedComps = ($serverResult.InformantResults[$instName].Keys | Where-Object {
-                    $serverResult.InformantResults[$instName][$_].Status -notin @("SUCCESS")
-                })
-                foreach ($fc in $failedComps) {
-                    $fs = $serverResult.InformantResults[$instName][$fc].Status
-                    $inlineAlerts += "<span class='inline-alert'>&#9632; Informant/$fc: $fs</span>"
-                }
+        }
+        if ($csAdminRow) {
+            $sharedCells += "<div class='detail-cell'><div class='d-label'>CS Admin</div><div class='d-value'>$(HtmlEncode $csAdminRow.ServiceName) [$(HtmlEncode $csAdminRow.Status)]</div></div>"
+        }
+        if ($serverResult -and $serverResult.EventLines -and $serverResult.EventLines.Count -gt 0) {
+            $evText = ($serverResult.EventLines | ForEach-Object { HtmlEncode $_ }) -join "<br>"
+            $sharedCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>Event Log (24h)</div><div class='d-value'>$evText</div></div>"
+        }
+        foreach ($row in $serverRows) {
+            $key  = "$($row.Server)|$($row.ServiceName)"
+            $prev = $prevData[$key]
+            if ($prev -and ($prev.Status -ne $row.Status -or
+                ($prev.Version -and $row.Version -and $prev.Version -ne $row.Version))) {
+                $chg  = if ($prev.Status -ne $row.Status) { "Status: $(HtmlEncode $prev.Status) &rarr; $(HtmlEncode $row.Status)" } else { "" }
+                $chgV = if ($prev.Version -and $row.Version -and $prev.Version -ne $row.Version) {
+                            " Version: $(HtmlEncode $prev.Version) &rarr; $(HtmlEncode $row.Version)" } else { "" }
+                $sharedCells += "<div class='detail-cell changed-cell full-width'><div class='d-label'>Changed</div><div class='d-value'>$(HtmlEncode $row.ServiceName): $chg$chgV</div></div>"
+            }
+        }
+
+        # ── Per-CS-instance tabs ──────────────────────────────────────────────
+        $tabHeaders = ""
+        $tabPanels  = ""
+        $firstTab   = $true
+
+        foreach ($primary in $csRows) {
+            $instName  = $primary.ServiceName
+            $instSafeId = $serverId + "_" + ($instName -replace '[^a-zA-Z0-9]', '_')
+            $infId      = $instSafeId + "_inf"
+            $activeClass = if ($firstTab) { " active" } else { "" }
+            $firstTab   = $false
+
+            $sc = switch ($primary.OverallStatus) {
+                "OK"       { "ok"       }
+                "WARN"     { "warn"     }
+                "CRITICAL" { "critical" }
+                "DOWN"     { "down"     }
+                default    { ""         }
             }
 
-            # ── Detail grid (skip null/NA values) ─────────────────────────────
-            $detCells = ""
-
-            function AddCell {
-                param([string]$Label, [string]$Value, [string]$ExtraClass = "", [bool]$ForceShow = $false)
-                $skip = @("","N/A","n/a","null","none","unknown")
-                if (-not $ForceShow -and ($skip -contains $Value.Trim())) { return "" }
-                return "<div class='detail-cell $ExtraClass'><div class='d-label'>$Label</div><div class='d-value'>$Value</div></div>"
+            $statusChip = if ($primary.Status -eq "Running") { FmtChip "RUNNING" "running" } else { FmtChip "STOPPED" "stopped" }
+            $cpuPctVal  = [double]$primary.CpuPct
+            $memPctVal  = [double]$primary.MemPct
+            $cpuClass   = if ($cpuPctVal -ge 90) {"critical"} elseif ($cpuPctVal -ge 75) {"warn"} else {"ok"}
+            $memClass   = if ($memPctVal -ge 90) {"critical"} elseif ($memPctVal -ge 75) {"warn"} else {"ok"}
+            $overallChip = switch ($primary.OverallStatus) {
+                "OK"       { FmtChip "OK"       "ok"       }
+                "WARN"     { FmtChip "WARN"      "warn"     }
+                "CRITICAL" { FmtChip "CRITICAL"  "critical" }
+                "DOWN"     { FmtChip "DOWN"       "down"    }
+                default    { FmtChip (HtmlEncode $primary.OverallStatus) "na" }
             }
 
-            if ($serverResult) {
-                $detCells += AddCell "Server Uptime"  (HtmlEncode $serverResult.Uptime)  "" $true
-                $detCells += AddCell "Memory"         "$($serverResult.MemUsedGB) GB / $($serverResult.MemTotalGB) GB ($($serverResult.MemPct)%)"  (if($serverResult.MemPct -ge 90){"alert-cell"}elseif($serverResult.MemPct -ge 75){"warn-cell"}else{""})  $true
-                $detCells += AddCell "CPU"            "$($serverResult.CpuAvg)%"  (if($serverResult.CpuAvg -ge 90){"alert-cell"}elseif($serverResult.CpuAvg -ge 75){"warn-cell"}else{""})  $true
-                $detCells += AddCell "Drives"         (HtmlEncode $serverResult.DrivesSummary)  "full-width"
-                foreach ($de in $serverResult.DriveErrors) {
-                    $detCells += "<div class='detail-cell alert-cell full-width'><div class='d-label'>Drive Critical</div><div class='d-value'>$(HtmlEncode $de)</div></div>"
-                }
-                foreach ($dw in $serverResult.DriveWarnings) {
-                    $detCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>Drive Warning</div><div class='d-value'>$(HtmlEncode $dw)</div></div>"
-                }
-            }
-            $detCells += AddCell "Run As"              (HtmlEncode $primary.RunAs)
-            $detCells += AddCell "Service Uptime"      (HtmlEncode $primary.ServiceUptime)
-            $detCells += AddCell "Restart Config"      (HtmlEncode $primary.RestartConfig)
-            $detCells += AddCell "Auto-Restarts (24h)" (HtmlEncode "$($primary.AutoRestarts)")
+            $tabHeaders += "<button class='tab-btn $sc$activeClass' onclick='switchTab(this,&quot;$instSafeId&quot;)'>" +
+                           "$(HtmlEncode $instName) $overallChip</button>"
 
-            if ($tomcatRow) {
-                $detCells += AddCell "Tomcat Service"  (HtmlEncode $tomcatRow.ServiceName)
-                $detCells += AddCell "Tomcat Version"  (HtmlEncode $tomcatRow.Version)
-                $detCells += AddCell "JRE Path"        (HtmlEncode $tomcatRow.JrePath)  "full-width"
-                $detCells += AddCell "Heap Xms"        (if($tomcatRow.HeapInitMB){"$($tomcatRow.HeapInitMB) MB"}else{""})
-                $detCells += AddCell "Heap Xmx"        (if($tomcatRow.HeapMaxMB){"$($tomcatRow.HeapMaxMB) MB"}else{""})
-                $detCells += AddCell "Working Set"     (HtmlEncode $tomcatRow.WorkingSetMB)
+            # Instance-specific detail cells
+            $instCells  = "<div class='inst-meta'>"
+            $instCells += "<div class='meta-row'><span class='meta-label'>Status</span>$statusChip</div>"
+            $instCells += "<div class='meta-row'><span class='meta-label'>Run As</span><span class='meta-val'>$(HtmlEncode $primary.RunAs)</span></div>"
+            $instCells += "<div class='meta-row'><span class='meta-label'>Uptime</span><span class='meta-val'>$(HtmlEncode $primary.ServiceUptime)</span></div>"
+            $instCells += "<div class='meta-row'><span class='meta-label'>Restart Config</span><span class='meta-val'>$(HtmlEncode $primary.RestartConfig)</span></div>"
+            $instCells += "<div class='meta-row'><span class='meta-label'>Auto-Restarts (24h)</span><span class='meta-val'>$(HtmlEncode ([string]$primary.AutoRestarts))</span></div>"
+            $instCells += "<div class='meta-row'><span class='meta-label'>CPU</span>$(FmtChip "$($primary.CpuPct)%" $cpuClass)</div>"
+            $instCells += "<div class='meta-row'><span class='meta-label'>Memory</span>$(FmtChip "$($primary.MemPct)%" $memClass)</div>"
+            $instCells += "</div>"
 
-                $gcCls = if ($serverResult -and $serverResult.GcWarnings -and $serverResult.GcWarnings.Count -gt 0) { "warn-cell" } else { "" }
-                $detCells += AddCell "GC Collector" (HtmlEncode $tomcatRow.GcCollector) $gcCls
-                if ($serverResult -and $serverResult.GcWarnings) {
-                    foreach ($gw in $serverResult.GcWarnings) {
-                        $detCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>GC Warning</div><div class='d-value'>$(HtmlEncode $gw)</div></div>"
-                    }
-                }
-                if ($serverResult -and $serverResult.GcRecommend -and $serverResult.GcRecommend.Count -gt 0) {
-                    $recHtml = "<ol style='margin:4px 0 0 16px;padding:0'>"
-                    foreach ($gr in $serverResult.GcRecommend) {
-                        $recHtml += "<li style='margin-bottom:4px'>$(HtmlEncode $gr)</li>"
-                    }
-                    $recHtml += "</ol>"
-                    $detCells += "<div class='detail-cell full-width' style='background:#0d1320;border-left:3px solid #3d5a80'>" +
-                                 "<div class='d-label' style='color:#8ab4d4'>GC Recommendations</div>" +
-                                 "<div class='d-value' style='color:#c9d1d9;font-family:inherit'>$recHtml</div></div>"
-                }
-            }
-            if ($csAdminRow) {
-                $detCells += AddCell "CS Admin" "$(HtmlEncode $csAdminRow.ServiceName) [$(HtmlEncode $csAdminRow.Status)]"
-            }
-            if ($serverResult -and $serverResult.EventLines -and $serverResult.EventLines.Count -gt 0) {
-                $evText = ($serverResult.EventLines | ForEach-Object { HtmlEncode $_ }) -join "<br>"
-                $detCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>Event Log (24h)</div><div class='d-value'>$evText</div></div>"
-            }
-            foreach ($row in $serverRows) {
-                $key  = "$($row.Server)|$($row.ServiceName)"
-                $prev = $prevData[$key]
-                if ($prev -and ($prev.Status -ne $row.Status -or ($prev.Version -and $prev.Version -ne $row.Version))) {
-                    $chg  = if ($prev.Status  -ne $row.Status)  { "Status: $(HtmlEncode $prev.Status) &rarr; $(HtmlEncode $row.Status)" }  else { "" }
-                    $chgV = if ($prev.Version -and $prev.Version -ne $row.Version) { " Version: $(HtmlEncode $prev.Version) &rarr; $(HtmlEncode $row.Version)" } else { "" }
-                    $detCells += "<div class='detail-cell changed-cell full-width'><div class='d-label'>Changed</div><div class='d-value'>$(HtmlEncode $row.ServiceName): $chg$chgV</div></div>"
-                }
-            }
-
-            # ── Informant grid (collapsed by default) ─────────────────────────
+            # Informant
             $infCells     = ""
-            $infHasIssues = $false; $infOkCount = 0
-            $infToggleHtml = ""
-
+            $infHasIssues = $false
+            $infOkCount   = 0
             if ($serverResult -and $serverResult.InformantResults -and
                 $serverResult.InformantResults.Contains($instName)) {
                 foreach ($comp in $serverResult.InformantResults[$instName].Keys) {
                     $ir      = $serverResult.InformantResults[$instName][$comp]
                     $slowBit = if ($ir.Slow) { " <span class='chip slow'>SLOW</span>" } else { "" }
                     $chipCls = switch ($ir.Status) {
-                        "SUCCESS"{"ok"} "FAILURE"{"critical"} "ERROR"{"critical"} default{"warn"}
+                        "SUCCESS" {"ok"} "FAILURE" {"failure"} "ERROR" {"error"} default {"other"}
                     }
                     if ($ir.Status -ne "SUCCESS") { $infHasIssues = $true } else { $infOkCount++ }
                     $detail = if ($ir.Status -notin @("SUCCESS","FAILURE")) {
-                                  "<span class='text-muted' style='font-size:10px'>$(HtmlEncode $ir.Detail)</span>"
-                              } else { "" }
-                    $infCells += "<div class='inf-cell'>" +
-                                 "<span class='inf-comp'>$(HtmlEncode $comp)</span>" +
+                        "<span class='text-muted' style='font-size:10px'>$(HtmlEncode $ir.Detail)</span>" } else { "" }
+                    $infCells += "<div class='inf-cell'><span class='inf-comp'>$(HtmlEncode $comp)</span>" +
                                  "<span class='chip $chipCls'>$(HtmlEncode $ir.Status)</span>$slowBit$detail" +
                                  "<span class='inf-ms'>$($ir.Ms)ms</span></div>"
                 }
-                $infSummary = if ($infHasIssues) { "Informant &mdash; issues detected" } else { "Informant &mdash; $infOkCount / $($serverResult.InformantResults[$instName].Keys.Count) OK" }
-                $infToggleHtml = "<tr><td colspan='10' style='padding:0'>" +
-                    "<div class='inf-toggle collapsed' onclick='togglePanel(this,&quot;$infId&quot;)' data-target='$infId'>" +
-                    "<span class='arrow-icon'></span>$infSummary</div>" +
-                    "<div id='$infId' class='hidden-panel'><div class='inf-grid'>$infCells</div></div>" +
-                    "</td></tr>"
             }
+            $infLabel = if ($infHasIssues) { "Informant &mdash; Issues detected" } else { "Informant &mdash; $infOkCount OK" }
+            $infAutoOpen = if ($infHasIssues) { "" } else { " collapsed" }
+            $infDisplay  = if ($infHasIssues) { "block" } else { "none" }
 
-            $versionDisplay = if ($tomcatRow -and (fmtVal (HtmlEncode $tomcatRow.Version))) { HtmlEncode $tomcatRow.Version } else { "" }
-            $wsDisplay      = if ($tomcatRow -and (fmtVal (HtmlEncode $tomcatRow.WorkingSetMB))) { HtmlEncode $tomcatRow.WorkingSetMB } else { "" }
-            $heapDisplay    = if ($tomcatRow -and $tomcatRow.HeapInitMB) {
-                                  "Xms $($tomcatRow.HeapInitMB)&thinsp;MB / Xmx $($tomcatRow.HeapMaxMB)&thinsp;MB"
-                              } else { "" }
+            $instCells += "<div class='inf-toggle$infAutoOpen' onclick='toggleInf(this,&quot;$infId&quot;)'>" +
+                          "<span class='arrow'>v</span> $infLabel</div>" +
+                          "<div id='$infId' class='hidden-panel' style='display:$infDisplay'><div class='inf-grid'>$infCells</div></div>"
 
-            $instanceHtml += "
-            <tr class='instance-header $sc' onclick='togglePanel(this, &quot;$detId&quot;)'>
-              <td class='td-arrow'><span class='arrow-icon'></span></td>
-              <td class='td-inst'><span class='inst-name'>$(HtmlEncode $instName)</span>
-                $(if($inlineAlerts){"<div class='inline-alerts'>$inlineAlerts</div>"})
-              </td>
-              <td>$statusChip</td>
-              <td class='td-mono'>$versionDisplay</td>
-              <td class='td-mono'>$wsDisplay</td>
-              <td class='td-mono'>$heapDisplay</td>
-              <td>$(fmtChip "$($primary.CpuPct)%" $cpuChipClass)</td>
-              <td>$(fmtChip "$($primary.MemPct)%" $memChipClass)</td>
-              <td class='td-mono'>$(if($primary.AutoRestarts -and $primary.AutoRestarts -ne "0" -and $primary.AutoRestarts -ne ""){HtmlEncode "$($primary.AutoRestarts)"}else{""})</td>
-              <td>$overallChip</td>
-            </tr>
-            <tr id='$detId' class='hidden-panel'><td colspan='10' style='padding:0'>
-              <div class='detail-panel'><div class='detail-grid'>$detCells</div></div>
-            </td></tr>
-            $infToggleHtml"
+            $tabPanels += "<div class='tab-panel$activeClass' id='$instSafeId'>$instCells</div>"
         }
 
+        # If no CS instances found, show a placeholder
+        if ($csRows.Count -eq 0) {
+            $tabHeaders = "<span style='color:#8b949e;font-size:12px;padding:6px 10px'>No Content Server instances found</span>"
+            $tabPanels  = ""
+        }
+
+        $instanceSection = "<div class='cs-tabs'>" +
+                           "<div class='tab-bar'>$tabHeaders</div>" +
+                           "<div class='tab-body'>$tabPanels</div>" +
+                           "</div>"
+
+        $serverBodyHtml = "<div class='server-detail'>" +
+                          "<div class='detail-grid shared-grid'>$sharedCells</div>" +
+                          $instanceSection +
+                          "</div>"
+
         $serverHtml += "
-        <tr class='server-header $serverStatus' onclick='toggleBody(&quot;$serverId&quot;, this)'>
-          <td colspan='10'><div class='server-label'><span class='arrow-icon'></span>$serverHeaderLabel</div></td>
+        <tr class='server-header $serverStatus' onclick='toggleServer(this, &quot;$serverId&quot;)'>
+          <td colspan='10'>
+            <div class='server-label'>
+              <span class='arrow'>v</span>
+              $serverHeaderLabel
+            </div>
+            $critBanner
+          </td>
         </tr>
-        <tbody id='$serverId' class='collapsible' style='display:none'>
-          <tr><td colspan='10' style='padding:0'>
-            <table class='inner-table'>
-              <thead><tr>
-                <th class='td-arrow'></th>
-                <th>Instance</th><th>Status</th><th>Version</th>
-                <th>Working Set</th><th>Heap</th>
-                <th>CPU%</th><th>Mem%</th><th>Restarts</th><th>Overall</th>
-              </tr></thead>
-              <tbody>$instanceHtml</tbody>
-            </table>
-          </td></tr>
-        </tbody>"
+        <tr id='$serverId' class='server-body' style='display:none'>
+          <td colspan='10' style='padding:0'>$serverBodyHtml</td>
+        </tr>"
     }
 
     $htmlBody += "
-    <tr class='zone-header $zoneStatus collapsed' onclick='toggleBody(&quot;$zoneId&quot;, this)'>
+    <tr class='zone-header $zoneStatus' onclick='toggleZone(this, &quot;${zoneId}_body&quot;)'>
       <td colspan='10'>
         <div class='zone-label'>
-          <span class='arrow-icon'></span>
+          <span class='arrow'>v</span>
           <span class='z-name'>$(HtmlEncode $zoneName)</span>
-          <span class='z-counts'>$zoneOK ok&ensp;$zoneWarn warn&ensp;$zoneCrit crit&ensp;$zoneDown down</span>
+          <span class='z-counts'>$zoneOK OK / $zoneWarn W / $zoneCrit C / $('{0:D2}' -f $zoneDown) D</span>
         </div>
       </td>
     </tr>
-    <tbody id='$zoneId' class='collapsible' style='display:none'>$serverHtml</tbody>"
+    <tr id='${zoneId}_body' class='zone-body'>
+      <td colspan='10' style='padding:0'>
+        <table class='zone-table' style='width:100%;border-collapse:collapse'>
+          <tbody>$serverHtml</tbody>
+        </table>
+      </td>
+    </tr>"
 }
 
 $zoneRollupHtml = foreach ($grp in $zoneSummary.Keys) {
@@ -1348,273 +1296,357 @@ $zoneRollupHtml = foreach ($grp in $zoneSummary.Keys) {
     $cls = if ($s.DOWN -gt 0 -or $s.CRITICAL -gt 0) { "crit" } elseif ($s.WARN -gt 0) { "warn" } else { "ok" }
     "<div class='zone-pill $cls'>" +
     "<span class='pill-name'>$(HtmlEncode $grp)</span>" +
-    "<span class='pill-counts'>$($s.OK)ok / $($s.WARN)w / $($s.CRITICAL)c / $($s.DOWN)d</span>" +
+    "<span class='pill-counts'>$($s.OK) OK / $($s.WARN) W / $($s.CRITICAL) C / $('{0:D2}' -f $s.DOWN) D</span>" +
     "</div>"
 }
 
-# ── Pre-compute values for here-string ─────────────────────────────────────────
-# IMPORTANT: Do NOT put complex $(if ...) subexpressions directly inside @" "@.
-# Compute them into plain variables first. See DEVELOPER NOTES at top of file.
-$htmlGenerated      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-$autoRestartLabel   = if ($AutoRestartStopped) { 'On' } else { 'Off' }
-$zoneRollupHtmlJoin = $zoneRollupHtml -join ''
+$generatedAt    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+$autoRestartTxt = if ($AutoRestartStopped) { 'On' } else { 'Off' }
 
-# ── HTML here-string ───────────────────────────────────────────────────────────
-# WARNING: The closing  "@  MUST be at column 1. No leading spaces. No trailing comments.
 $htmlContent = @"
 <!DOCTYPE html>
 <html lang='en'><head><meta charset='UTF-8'>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>Service Check Report - $timestamp</title>
 <style>
-:root {
-  --bg:       #0f1117;
-  --bg2:      #161b22;
-  --bg3:      #1c2128;
-  --border:   #21262d;
-  --text:     #c9d1d9;
-  --text-dim: #8b949e;
-  --text-hi:  #e6edf3;
-  --ok:       #3fb950;
-  --warn:     #d29922;
-  --crit:     #e8e8e8;
-  --crit-bg:  #2a2a2a;
-  --crit-bd:  #888888;
-  --accent:   #58a6ff;
-  --mono:     'Cascadia Code','Consolas',monospace;
-}
-body.mono-mode {
-  --ok:      #e8e8e8;
-  --warn:    #aaaaaa;
-  --crit:    #ffffff;
-  --crit-bg: #333333;
-  --crit-bd: #aaaaaa;
-  --accent:  #cccccc;
-}
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; padding: 24px; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #c9d1d9; min-height: 100vh; padding: 24px; }
 
-/* ── Header ── */
-.page-header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
-.logo { width: 38px; height: 38px; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; color: var(--text-dim); }
-.page-header h1 { font-size: 18px; font-weight: 700; color: var(--text-hi); }
-.page-header .sub { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
-.header-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
-.run-info { font-size: 11px; color: var(--text-dim); text-align: right; line-height: 1.6; }
-.run-info strong { color: var(--text); }
+  /* ── Top bar (no section headers) ── */
+  .top-bar { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #21262d; flex-wrap: wrap; }
+  .top-bar .logo { width: 36px; height: 36px; background: linear-gradient(135deg, #238636, #2ea043); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; color:#fff; font-weight:700; }
+  .top-bar .title { font-size: 16px; font-weight: 700; color: #e6edf3; }
+  .top-bar .subtitle { font-size: 12px; color: #8b949e; }
+  .top-bar .meta { margin-left: auto; font-size: 11px; color: #8b949e; text-align: right; }
+  .top-bar .meta strong { color: #c9d1d9; }
 
-/* ── Mono toggle ── */
-.toggle-btn { font-size: 11px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg3); color: var(--text-dim); cursor: pointer; white-space: nowrap; }
-.toggle-btn:hover { border-color: var(--text-dim); color: var(--text); }
-.toggle-btn.active { border-color: var(--text-dim); color: var(--text-hi); background: var(--bg2); }
+  /* ── Stat bar ── */
+  .stat-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+  .stat-card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 10px 18px; min-width: 90px; text-align: center; }
+  .stat-card .stat-num { font-size: 24px; font-weight: 700; line-height: 1; margin-bottom: 3px; }
+  .stat-card .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #8b949e; }
+  .stat-card.ok .stat-num    { color: #3fb950; }
+  .stat-card.warn .stat-num  { color: #d29922; }
+  .stat-card.crit .stat-num  { color: #e07b00; }
+  .stat-card.down .stat-num  { color: #e07b00; }
+  .stat-card.total .stat-num { color: #79c0ff; }
 
-/* ── Stats ── */
-.stat-bar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
-.stat-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 18px; min-width: 100px; text-align: center; }
-.stat-num { font-size: 26px; font-weight: 700; line-height: 1; margin-bottom: 3px; }
-.stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); }
-.stat-card.ok   .stat-num { color: var(--ok); }
-.stat-card.warn .stat-num { color: var(--warn); }
-.stat-card.crit .stat-num { color: var(--crit); }
-.stat-card.down .stat-num { color: var(--crit); }
-.stat-card.total .stat-num { color: var(--accent); }
+  /* ── Zone pills ── */
+  .zone-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  .zone-pill { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; border: 1px solid transparent; cursor: pointer; }
+  .zone-pill .pill-name { color: #e6edf3; }
+  .zone-pill .pill-counts { font-size: 11px; opacity: 0.8; }
+  .zone-pill.ok   { background: #0d1f12; border-color: #238636; }
+  .zone-pill.warn { background: #1f1a0d; border-color: #9e6a03; }
+  .zone-pill.crit { background: #1c1100; border-color: #c76b00; }
 
-/* ── Zone pills ── */
-.zone-pills { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }
-.zone-pill { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 16px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); background: var(--bg2); cursor: pointer; }
-.zone-pill .pill-name { color: var(--text-hi); }
-.zone-pill .pill-counts { font-size: 10px; color: var(--text-dim); }
-.zone-pill.ok   { border-color: #2d5a3d; }
-.zone-pill.warn { border-color: #5a4a1a; }
-.zone-pill.crit { border-color: var(--crit-bd); }
+  /* ── Main table ── */
+  .table-wrap { background: #161b22; border: 1px solid #21262d; border-radius: 10px; overflow: hidden; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 0; border: none; font-size: 13px; }
 
-/* ── Table shell ── */
-.table-wrap { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-table { border-collapse: collapse; width: 100%; }
-th { background: var(--bg3); color: var(--text-dim); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
-td { padding: 0; border: none; font-size: 13px; }
+  /* ── Zone header row ── */
+  .zone-header td { padding: 10px 16px; font-size: 13px; font-weight: 700; cursor: pointer; background: #1c2128; border-top: 2px solid #21262d; border-bottom: 1px solid #21262d; user-select: none; }
+  .zone-header.ok   td { border-left: 3px solid #238636; }
+  .zone-header.warn td { border-left: 3px solid #9e6a03; }
+  .zone-header.down td,
+  .zone-header.critical td { border-left: 3px solid #c76b00; }
+  .zone-label { display: flex; align-items: center; gap: 10px; }
+  .zone-label .z-name   { color: #79c0ff; font-size: 13px; }
+  .zone-label .z-counts { font-size: 11px; color: #8b949e; font-weight: 400; }
 
-/* ── Zone row ── */
-.zone-header td { padding: 10px 14px; font-size: 13px; font-weight: 700; cursor: pointer; background: var(--bg3); border-top: 2px solid var(--border); border-bottom: 1px solid var(--border); user-select: none; }
-.zone-header.ok   td { border-left: 3px solid #2d5a3d; }
-.zone-header.warn td { border-left: 3px solid #5a4a1a; }
-.zone-header.down td, .zone-header.critical td { border-left: 3px solid var(--crit-bd); }
-.zone-label { display: flex; align-items: center; gap: 10px; }
-.z-name { color: var(--accent); } .z-counts { font-size: 11px; color: var(--text-dim); font-weight: 400; }
+  /* ── Zone body row (wraps server rows) ── */
+  .zone-body > td { padding: 0; }
+  .zone-table { background: #161b22; }
 
-/* ── Server row ── */
-.server-header td { padding: 8px 14px 8px 26px; cursor: pointer; background: var(--bg2); border-bottom: 1px solid var(--border); user-select: none; }
-.server-header.ok   td { border-left: 3px solid #2d5a3d; }
-.server-header.warn td { border-left: 3px solid #5a4a1a; }
-.server-header.down td, .server-header.critical td { border-left: 3px solid var(--crit-bd); }
-.server-label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.srv-zone { font-size: 10px; color: var(--text-dim); } .srv-inst { font-size: 12px; color: var(--ok); font-weight: 700; }
-.srv-name { font-size: 13px; color: var(--text); } .srv-sep { color: var(--border); }
+  /* ── Server header row ── */
+  .server-header td { padding: 8px 16px 8px 32px; cursor: pointer; background: #161b22; border-bottom: 1px solid #21262d; user-select: none; }
+  .server-header.ok   td { border-left: 3px solid #238636; }
+  .server-header.warn td { border-left: 3px solid #9e6a03; }
+  .server-header.down td,
+  .server-header.critical td { border-left: 3px solid #c76b00; }
+  .server-label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .srv-zone { font-size: 11px; color: #8b949e; }
+  .srv-inst { font-size: 12px; color: #3fb950; font-weight: 700; }
+  .srv-name { font-size: 13px; color: #c9d1d9; }
+  .srv-sep  { color: #30363d; }
 
-/* ── Inner table ── */
-.inner-table { width: 100%; border-collapse: collapse; }
-.inner-table th { background: var(--bg); padding: 7px 10px; font-size: 10px; }
-.instance-header td { padding: 7px 10px; cursor: pointer; background: var(--bg); border-bottom: 1px solid var(--border); user-select: none; }
-.instance-header:hover td { background: var(--bg2); }
-.inst-name { color: var(--text-hi); font-weight: 600; font-size: 13px; }
-.inline-alerts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
-.inline-alert { font-size: 10px; font-weight: 600; color: var(--crit); background: var(--crit-bg); border: 1px solid var(--crit-bd); border-radius: 4px; padding: 1px 6px; letter-spacing: 0.02em; }
-body.mono-mode .inline-alert { color: #fff; background: #222; border-color: #888; }
+  /* ── Critical error banner (shown inline under server label) ── */
+  .crit-banner { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; }
+  .crit-item { font-size: 11px; color: #ff9500; background: #1c1100; border: 1px solid #c76b00; border-radius: 4px; padding: 2px 7px; }
 
-/* ── Chips ── */
-.chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; white-space: nowrap; border: 1px solid transparent; }
-.chip.ok, .chip.running { color: var(--ok); border-color: #2d5a3d; background: #0d1f12; }
-.chip.warn { color: var(--warn); border-color: #5a4a1a; background: #1a1400; }
-.chip.critical, .chip.stopped, .chip.down { color: var(--crit); border-color: var(--crit-bd); background: var(--crit-bg); }
-.chip.slow { color: var(--warn); border-color: #5a4a1a; background: #1a1400; }
-.chip.na { color: var(--text-dim); border-color: var(--border); background: var(--bg2); }
-body.mono-mode .chip.ok, body.mono-mode .chip.running { color: #fff; border-color: #666; background: #1e1e1e; }
-body.mono-mode .chip.warn  { color: #ccc; border-color: #555; background: #1e1e1e; }
-body.mono-mode .chip.critical, body.mono-mode .chip.stopped, body.mono-mode .chip.down { color: #fff; border-color: #aaa; background: #333; }
+  /* ── Server body ── */
+  .server-body > td { padding: 0; background: #0d1117; border-bottom: 2px solid #21262d; }
+  .server-detail { padding: 0; }
 
-/* ── Arrow icon ── */
-.arrow-icon { display: inline-block; width: 14px; height: 14px; border-radius: 3px; background: var(--bg3); border: 1px solid var(--border); text-align: center; line-height: 13px; font-size: 8px; color: var(--text-dim); vertical-align: middle; margin-right: 6px; flex-shrink: 0; transition: transform 0.15s; }
-.arrow-icon::after { content: '\25BC'; }
-.collapsed .arrow-icon::after { content: '\25B6'; }
-.td-arrow { width: 28px; }
-.td-inst  { min-width: 180px; }
-.td-mono  { font-family: var(--mono); font-size: 11px; padding: 7px 10px; color: var(--text-dim); }
+  /* ── Shared detail grid (server-level info, shown once) ── */
+  .shared-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1px; background: #21262d; border-bottom: 1px solid #21262d; }
+  .detail-cell { background: #0d1117; padding: 7px 14px; display: flex; flex-direction: column; gap: 2px; }
+  .detail-cell .d-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: #8b949e; }
+  .detail-cell .d-value { font-size: 12px; color: #c9d1d9; word-break: break-all; font-family: 'Cascadia Code','Consolas',monospace; }
+  .detail-cell.full-width { grid-column: 1 / -1; }
+  .detail-cell.critical-cell { background: #130c00; border-left: 3px solid #c76b00; }
+  .detail-cell.critical-cell .d-label { color: #ff9500; font-weight: 900; }
+  .detail-cell.critical-cell .d-value { color: #ffb347; font-weight: 700; }
+  .detail-cell.warn-cell { background: #13100a; }
+  .detail-cell.warn-cell .d-label { color: #d29922; }
+  .detail-cell.warn-cell .d-value { color: #d29922; }
+  .detail-cell.changed-cell { background: #130f00; }
+  .detail-cell.changed-cell .d-label { color: #e3b341; }
+  .detail-cell.changed-cell .d-value { color: #e3b341; }
 
-/* ── Detail panel ── */
-.detail-panel { background: var(--bg); border-bottom: 1px solid var(--border); }
-.detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1px; background: var(--border); border-top: 1px solid var(--border); }
-.detail-cell { background: var(--bg); padding: 7px 14px; display: flex; flex-direction: column; gap: 2px; }
-.d-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-dim); }
-.d-value { font-size: 11px; color: var(--text); word-break: break-all; font-family: var(--mono); }
-.detail-cell.full-width { grid-column: 1 / -1; }
-.detail-cell.alert-cell   { background: #1a1a1a; }
-.detail-cell.alert-cell   .d-label { color: var(--crit); }
-.detail-cell.alert-cell   .d-value { color: var(--crit); font-weight: 600; }
-.detail-cell.warn-cell    { background: #141200; }
-.detail-cell.warn-cell    .d-label { color: var(--warn); }
-.detail-cell.warn-cell    .d-value { color: var(--warn); }
-.detail-cell.changed-cell { background: #141200; }
-.detail-cell.changed-cell .d-label { color: var(--warn); }
-.detail-cell.changed-cell .d-value { color: var(--warn); }
+  /* ── CS instance tabs ── */
+  .cs-tabs { background: #0d1117; }
+  .tab-bar { display: flex; flex-wrap: wrap; gap: 0; background: #161b22; border-bottom: 1px solid #21262d; padding: 6px 12px; gap: 6px; }
+  .tab-btn { background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 6px; padding: 4px 12px; font-size: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+  .tab-btn:hover { background: #2d333b; color: #c9d1d9; }
+  .tab-btn.active { background: #0d1117; color: #e6edf3; border-color: #444c56; }
+  .tab-btn.ok     { border-left: 3px solid #238636; }
+  .tab-btn.warn   { border-left: 3px solid #9e6a03; }
+  .tab-btn.critical, .tab-btn.down { border-left: 3px solid #c76b00; }
+  .tab-body { padding: 0; }
+  .tab-panel { display: none; padding: 12px 16px; }
+  .tab-panel.active { display: block; }
 
-/* ── Informant toggle ── */
-.inf-toggle { display: flex; align-items: center; gap: 6px; padding: 6px 14px; cursor: pointer; background: var(--bg); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); user-select: none; font-size: 11px; font-weight: 600; color: var(--accent); }
-.inf-toggle:hover { background: var(--bg2); }
-.inf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 1px; background: var(--border); }
-.inf-cell { background: var(--bg); padding: 6px 12px; display: flex; align-items: center; gap: 8px; }
-.inf-comp { font-size: 11px; font-weight: 600; color: var(--text-dim); width: 90px; flex-shrink: 0; font-family: var(--mono); }
-.inf-ms { font-size: 10px; color: var(--border); margin-left: auto; }
+  /* ── Instance meta rows ── */
+  .inst-meta { display: flex; flex-wrap: wrap; gap: 6px 24px; margin-bottom: 10px; }
+  .meta-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .meta-label { color: #8b949e; font-size: 10px; font-weight: 600; text-transform: uppercase; min-width: 110px; }
+  .meta-val { color: #c9d1d9; font-family: 'Cascadia Code','Consolas',monospace; font-size: 12px; }
 
-/* ── Misc ── */
-.hidden-panel { display: none; }
-.collapsible  { display: table-row-group; }
-.text-muted   { color: var(--text-dim); }
-</style>
-</head><body>
+  /* ── Chips ── */
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; white-space: nowrap; }
+  .chip.ok, .chip.running { background: #0d1f12; color: #3fb950; border: 1px solid #238636; }
+  .chip.warn { background: #1f1a0d; color: #d29922; border: 1px solid #9e6a03; }
+  .chip.critical, .chip.failure, .chip.stopped, .chip.down, .chip.error {
+    background: #1c1100; color: #ff9500; border: 2px solid #c76b00;
+    font-weight: 900; text-transform: uppercase; }
+  .chip.other { background: #1a1f2e; color: #79c0ff; border: 1px solid #1f6feb; }
+  .chip.slow  { background: #1f1508; color: #e3b341; border: 1px solid #bb8009; }
+  .chip.na    { background: #161b22; color: #8b949e; border: 1px solid #30363d; }
 
-<div class='page-header'>
-  <div class='logo'>&#9830;</div>
-  <div>
-    <h1>Service Check Report</h1>
-    <div class='sub'>Tomcat &middot; Content Server &middot; CS Admin</div>
-  </div>
-  <div class='header-right'>
-    <button class='toggle-btn' id='monoBtn' onclick='toggleMono()'>Mono</button>
-    <div class='run-info'>
-      <strong>Generated:</strong> $htmlGenerated<br>
-      <strong>Servers:</strong> $serverCount &nbsp;&middot;&nbsp; <strong>Auto-restart:</strong> $autoRestartLabel
-    </div>
+  /* ── Informant ── */
+  .inf-toggle { display: flex; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer; user-select: none; font-size: 12px; font-weight: 600; color: #79c0ff; margin-top: 8px; }
+  .inf-toggle:hover { color: #a5d6ff; }
+  .inf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1px; background: #21262d; margin-top: 6px; border-radius: 4px; overflow: hidden; }
+  .inf-cell { background: #0a0d13; padding: 6px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .inf-cell .inf-comp { font-size: 11px; font-weight: 600; color: #8b949e; width: 90px; flex-shrink: 0; font-family: 'Cascadia Code','Consolas',monospace; }
+  .inf-cell .inf-ms { font-size: 10px; color: #484f58; margin-left: auto; }
+
+  /* ── Arrow knob ── */
+  .arrow { display: inline-block; width: 14px; height: 14px; flex-shrink: 0; border-radius: 3px; background: #21262d; text-align: center; line-height: 14px; font-size: 8px; color: #8b949e; transition: transform 0.18s ease; font-style: normal; }
+  .collapsed .arrow { transform: rotate(-90deg); }
+  .hidden-panel { display: none; }
+  .text-muted { color: #8b949e; }
+
+  /* ── A11y button ── */
+  #a11y-btn { position: fixed; bottom: 18px; right: 18px; z-index: 999;
+    background: #21262d; color: #c9d1d9; border: 1px solid #444c56;
+    border-radius: 20px; padding: 6px 14px; font-size: 12px; font-weight: 600;
+    cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.5); }
+  #a11y-btn:hover { background: #2d333b; }
+
+  /* ── A11y overrides ── */
+  body.a11y { background:#fff; color:#111; }
+  body.a11y .top-bar { border-color:#bbb; }
+  body.a11y .top-bar .title { color:#000; }
+  body.a11y .top-bar .subtitle, body.a11y .top-bar .meta { color:#444; }
+  body.a11y .top-bar .meta strong { color:#000; }
+  body.a11y .stat-card { background:#f5f5f5; border:2px solid #bbb; }
+  body.a11y .stat-card .stat-num { color:#000 !important; }
+  body.a11y .stat-card .stat-label { color:#444; }
+  body.a11y .table-wrap { background:#fff; border-color:#bbb; }
+  body.a11y .zone-header td { background:#f0f0f0; border-color:#bbb; }
+  body.a11y .zone-header.ok td, body.a11y .zone-header.warn td,
+  body.a11y .zone-header.down td, body.a11y .zone-header.critical td { border-left:4px solid #000; }
+  body.a11y .z-name { color:#000; }
+  body.a11y .z-counts { color:#444; }
+  body.a11y .server-header td { background:#fafafa; border-color:#bbb; }
+  body.a11y .server-header.ok td, body.a11y .server-header.warn td,
+  body.a11y .server-header.down td, body.a11y .server-header.critical td { border-left:4px solid #000; }
+  body.a11y .srv-zone { color:#555; }
+  body.a11y .srv-inst, body.a11y .srv-name { color:#000; }
+  body.a11y .crit-item { background:#f0f0f0; color:#000; border-color:#000; }
+  body.a11y .server-body > td { background:#fafafa; }
+  body.a11y .shared-grid { background:#ccc; }
+  body.a11y .detail-cell { background:#fff; }
+  body.a11y .detail-cell .d-label { color:#444; }
+  body.a11y .detail-cell .d-value { color:#000; }
+  body.a11y .detail-cell.critical-cell { background:#f0f0f0 !important; border-left:4px solid #000 !important; }
+  body.a11y .detail-cell.critical-cell .d-label { color:#000 !important; font-weight:900 !important; }
+  body.a11y .detail-cell.critical-cell .d-value { color:#000 !important; font-weight:700 !important; text-decoration:underline; }
+  body.a11y .detail-cell.warn-cell { background:#f5f5f5 !important; border-left:4px dashed #555 !important; }
+  body.a11y .detail-cell.warn-cell .d-label, body.a11y .detail-cell.warn-cell .d-value { color:#222 !important; }
+  body.a11y .detail-cell.changed-cell { background:#ebebeb !important; border-left:4px dotted #555 !important; }
+  body.a11y .detail-cell.changed-cell .d-label, body.a11y .detail-cell.changed-cell .d-value { color:#000 !important; }
+  body.a11y .cs-tabs { background:#fafafa; }
+  body.a11y .tab-bar { background:#e8e8e8; border-color:#bbb; }
+  body.a11y .tab-btn { background:#ddd; color:#000; border-color:#aaa; }
+  body.a11y .tab-btn.active { background:#fff; border-color:#000; }
+  body.a11y .meta-label { color:#444; }
+  body.a11y .meta-val { color:#000; }
+  body.a11y .chip { background:#fff !important; color:#000 !important; border:2px solid #000 !important; font-weight:700 !important; }
+  body.a11y .chip.ok::before      { content:'\2713 '; }
+  body.a11y .chip.running::before { content:'\25B6 '; }
+  body.a11y .chip.warn { border-style:dashed !important; }
+  body.a11y .chip.warn::before { content:'\26A0 '; }
+  body.a11y .chip.critical, body.a11y .chip.failure, body.a11y .chip.stopped,
+  body.a11y .chip.down, body.a11y .chip.error { border-width:3px !important; text-decoration:underline; }
+  body.a11y .chip.critical::before, body.a11y .chip.failure::before,
+  body.a11y .chip.stopped::before, body.a11y .chip.down::before,
+  body.a11y .chip.error::before { content:'\2715 '; }
+  body.a11y .chip.slow::before { content:'\23F1 '; }
+  body.a11y .chip.na { border-style:dotted !important; color:#555 !important; }
+  body.a11y .chip.other { border-style:dotted !important; }
+  body.a11y .zone-pill { background:#fff !important; color:#000 !important; border:2px solid #000 !important; }
+  body.a11y .zone-pill.ok::before   { content:'\2713 '; font-weight:700; }
+  body.a11y .zone-pill.warn::before { content:'\26A0 '; font-weight:700; }
+  body.a11y .zone-pill.crit::before { content:'\2715 '; font-weight:900; }
+  body.a11y .zone-pill.warn { border-style:dashed !important; }
+  body.a11y .zone-pill.crit { border-style:solid !important; border-width:3px !important; }
+  body.a11y .zone-pill .pill-name, body.a11y .zone-pill .pill-counts { color:#000 !important; }
+  body.a11y .inf-toggle { color:#000; }
+  body.a11y .inf-grid { background:#ccc; }
+  body.a11y .inf-cell { background:#fafafa; }
+  body.a11y .inf-cell .inf-comp { color:#444; }
+  body.a11y .arrow { background:#ddd; color:#000; }
+  body.a11y .top-bar .logo { background:#000; }
+  body.a11y #a11y-btn { background:#111; color:#fff; border-color:#000; }
+</style></head><body>
+
+<button id='a11y-btn' aria-pressed='false' title='Toggle color-free accessible mode'>&#9681; Color-Free Mode</button>
+
+<div class='top-bar'>
+  <div class='logo'>S</div>
+  <div><div class='title'>Service Check Report</div><div class='subtitle'>Tomcat / Content Server / CS Admin</div></div>
+  <div class='meta'>
+    <div><strong>Generated:</strong> $generatedAt</div>
+    <div><strong>Servers:</strong> $serverCount &nbsp;|&nbsp; <strong>Auto-restart:</strong> $autoRestartTxt</div>
   </div>
 </div>
 
 <div class='stat-bar' id='stat-bar'></div>
-
-<div class='zone-pills' id='zone-pills'>$zoneRollupHtmlJoin</div>
+<div class='zone-pills' id='zone-pills'></div>
 
 <div class='table-wrap'>
 <table id='main-table'>
-  <thead><tr>
-    <th class='td-arrow'></th>
-    <th>Instance</th><th>Status</th><th>Version</th>
-    <th>Working Set</th><th>Heap</th>
-    <th>CPU%</th><th>Mem%</th><th>Restarts</th><th>Overall</th>
-  </tr></thead>
   <tbody>$htmlBody</tbody>
 </table>
 </div>
 
 <script>
-function toggleBody(id, row) {
-  var el = document.getElementById(id);
-  if (!el) return;
-  var hidden = el.style.display === 'none' || el.style.display === '';
-  el.style.display = hidden ? 'table-row-group' : 'none';
-  row.classList.toggle('collapsed', !hidden);
+// ── Zone collapse ──────────────────────────────────────────────────────────
+function toggleZone(hdr, bodyId) {
+    var body = document.getElementById(bodyId);
+    if (!body) return;
+    var hidden = body.style.display === 'none';
+    body.style.display = hidden ? '' : 'none';
+    hdr.classList.toggle('collapsed', !hidden);
 }
 
-function togglePanel(row, id) {
-  var el = document.getElementById(id);
-  if (!el) return;
-  var hidden = el.style.display === 'none' || el.style.display === '';
-  el.style.display = hidden ? 'table-row' : 'none';
-  row.classList.toggle('collapsed', !hidden);
+// ── Server collapse ────────────────────────────────────────────────────────
+function toggleServer(hdr, bodyId) {
+    var body = document.getElementById(bodyId);
+    if (!body) return;
+    var hidden = body.style.display === 'none';
+    body.style.display = hidden ? '' : 'none';
+    hdr.classList.toggle('collapsed', !hidden);
 }
 
-function toggleMono() {
-  document.body.classList.toggle('mono-mode');
-  var btn = document.getElementById('monoBtn');
-  btn.classList.toggle('active');
+// ── Informant toggle ───────────────────────────────────────────────────────
+function toggleInf(btn, id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var hidden = el.style.display === 'none' || el.style.display === '';
+    el.style.display = hidden ? 'block' : 'none';
+    btn.classList.toggle('collapsed', !hidden);
 }
 
-// Wire zone pills to expand their zone
-document.addEventListener('DOMContentLoaded', function () {
-  document.querySelectorAll('.zone-pill').forEach(function(pill) {
-    pill.addEventListener('click', function() {
-      var name = pill.querySelector('.pill-name').textContent.trim();
-      document.querySelectorAll('.zone-header').forEach(function(row) {
-        var zname = row.querySelector('.z-name');
-        if (zname && zname.textContent.trim() === name) {
-          var id = row.nextElementSibling;
-          while (id && id.tagName !== 'TBODY') { id = id.nextElementSibling; }
-          if (id) {
-            var hidden = id.style.display === 'none' || id.style.display === '';
-            id.style.display = hidden ? 'table-row-group' : 'none';
-            row.classList.toggle('collapsed', !hidden);
-          }
+// ── CS instance tab switch ─────────────────────────────────────────────────
+function switchTab(btn, panelId) {
+    var bar   = btn.parentElement;
+    var body  = bar.nextElementSibling;
+    bar.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
+    body.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.remove('active'); });
+    btn.classList.add('active');
+    var panel = document.getElementById(panelId);
+    if (panel) panel.classList.add('active');
+}
+
+window.addEventListener('DOMContentLoaded', function () {
+    // Auto-expand zones/servers with issues; collapse healthy ones
+    document.querySelectorAll('.zone-body').forEach(function(zb){
+        var hasBad = zb.querySelector('.server-header.warn,.server-header.down,.server-header.critical');
+        if (!hasBad) {
+            zb.style.display = 'none';
+            var hdr = zb.previousElementSibling;
+            if (hdr) hdr.classList.add('collapsed');
         }
-      });
     });
-  });
+    document.querySelectorAll('.server-body').forEach(function(sb){
+        var hdr = sb.previousElementSibling;
+        if (hdr && (hdr.classList.contains('warn') || hdr.classList.contains('down') || hdr.classList.contains('critical'))) {
+            sb.style.display = '';
+            hdr.classList.remove('collapsed');
+        } else {
+            sb.style.display = 'none';
+            if (hdr) hdr.classList.add('collapsed');
+        }
+    });
 
-  // Build stat bar
-  var ok=0, warn=0, crit=0, down=0;
-  document.querySelectorAll('.instance-header').forEach(function(r) {
-    if      (r.classList.contains('ok'))       ok++;
-    else if (r.classList.contains('warn'))     warn++;
-    else if (r.classList.contains('critical')) crit++;
-    else if (r.classList.contains('down'))     down++;
-  });
-  document.getElementById('stat-bar').innerHTML =
-    mk(ok+warn+crit+down,'Total','total') +
-    mk(ok,'Healthy','ok') +
-    mk(warn,'Warning','warn') +
-    mk(crit,'Critical','crit') +
-    mk(down,'Down','down');
+    // Stat bar
+    var ok=0, warn=0, crit=0, down=0;
+    document.querySelectorAll('.server-header').forEach(function(r){
+        if      (r.classList.contains('critical')) crit++;
+        else if (r.classList.contains('down'))     down++;
+        else if (r.classList.contains('warn'))     warn++;
+        else                                        ok++;
+    });
+    document.getElementById('stat-bar').innerHTML =
+        mk(ok+warn+crit+down,'Total','total') + mk(ok,'Healthy','ok') +
+        mk(warn,'Warning','warn') + mk(crit,'Critical','crit') +
+        mk(('00'+down).slice(-2),'Down','down');
+
+    // Zone pills (clickable — scroll to zone)
+    var pillBar = document.getElementById('zone-pills');
+    document.querySelectorAll('.zone-header').forEach(function(zh){
+        var zl   = zh.querySelector('.z-name');
+        var zc   = zh.querySelector('.z-counts');
+        var cls  = zh.classList.contains('ok') ? 'ok' : zh.classList.contains('warn') ? 'warn' : 'crit';
+        var pill = document.createElement('div');
+        pill.className = 'zone-pill ' + cls;
+        pill.innerHTML = "<span class='pill-name'>" + (zl ? zl.textContent : '') + "</span>" +
+                         "<span class='pill-counts'>" + (zc ? zc.textContent : '') + "</span>";
+        pill.addEventListener('click', function(){
+            zh.scrollIntoView({ behavior:'smooth', block:'start' });
+            // Expand the zone if collapsed
+            var bodyId = zh.getAttribute('onclick').match(/"([^"]+)"/);
+            if (bodyId) {
+                var zb = document.getElementById(bodyId[1]);
+                if (zb && zb.style.display === 'none') toggleZone(zh, bodyId[1]);
+            }
+        });
+        pillBar.appendChild(pill);
+    });
 });
 
-function mk(n,l,c) {
-  return "<div class='stat-card "+c+"'><div class='stat-num'>"+n+"</div><div class='stat-label'>"+l+"</div></div>";
-}
+function mk(n,l,c){ return "<div class='stat-card "+c+"'><div class='stat-num'>"+n+"</div><div class='stat-label'>"+l+"</div></div>"; }
+
+// A11y toggle
+document.getElementById('a11y-btn').addEventListener('click', function(){
+    var on = document.body.classList.toggle('a11y');
+    this.setAttribute('aria-pressed', String(on));
+    this.textContent = on ? '\u25D1 Standard Mode' : '\u25D1 Color-Free Mode';
+});
 </script>
 </body></html>
 "@
-# ↑ The  "@  above MUST stay at column 1. No leading spaces. See DEVELOPER NOTES at top.
 
 $utf8Bom = New-Object System.Text.UTF8Encoding $true
 [System.IO.File]::WriteAllText($htmlFile, $htmlContent, $utf8Bom)
 Write-Log "HTML report    : $htmlFile" -Color Green
+#endregion
 
-# ── Alerts ─────────────────────────────────────────────────────────────────────
 $issueRows = $allCsvRows | Where-Object { $_.OverallStatus -in @("DOWN","CRITICAL") }
 if ($issueRows) {
     $bodyLines = @("Service Check Alert - $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))", "")
@@ -1628,7 +1660,7 @@ if ($issueRows) {
             -Body $bodyText -ErrorAction Stop
         Write-Log "Alert email sent to $EmailTo" -Color Green
     } catch {
-        Write-Log "Failed to send alert email: $_" -Color Yellow
+        Write-Log "Failed to send alert email: $_" -Color Red
     }
     if ($TeamsWebhookUrl) {
         Send-TeamsAlert -WebhookUrl $TeamsWebhookUrl `
@@ -1637,7 +1669,6 @@ if ($issueRows) {
     }
 }
 
-# ── Footer ─────────────────────────────────────────────────────────────────────
 $endTime = Get-Date
 $dur     = $endTime - $startTime
 Write-Log ""
