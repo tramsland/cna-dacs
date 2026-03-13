@@ -1,1477 +1,408 @@
-#Requires -RunAsAdministrator
-
-<#
-
-.SYNOPSIS
-
-    Remotely uninstalls and reinstalls the OpenText System Center Agent on a list
-
-    of servers defined in servers.txt. Skips servers that are already current.
-
-    The installer is sourced from the same directory as this script.
-
- 
-
-.NOTES
-
-    Directory layout:
-
-        syscenteragent.ps1      <- this script
-
-        servers.txt             <- one server name/IP per line, # or [ = comment/section
-
-        <installer>.exe/.msi    <- agent installer (auto-detected)
-
- 
-
-.PARAMETER InstallerName
-
-    Filename of the installer. Auto-detected if omitted.
-
- 
-
-.PARAMETER BackupRoot
-
-    Root path ON THE REMOTE MACHINE for backups. Default: C:\Temp\OTAgentBackup
-
- 
-
-.PARAMETER LogDir
-
-    Log path ON THE REMOTE MACHINE. Default: C:\Temp\OTAgentLogs
-
- 
-
-.PARAMETER InstallSilentArgs
-
-    Silent install arguments. Default: /S /quiet
-
- 
-
-.PARAMETER MaxParallel
-
-    Servers to process simultaneously. Default: 5
-
- 
-
-.PARAMETER Credential
-
-    PSCredential for remote sessions. Uses current context if omitted.
-
- 
-
-.EXAMPLE
-
-    .\syscenteragent.ps1
-
- 
-
-.EXAMPLE
-
-    $cred = Get-Credential
-
-    .\syscenteragent.ps1 -InstallerName "OTAgent_2.4.exe" -Credential $cred
-
-#>
-
- 
-
-[CmdletBinding()]
-
-param(
-
-    [string]$InstallerName     = "",
-
-    [string]$BackupRoot        = "C:\Temp\OTAgentBackup",
-
-    [string]$LogDir            = "C:\Temp\OTAgentLogs",
-
-    [string]$InstallSilentArgs = "/S /quiet",
-
-    [int]$MaxParallel          = 5,
-
-    [PSCredential]$Credential  = $null
-
-)
-
- 
-
-# ─── PATHS ────────────────────────────────────────────────────────────────────
-
-$ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Definition
-
-$ServersFile = Join-Path $ScriptDir "servers.txt"
-
-$LocalLogDir = Join-Path $ScriptDir "Logs"
-
-$SummaryLog  = Join-Path $LocalLogDir "Summary_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-
- 
-
-if (-not (Test-Path $LocalLogDir)) { New-Item -ItemType Directory -Path $LocalLogDir -Force | Out-Null }
-
- 
-
-# ─── CONFIGURATION ────────────────────────────────────────────────────────────
-
-$AgentDisplayName   = "OpenText System Center"
-
-$ConfigFilePatterns = @("*.cfg", "*.xml", "*.ini", "*.conf", "*.json")
-
-$ConfigSubDirs      = @("config", "conf", "settings", "data", "configuration")
-
-$KnownServiceNames  = @("OTSCAgent", "OpenTextSystemCenterAgent")
-
-$RemoteStagingDir   = "C:\DLA-failsafe\patching"
-
- 
-
-# ─── LOGGING ──────────────────────────────────────────────────────────────────
-
+#==================================================================================
+#
+#        SCRIPT: System Center Agent Audit (Parallel)
+#
+#        DESCRIPTION:
+#        Evaluates the current state of the System Center (SCOM/OMS) agent
+#        across a list of remote servers. For each server, reports:
+#          - Content Server instance name (resolved from service metadata)
+#          - System Center Agent service status
+#          - Installed agent version
+#          - All installation path mappings resolved from the service
+#
+#        servers.txt format:
+#        - Place in the same directory as this script.
+#        - Zones defined using [Zone Name] headers.
+#        - One FQDN per line. Instance name is resolved automatically.
+#        - Lines starting with # are comments and ignored.
+#        - Blank lines are ignored.
+#
+#        Example servers.txt:
+#
+#          [Production - Public]
+#          prodpub1.domain.com
+#          prodpub2.domain.com
+#
+#          [Production - Private]
+#          prodpriv1.domain.com
+#
+#==================================================================================
+
+#region Configuration
+$configFile = Join-Path $PSScriptRoot "servers.txt"
+if (-not (Test-Path $configFile)) {
+    Write-Host "ERROR: Server config file not found: $configFile" -ForegroundColor Red
+    Write-Host "Create a 'servers.txt' file in the same directory as this script." -ForegroundColor Yellow
+    Write-Host "One FQDN per line. Zone headers: [Zone Name]" -ForegroundColor Yellow
+    exit 1
+}
+
+$logDir          = "C:\Logs"
+$localLogPath    = Join-Path $logDir "SCOMAgentAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$csvPath         = Join-Path $logDir "SCOMAgentAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$maxParallelJobs = 5
+#endregion
+
+#region Helpers
 function Write-Log {
-
     param(
-
-        [string]$Msg,
-
-        [string]$Server = "ORCHESTRATOR",
-
-        [ValidateSet("INFO","WARN","ERROR","SUCCESS","SECTION")]$Level = "INFO"
-
+        [string]$Message,
+        [string]$Level = 'INFO',
+        [string]$Color = 'White',
+        [switch]$Spacer
     )
-
-    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Server] [$Level] $Msg"
-
-    $line | Tee-Object -FilePath $SummaryLog -Append | Write-Host -ForegroundColor $(
-
-        switch ($Level) {
-
-            "ERROR"   { "Red"     }
-
-            "WARN"    { "Yellow"  }
-
-            "SUCCESS" { "Green"   }
-
-            "SECTION" { "Magenta" }
-
-            default   { "Cyan"    }
-
-        }
-
-    )
-
-}
-
- 
-
-function Write-Section {
-
-    param([string]$T, [string]$S = "ORCHESTRATOR")
-
-    Write-Log "===== $T =====" -Server $S -Level SECTION
-
-}
-
- 
-
-# ─── RESOLVE LOCAL INSTALLER ──────────────────────────────────────────────────
-
-Write-Section "INIT"
-
-Write-Log "Script directory : $ScriptDir"
-
-Write-Log "Servers file     : $ServersFile"
-
- 
-
-if ($InstallerName -ne "") {
-
-    $LocalInstaller = Join-Path $ScriptDir $InstallerName
-
-} else {
-
-    Write-Log "Auto-detecting installer in script directory..."
-
-    $LocalInstaller = Get-ChildItem -Path $ScriptDir -File |
-
-        Where-Object { $_.Extension -in @(".exe",".msi") -and
-
-                       $_.Name -match "opentext|otagent|systemcenter" } |
-
-        Sort-Object LastWriteTime -Descending |
-
-        Select-Object -First 1 -ExpandProperty FullName
-
-}
-
- 
-
-if (-not $LocalInstaller -or -not (Test-Path $LocalInstaller)) {
-
-    Write-Log "No installer found in script directory: $ScriptDir" -Level ERROR
-
-    Write-Log "Place the installer (.exe or .msi) in the same folder as this script." -Level ERROR
-
-    exit 1
-
-}
-
- 
-
-Write-Log "Installer found  : $LocalInstaller" -Level SUCCESS
-
-$InstallerFileName = Split-Path $LocalInstaller -Leaf
-
- 
-
-# Read installer version from file metadata
-
-$InstallerVersion = $null
-
-try {
-
-    $fi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($LocalInstaller)
-
-    $InstallerVersion = if ($fi.FileVersion) { $fi.FileVersion -replace '\s','' } else { $fi.ProductVersion -replace '\s','' }
-
-    Write-Log "Installer version: $InstallerVersion" -Level SUCCESS
-
-} catch {
-
-    Write-Log "Could not read installer file version – version check will be skipped." -Level WARN
-
-}
-
- 
-
-# ─── LOAD SERVER LIST ─────────────────────────────────────────────────────────
-
-if (-not (Test-Path $ServersFile)) {
-
-    Write-Log "servers.txt not found at: $ServersFile" -Level ERROR
-
-    exit 1
-
-}
-
- 
-
-$Servers = Get-Content $ServersFile |
-
-    ForEach-Object { $_.Trim() } |
-
-    Where-Object   { $_ -ne "" -and $_ -notmatch "^[#\[]" }
-
- 
-
-if ($Servers.Count -eq 0) {
-
-    Write-Log "No servers found in servers.txt" -Level ERROR
-
-    exit 1
-
-}
-
- 
-
-Write-Log "Servers to process: $($Servers.Count)" -Level SUCCESS
-
-$Servers | ForEach-Object { Write-Log "  -> $_" }
-
- 
-
-# ─── REMOTE SCRIPTBLOCK ───────────────────────────────────────────────────────
-
-$RemoteBlock = {
-
-    param(
-
-        $InstallerPath,
-
-        $BackupRoot,
-
-        $LogDir,
-
-        $InstallSilentArgs,
-
-        $AgentDisplayName,
-
-        $ConfigFilePatterns,
-
-        $ConfigSubDirs,
-
-        $KnownServiceNames,
-
-        $InstallerVersion
-
-    )
-
- 
-
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-
-    $LogFile   = Join-Path $LogDir "OTAgent_Reinstall_$timestamp.log"
-
-    $BackupDir = Join-Path $BackupRoot $timestamp
-
- 
-
-    foreach ($d in @($LogDir, $BackupDir)) {
-
-        if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
-
+    if ($Spacer) {
+        Add-Content -Path $localLogPath -Value ''
+        Write-Host ''
+        return
     }
+    $entry = "[$Level] - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+    Write-Host $entry -ForegroundColor $Color
+    Add-Content -Path $localLogPath -Value $entry
+}
 
- 
-
-    function Write-Log {
-
-        param([string]$Msg, [ValidateSet("INFO","WARN","ERROR","SUCCESS","SECTION")]$Level = "INFO")
-
-        $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Msg"
-
-        Add-Content -Path $LogFile -Value $line
-
-        Write-Output $line
-
-    }
-
- 
-
-    function Write-Section { param([string]$T) Write-Log "===== $T =====" -Level SECTION }
-
- 
-
-    function Parse-IniFlat {
-
-        param([string]$Path)
-
-        $tbl = [hashtable]@{}
-
-        Get-Content $Path | ForEach-Object {
-
-            $line = $_.Trim()
-
-            if ($line -ne "" -and $line -notmatch "^[#;]" -and $line -match "^([^=]+)=(.*)$") {
-
-                $tbl[$Matches[1].Trim()] = $Matches[2].Trim()
-
+function Parse-ServersFile {
+    param([string]$Path)
+    $groups  = [ordered]@{}
+    $current = 'Ungrouped'
+    $count   = 0
+    foreach ($line in (Get-Content $Path)) {
+        $t = $line.Trim()
+        if ($t -match '^\s*$' -or $t -match '^\s*#') { continue }
+        if ($t -match '^\[(.+)\]$') {
+            $current = $Matches[1].Trim()
+            if (-not $groups.Contains($current)) {
+                $groups[$current] = [System.Collections.Generic.List[string]]::new()
             }
-
+            continue
         }
+        if (-not $groups.Contains($current)) {
+            $groups[$current] = [System.Collections.Generic.List[string]]::new()
+        }
+        $groups[$current].Add($t)
+        $count++
+    }
+    return $groups, $count
+}
+#endregion
 
-        return $tbl
-
+#region Remote Audit Script Block
+$auditScript = {
+    $result = [pscustomobject]@{
+        ComputerName        = $env:COMPUTERNAME
+        Zone                = $null   # populated by caller
+        ContentServerInstance = $null
+        ContentServerDir    = $null
+        AgentServiceName    = $null
+        AgentDisplayName    = $null
+        AgentStatus         = $null
+        AgentStartType      = $null
+        AgentVersion        = $null
+        AgentInstallPath    = $null
+        AgentExePath        = $null
+        AgentDataPath       = $null
+        AgentConfigPath     = $null
+        AgentAccountName    = $null
+        AgentDescription    = $null
+        AgentPID            = $null
+        Errors              = [System.Collections.Generic.List[string]]::new()
     }
 
- 
+    try {
+        $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
 
-    $uninstallKeys = @(
+        #--- Resolve Content Server instance (mirrors existing discovery logic) ---
+        $csSvc = $allSvcs | Where-Object {
+            $_.Description -like '*Content Server*' -and
+            $_.Description -notlike '*Content Server Admin*'
+        } | Select-Object -First 1
 
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        if ($csSvc) {
+            $result.ContentServerInstance = $csSvc.Name
 
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-
-    )
-
- 
-
-    # ── Locate agent ──────────────────────────────────────────────────────────
-
-    Write-Section "LOCATE"
-
-    $agentEntry = $uninstallKeys |
-
-        ForEach-Object { Get-ItemProperty $_ -ErrorAction SilentlyContinue } |
-
-        Where-Object   { $_.DisplayName -like "*$AgentDisplayName*" } |
-
-        Select-Object  -First 1
-
- 
-
-    $installPath = $null
-
-    if ($agentEntry) {
-
-        Write-Log "Found: $($agentEntry.DisplayName) v$($agentEntry.DisplayVersion)" -Level SUCCESS
-
-        $installPath = $agentEntry.InstallLocation
-
-        if (-not $installPath -or -not (Test-Path $installPath)) {
-
-            $exePath     = ($agentEntry.UninstallString -replace '"','') -split ' ' | Select-Object -First 1
-
-            $installPath = if (Test-Path $exePath) { Split-Path $exePath -Parent } else { $null }
-
-        }
-
-        Write-Log "Install path: $installPath"
-
-    } else {
-
-        Write-Log "No existing agent found. Proceeding to fresh install." -Level WARN
-
-    }
-
- 
-
-    # ── Version check ─────────────────────────────────────────────────────────
-
-    Write-Section "VERSION CHECK"
-
-    $installedVersion = if ($agentEntry) { $agentEntry.DisplayVersion } else { $null }
-
-    Write-Log "Installed version : $(if ($installedVersion) { $installedVersion } else { 'Not installed' })"
-
-    Write-Log "Installer version : $(if ($InstallerVersion) { $InstallerVersion } else { 'Unknown' })"
-
- 
-
-    if ($installedVersion -and $InstallerVersion) {
-
-        try {
-
-            $vInstalled = [System.Version]::Parse($installedVersion)
-
-            $vInstaller = [System.Version]::Parse($InstallerVersion)
-
- 
-
-            if ($vInstalled -ge $vInstaller) {
-
-                Write-Log "Already at v$installedVersion – no upgrade needed. Skipping." -Level SUCCESS
-
-                return @{
-
-                    Success       = $true
-
-                    Message       = "SKIPPED - Already at v$installedVersion (installer is v$InstallerVersion)"
-
-                    Log           = $LogFile
-
-                    BackupDir     = $null
-
-                    HealthSummary = [ordered]@{
-
-                        Registry   = "OK - v$installedVersion"
-
-                        InstallDir = if ($installPath -and (Test-Path $installPath)) { "OK" } else { "WARN - not verified" }
-
-                        ConfigIni  = "SKIPPED"
-
-                        LocalCert  = "SKIPPED"
-
-                        Services   = "SKIPPED"
-
+            if ($csSvc.PathName) {
+                $exePath = $csSvc.PathName -replace '^"([^"]+)".*$', '$1' `
+                                           -replace '^([^\s]+\.exe).*$', '$1'
+                $dir   = Split-Path $exePath -Parent
+                $csDir = $null
+                for ($i = 0; $i -lt 6; $i++) {
+                    if ([IO.Path]::GetFileName($dir) -ieq 'contentserver') {
+                        $csDir = $dir; break
                     }
-
-                }
-
-            } else {
-
-                Write-Log "Upgrade required: v$installedVersion -> v$InstallerVersion" -Level WARN
-
-            }
-
-        } catch {
-
-            Write-Log "Version parse failed – proceeding with reinstall." -Level WARN
-
-        }
-
-    } elseif (-not $InstallerVersion) {
-
-        Write-Log "Installer version unreadable – proceeding with reinstall." -Level WARN
-
-    }
-
- 
-
-    # ── Detect services ───────────────────────────────────────────────────────
-
-    Write-Section "SERVICES"
-
-    $detectedServices = @()
-
-    foreach ($svc in $KnownServiceNames) {
-
-        if (Get-Service -Name $svc -ErrorAction SilentlyContinue) { $detectedServices += $svc }
-
-    }
-
-    if ($installPath) {
-
-        $norm = $installPath.TrimEnd('\').ToLower()
-
-        Get-WmiObject Win32_Service | Where-Object {
-
-            $_.PathName -and $_.PathName.ToLower().TrimStart('"') -like "$norm\*"
-
-        } | ForEach-Object {
-
-            if ($detectedServices -notcontains $_.Name) { $detectedServices += $_.Name }
-
-        }
-
-    }
-
-    Write-Log "Services detected: $($detectedServices -join ', ')"
-
- 
-
-    # ── Stop services ─────────────────────────────────────────────────────────
-
-    Write-Section "STOP SERVICES"
-
-    foreach ($svc in $detectedServices) {
-
-        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-
-        if ($s -and $s.Status -ne 'Stopped') {
-
-            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
-
-            Start-Sleep -Seconds 2
-
-            Write-Log "Stopped: $svc" -Level SUCCESS
-
-        }
-
-    }
-
- 
-
-    # ── Full backup ───────────────────────────────────────────────────────────
-
-    Write-Section "FULL BACKUP"
-
-    $backupInstallDir = Join-Path $BackupDir "InstallDir"
-
-    if ($installPath -and (Test-Path $installPath)) {
-
-        try {
-
-            Copy-Item -Path $installPath -Destination $backupInstallDir -Recurse -Force
-
-            $sz = [math]::Round((Get-ChildItem $backupInstallDir -Recurse -File |
-
-                Measure-Object -Property Length -Sum).Sum / 1MB, 2)
-
-            Write-Log "Backup complete. Size: ${sz} MB" -Level SUCCESS
-
-        } catch {
-
-            Write-Log "Backup failed: $_" -Level ERROR
-
-            return @{ Success=$false; Message="Backup failed: $_"; Log=$LogFile; BackupDir=$BackupDir; HealthSummary=@{} }
-
-        }
-
-    } else {
-
-        Write-Log "Install dir not found – skipping full backup." -Level WARN
-
-    }
-
- 
-
-    @{ InstallPath=$installPath; Version=$agentEntry.DisplayVersion; Timestamp=$timestamp } |
-
-        ConvertTo-Json | Set-Content (Join-Path $BackupDir "backup_meta.json")
-
- 
-
-    # ── Identify config files ─────────────────────────────────────────────────
-
-    $configMap = [hashtable]@{}
-
-    if (Test-Path $backupInstallDir) {
-
-        foreach ($sub in $ConfigSubDirs) {
-
-            $sp = Join-Path $backupInstallDir $sub
-
-            if (Test-Path $sp) {
-
-                foreach ($pat in $ConfigFilePatterns) {
-
-                    Get-ChildItem $sp -Filter $pat -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-
-                        $rel  = $_.FullName.Substring($backupInstallDir.Length).TrimStart('\')
-
-                        $orig = Join-Path $installPath $rel
-
-                        $configMap[$_.FullName] = $orig
-
+                    $candidate = Join-Path $dir 'contentserver'
+                    if (Test-Path $candidate -PathType Container) {
+                        $csDir = $candidate; break
                     }
-
+                    $parent = Split-Path $dir -Parent
+                    if ($parent -eq $dir) { break }
+                    $dir = $parent
                 }
-
-            }
-
-        }
-
-        Write-Log "$($configMap.Count) config file(s) identified for restore."
-
-    }
-
- 
-
-    # ── Uninstall ─────────────────────────────────────────────────────────────
-
-    Write-Section "UNINSTALL"
-
-    if ($agentEntry) {
-
-        $cmd   = if ($agentEntry.QuietUninstallString) { $agentEntry.QuietUninstallString } else { $agentEntry.UninstallString }
-
-        $isMsi = $cmd -match "msiexec" -or $agentEntry.PSChildName -match "^\{"
-
- 
-
-        if ($isMsi) {
-
-            $pc = if ($agentEntry.PSChildName -match "^\{") {
-
-                $agentEntry.PSChildName
-
+                $result.ContentServerDir = if ($csDir) { $csDir } else { 'Not resolved' }
             } else {
-
-                $cmd -split ' ' | Where-Object { $_ -match "^\{" } | Select-Object -First 1
-
+                $result.ContentServerDir = 'No PathName on service'
             }
-
-            $proc = Start-Process "msiexec.exe" `
-
-                -ArgumentList "/x $pc /qn /norestart /l*v `"$LogDir\uninstall_$timestamp.log`"" `
-
-                -Wait -PassThru
-
         } else {
-
-            if ($cmd -notmatch "/S|/silent|/quiet") { $cmd += " /S" }
-
-            $proc = Start-Process "cmd.exe" -ArgumentList "/c `"$cmd`"" -Wait -PassThru
-
+            $result.Errors.Add("WARNING: No Content Server service found (excluding Admin).")
         }
 
- 
-
-        if ($proc.ExitCode -notin @(0,3010,1605)) {
-
-            Write-Log "Uninstall failed. Exit code: $($proc.ExitCode)" -Level ERROR
-
-            if (Test-Path $backupInstallDir) {
-
-                if (Test-Path $installPath) { Remove-Item $installPath -Recurse -Force -ErrorAction SilentlyContinue }
-
-                Copy-Item $backupInstallDir $installPath -Recurse -Force
-
-                Write-Log "Rollback applied." -Level WARN
-
-            }
-
-            return @{ Success=$false; Message="Uninstall failed (code $($proc.ExitCode))"; Log=$LogFile; BackupDir=$BackupDir; HealthSummary=@{} }
-
-        }
-
-        Write-Log "Uninstall complete. Exit code: $($proc.ExitCode)" -Level SUCCESS
-
-        Start-Sleep -Seconds 5
-
-    }
-
- 
-
-    # ── Install ───────────────────────────────────────────────────────────────
-
-    Write-Section "INSTALL"
-
-    $ext         = [System.IO.Path]::GetExtension($InstallerPath).ToLower()
-
-    $installArgs = $InstallSilentArgs
-
- 
-
-    if ($installPath) {
-
-        if ($ext -eq ".msi") {
-
-            $installArgs = "/i `"$InstallerPath`" /qn /norestart INSTALLDIR=`"$installPath`" /l*v `"$LogDir\install_$timestamp.log`""
-
-        } else {
-
-            $installArgs = "$InstallSilentArgs /D=`"$installPath`""
-
-        }
-
-    }
-
- 
-
-    if ($ext -eq ".msi") {
-
-        $proc = Start-Process "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
-
-    } else {
-
-        $proc = Start-Process -FilePath $InstallerPath -ArgumentList $installArgs -Wait -PassThru
-
-    }
-
- 
-
-    if ($proc.ExitCode -notin @(0,3010)) {
-
-        Write-Log "Install failed. Exit code: $($proc.ExitCode)" -Level ERROR
-
-        if (Test-Path $backupInstallDir) {
-
-            if (Test-Path $installPath) { Remove-Item $installPath -Recurse -Force -ErrorAction SilentlyContinue }
-
-            Copy-Item $backupInstallDir $installPath -Recurse -Force
-
-            Write-Log "Rollback applied." -Level WARN
-
-        }
-
-        return @{ Success=$false; Message="Install failed (code $($proc.ExitCode))"; Log=$LogFile; BackupDir=$BackupDir; HealthSummary=@{} }
-
-    }
-
-    Write-Log "Install complete. Exit code: $($proc.ExitCode)" -Level SUCCESS
-
- 
-
-    # ── Restore config files ──────────────────────────────────────────────────
-
-    Write-Section "RESTORE CONFIG"
-
-    foreach ($entry in $configMap.GetEnumerator()) {
-
-        $dest = $entry.Value
-
-        if (Test-Path $entry.Key) {
-
-            $dd = Split-Path $dest
-
-            if (-not (Test-Path $dd)) { New-Item -ItemType Directory -Path $dd -Force | Out-Null }
-
-            Copy-Item $entry.Key $dest -Force
-
-            Write-Log "Restored: $dest" -Level SUCCESS
-
-        }
-
-    }
-
- 
-
-    # ── Merge config.ini ──────────────────────────────────────────────────────
-
-    Write-Section "MERGE CONFIG.INI"
-
-    $oldConfigPath = Join-Path $backupInstallDir "configuration\config.ini"
-
-    $newConfigPath = Join-Path $installPath "configuration\config.ini"
-
- 
-
-    if (-not (Test-Path $oldConfigPath)) {
-
-        Write-Log "Old config.ini not found in backup – skipping merge." -Level WARN
-
-    } elseif (-not (Test-Path $newConfigPath)) {
-
-        Write-Log "New config.ini not found after reinstall – copying old file directly." -Level WARN
-
-        $newConfigDir = Split-Path $newConfigPath
-
-        if (-not (Test-Path $newConfigDir)) { New-Item -ItemType Directory -Path $newConfigDir -Force | Out-Null }
-
-        Copy-Item $oldConfigPath $newConfigPath -Force
-
-        Write-Log "Old config.ini copied to: $newConfigPath" -Level SUCCESS
-
-    } else {
-
-        Write-Log "Merging old config.ini into new (old value wins on conflict)..."
-
-        $oldValues = Parse-IniFlat $oldConfigPath
-
-        $newValues = Parse-IniFlat $newConfigPath
-
-        $added = 0; $preserved = 0; $kept = 0
-
-        $merged = [hashtable]@{}
-
-        foreach ($key in $newValues.Keys) { $merged[$key] = $newValues[$key] }
-
-        foreach ($key in $oldValues.Keys) {
-
-            if ($merged.ContainsKey($key)) {
-
-                if ($merged[$key] -ne $oldValues[$key]) {
-
-                    Write-Log "  CONFLICT [$key] new='$($merged[$key])' -> kept old='$($oldValues[$key])'" -Level WARN
-
-                    $merged[$key] = $oldValues[$key]
-
-                    $preserved++
-
-                } else {
-
-                    $kept++
-
-                }
-
-            } else {
-
-                Write-Log "  ADDED    [$key] = '$($oldValues[$key])'" -Level INFO
-
-                $merged[$key] = $oldValues[$key]
-
-                $added++
-
-            }
-
-        }
-
-        $header = Get-Content $newConfigPath | Where-Object { $_.Trim() -eq "" -or $_.Trim() -match "^[#;]" }
-
-        $body   = $merged.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
-
-        Copy-Item $newConfigPath "$newConfigPath.premerge.bak" -Force
-
-        ($header + $body) | Set-Content -Path $newConfigPath -Encoding UTF8
-
-        Write-Log "Merge complete. Preserved: $preserved, Added: $added, Unchanged: $kept." -Level SUCCESS
-
-        Write-Log "Pre-merge backup: $newConfigPath.premerge.bak"
-
-    }
-
- 
-
-    # ── Restore localcert ─────────────────────────────────────────────────────
-
-    Write-Section "RESTORE LOCALCERT"
-
-    $backedUpCertDir = Join-Path $backupInstallDir "localcert"
-
-    if (Test-Path $backedUpCertDir) {
-
-        if ($installPath) {
-
-            $destCertDir = Join-Path $installPath "localcert"
-
-            try {
-
-                if (Test-Path $destCertDir) { Write-Log "Existing localcert found – overwriting." -Level WARN }
-
-                Copy-Item -Path $backedUpCertDir -Destination $destCertDir -Recurse -Force
-
-                $certCount = (Get-ChildItem $destCertDir -Recurse -File).Count
-
-                Write-Log "localcert restored: $destCertDir ($certCount file(s))" -Level SUCCESS
-
-            } catch {
-
-                Write-Log "Failed to restore localcert: $_" -Level ERROR
-
-            }
-
-        } else {
-
-            Write-Log "Install path unknown – cannot restore localcert." -Level ERROR
-
-        }
-
-    } else {
-
-        Write-Log "localcert not found in backup – skipping." -Level WARN
-
-    }
-
- 
-
-    # ── Start services ────────────────────────────────────────────────────────
-
-    Write-Section "START SERVICES"
-
-    foreach ($svc in $detectedServices) {
-
-        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-
-        if ($s) {
-
-            Start-Service -Name $svc -ErrorAction SilentlyContinue
-
-            Start-Sleep -Seconds 2
-
-            $s.Refresh()
-
-            if ($s.Status -eq 'Running') {
-
-                Write-Log "Started: $svc" -Level SUCCESS
-
-            } else {
-
-                Write-Log "Did not start: $svc" -Level WARN
-
-            }
-
-        }
-
-    }
-
- 
-
-    # ── Verify ────────────────────────────────────────────────────────────────
-
-    Write-Section "VERIFY"
-
- 
-
-    $newEntry = $uninstallKeys |
-
-        ForEach-Object { Get-ItemProperty $_ -ErrorAction SilentlyContinue } |
-
-        Where-Object   { $_.DisplayName -like "*$AgentDisplayName*" } |
-
-        Select-Object  -First 1
-
- 
-
-    $regOk  = $null -ne $newEntry
-
-    $dirOk  = $installPath -and (Test-Path $installPath)
-
- 
-
-    $configIniPath = Join-Path $installPath "configuration\config.ini"
-
-    $configOk      = (Test-Path $configIniPath) -and (Get-Item $configIniPath).Length -gt 0
-
- 
-
-    $certDir   = Join-Path $installPath "localcert"
-
-    $certOk    = Test-Path $certDir
-
-    $certCount = if ($certOk) { (Get-ChildItem $certDir -Recurse -File).Count } else { 0 }
-
- 
-
-    $svcResults = [hashtable]@{}
-
-    foreach ($svc in $detectedServices) {
-
-        $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-
-        $svcResults[$svc] = if ($s) { $s.Status.ToString() } else { "NotFound" }
-
-    }
-
- 
-
-    Write-Log "Registry   : $(if ($regOk) { "$($newEntry.DisplayName) v$($newEntry.DisplayVersion)" } else { 'NOT found' })" -Level $(if ($regOk) { 'SUCCESS' } else { 'ERROR' })
-
-    Write-Log "Install dir: $(if ($dirOk) { 'OK' } else { 'NOT found' })"                                                    -Level $(if ($dirOk) { 'SUCCESS' } else { 'ERROR' })
-
-    Write-Log "config.ini : $(if ($configOk) { 'OK' } else { 'Missing or empty' })"                                          -Level $(if ($configOk) { 'SUCCESS' } else { 'WARN' })
-
-    Write-Log "localcert  : $(if ($certOk) { "OK ($certCount files)" } else { 'NOT found' })"                                 -Level $(if ($certOk) { 'SUCCESS' } else { 'WARN' })
-
-    $svcResults.GetEnumerator() | ForEach-Object {
-
-        Write-Log "Service [$($_.Key)]: $($_.Value)" -Level $(if ($_.Value -eq 'Running') { 'SUCCESS' } else { 'WARN' })
-
-    }
-
- 
-
-    $verified = $regOk -and $dirOk
-
-    $healthSummary = [ordered]@{
-
-        Registry   = if ($regOk)    { "OK - v$($newEntry.DisplayVersion)" } else { "FAIL" }
-
-        InstallDir = if ($dirOk)    { "OK" } else { "FAIL" }
-
-        ConfigIni  = if ($configOk) { "OK" } else { "WARN - missing or empty" }
-
-        LocalCert  = if ($certOk)   { "OK ($certCount files)" } else { "WARN - missing" }
-
-        Services   = ($svcResults.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; "
-
-    }
-
- 
-
-    return @{
-
-        Success       = $verified
-
-        Message       = if ($verified) { "Reinstall succeeded. v$($newEntry.DisplayVersion)" } else { "Reinstall may have failed – check log." }
-
-        Log           = $LogFile
-
-        BackupDir     = $BackupDir
-
-        HealthSummary = $healthSummary
-
-    }
-
-}
-
- 
-
-# ─── PROCESS SERVERS ──────────────────────────────────────────────────────────
-
-Write-Section "REMOTE EXECUTION"
-
- 
-
-$results        = [System.Collections.Generic.List[object]]::new()
-
-$jobs           = @()
-
-$remoteBlockStr = $RemoteBlock.ToString()
-
- 
-
-foreach ($server in $Servers) {
-
- 
-
-    # Wait until a slot is free by polling active jobs
-
-    while (($jobs | Where-Object { $_.Job.State -eq 'Running' }).Count -ge $MaxParallel) {
-
-        Start-Sleep -Milliseconds 500
-
-    }
-
- 
-
-    Write-Log "Dispatching job to: $server" -Server $server
-
- 
-
-    $job = Start-Job -ScriptBlock {
-
-        param(
-
-            $server, $localInstaller, $installerFileName, $remoteStagingDir,
-
-            $remoteBlockStr, $backupRoot, $logDir, $installSilentArgs,
-
-            $agentDisplayName, $configFilePatterns, $configSubDirs,
-
-            $knownServiceNames, $installerVersion, $credential
-
-        )
-
- 
-
-        $result = @{ Server=$server; Success=$false; Message=""; Log=""; BackupDir=""; HealthSummary=@{} }
-
- 
-
-        # Detect if target is the local machine
-
-        $localNames = @(
-
-            $env:COMPUTERNAME.ToLower(),
-
-            "$($env:COMPUTERNAME).$($env:USERDNSDOMAIN)".ToLower(),
-
-            "localhost",
-
-            "127.0.0.1"
-
-        )
-
-        $isLocal = $localNames -contains $server.ToLower() -or
-
-                   $server.ToLower().Split('.')[0] -eq $env:COMPUTERNAME.ToLower()
-
- 
-
-        try {
-
-            $remoteBlock = [ScriptBlock]::Create($remoteBlockStr)
-
- 
-
-            if ($isLocal) {
-
-                # ── Local execution ───────────────────────────────────────
-
-                if (-not (Test-Path $remoteStagingDir)) {
-
-                    New-Item -ItemType Directory -Path $remoteStagingDir -Force | Out-Null
-
-                }
-
-                $remoteInstallerPath = Join-Path $remoteStagingDir $installerFileName
-
-                Copy-Item -Path $localInstaller -Destination $remoteInstallerPath -Force
-
- 
-
-                $res = & $remoteBlock $remoteInstallerPath $backupRoot $logDir $installSilentArgs `
-
-                    $agentDisplayName $configFilePatterns $configSubDirs $knownServiceNames $installerVersion
-
- 
-
-                # Local run – installer stays in place, nothing removed
-
- 
-
-            } else {
-
-                # ── Remote execution ──────────────────────────────────────
-
- 
-
-                # Pre-flight: test connectivity before attempting anything
-
-                Write-Output "[$server] Testing connectivity..."
-
-                $pingOk = Test-Connection -ComputerName $server -Count 1 -Quiet -ErrorAction SilentlyContinue
-
-                if (-not $pingOk) {
-
-                    $result.Message = "UNREACHABLE - Host did not respond to ping"
-
-                    return $result
-
-                }
-
- 
-
-                $winrmOk = Test-NetConnection -ComputerName $server -Port 5985 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
-
-                if (-not $winrmOk.TcpTestSucceeded) {
-
-                    $result.Message = "UNREACHABLE - WinRM port 5985 not accessible"
-
-                    return $result
-
-                }
-
- 
-
-                # Build session first so we can use it for file copy if share fails
-
-                $sessionParams = @{ ComputerName=$server; ErrorAction="Stop" }
-
-                if ($credential) { $sessionParams.Credential = $credential }
-
-                $session = New-PSSession @sessionParams
-
- 
-
-                # Ensure staging directory exists on remote
-
-                Invoke-Command -Session $session -ScriptBlock {
-
-                    param($d)
-
-                    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
-
-                } -ArgumentList $remoteStagingDir
-
- 
-
-                $remoteInstallerPath = Join-Path $remoteStagingDir $installerFileName
-
- 
-
-                # Try admin share copy first (faster for large files)
-
-                $usedShare = $false
-
-                $adminShare = \\$server\C$\DLA-failsafe\patching
-
-                try {
-
-                    if (-not (Test-Path $adminShare)) {
-
-                        New-Item -ItemType Directory -Path $adminShare -Force -ErrorAction Stop | Out-Null
-
-                    }
-
-                    $remoteDest = Join-Path $adminShare $installerFileName
-
-                    Copy-Item -Path $localInstaller -Destination $remoteDest -Force -ErrorAction Stop
-
-                    # Verify the file actually landed
-
-                    $verifyPath = \\$server\C$\DLA-failsafe\patching\$installerFileName
-
-                    if (Test-Path $verifyPath) {
-
-                        $usedShare = $true
-
-                        Write-Output "[$server] Installer copied via admin share."
-
-                    }
-
-                } catch {
-
-                    $usedShare = $false
-
-                }
-
- 
-
-                # Fallback: copy over PSSession if share failed or file didn't land
-
-                if (-not $usedShare) {
-
-                    Write-Output "[$server] Admin share unavailable – copying via PSSession..."
-
-                    Copy-Item -Path $localInstaller -Destination $remoteInstallerPath -ToSession $session -Force
-
-                }
-
- 
-
-                # Verify installer exists on remote before proceeding
-
-                $installerExists = Invoke-Command -Session $session -ScriptBlock {
-
-                    param($p) Test-Path $p
-
-                } -ArgumentList $remoteInstallerPath
-
- 
-
-                if (-not $installerExists) {
-
-                    Remove-PSSession $session -ErrorAction SilentlyContinue
-
-                    $result.Message = "FAILED - Installer could not be copied to remote path: $remoteInstallerPath"
-
-                    return $result
-
-                }
-
- 
-
-                Write-Output "[$server] Installer verified at $remoteInstallerPath"
-
- 
-
-                $res = Invoke-Command -Session $session -ScriptBlock $remoteBlock -ArgumentList @(
-
-                    $remoteInstallerPath, $backupRoot, $logDir, $installSilentArgs,
-
-                    $agentDisplayName, $configFilePatterns, $configSubDirs,
-
-                    $knownServiceNames, $installerVersion
-
+        #--- Resolve System Center / SCOM / OMS Agent service ---
+        # Searches by known service names and display name patterns
+        $agentSvc = $allSvcs | Where-Object {
+            $_.Name        -eq 'OTSystemCenterAgent'             -or
+            $_.DisplayName -eq 'Open Text System Center Agent'   -or
+            $_.Description -like '*Open Text System Center Agent*'
+        } | Select-Object -First 1
+
+        if ($agentSvc) {
+            $result.AgentServiceName  = $agentSvc.Name
+            $result.AgentDisplayName  = $agentSvc.DisplayName
+            $result.AgentStatus       = $agentSvc.State          # Running / Stopped / etc.
+            $result.AgentStartType    = $agentSvc.StartMode       # Auto / Manual / Disabled
+            $result.AgentAccountName  = $agentSvc.StartName
+            $result.AgentDescription  = $agentSvc.Description
+            $result.AgentPID          = $agentSvc.ProcessId
+
+            #--- Resolve paths from service PathName ---
+            if ($agentSvc.PathName) {
+                $rawExe = $agentSvc.PathName -replace '^"([^"]+)".*$', '$1' `
+                                             -replace '^([^\s]+\.exe).*$', '$1'
+                $result.AgentExePath     = $rawExe
+                $result.AgentInstallPath = Split-Path $rawExe -Parent
+
+                # Attempt to resolve well-known sub-paths relative to install dir
+                $installDir = $result.AgentInstallPath
+
+                $dataCandidates = @(
+                    (Join-Path $installDir 'Health Service State'),
+                    (Join-Path (Split-Path $installDir -Parent) 'Health Service State'),
+                    (Join-Path $installDir 'Data')
                 )
+                foreach ($c in $dataCandidates) {
+                    if (Test-Path $c) { $result.AgentDataPath = $c; break }
+                }
 
- 
-
-                Invoke-Command -Session $session -ScriptBlock {
-
-                    param($f) Remove-Item $f -Force -ErrorAction SilentlyContinue
-
-                } -ArgumentList $remoteInstallerPath
-
- 
-
-                Remove-PSSession $session -ErrorAction SilentlyContinue
-
+                $configCandidates = @(
+                    (Join-Path $installDir 'MOMAgent.ini'),
+                    (Join-Path $installDir 'AgentCfg.xml'),
+                    (Join-Path $installDir 'conf'),
+                    (Join-Path (Split-Path $installDir -Parent) 'conf')
+                )
+                foreach ($c in $configCandidates) {
+                    if (Test-Path $c) { $result.AgentConfigPath = $c; break }
+                }
+            } else {
+                $result.Errors.Add("WARNING: Agent service '$($agentSvc.Name)' has no PathName.")
             }
 
- 
+            #--- Resolve installed version from the executable ---
+            if ($result.AgentExePath -and (Test-Path $result.AgentExePath)) {
+                try {
+                    $vi = (Get-Item $result.AgentExePath -ErrorAction Stop).VersionInfo
+                    $result.AgentVersion = $vi.FileVersion
+                } catch {
+                    $result.Errors.Add("WARNING: Could not read file version from '$($result.AgentExePath)': $_")
+                }
+            }
 
-            $result.Success       = $res.Success
+            #--- Fallback: try registry for version ---
+            if (-not $result.AgentVersion) {
+                $regPaths = @(
+                    'HKLM:\SOFTWARE\Microsoft\Microsoft Operations Manager\3.0\Setup',
+                    'HKLM:\SOFTWARE\Microsoft\System Center Operations Manager\12\Setup',
+                    'HKLM:\SOFTWARE\Microsoft\System Center\2012\Agent\Setup',
+                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft Operations Manager\3.0\Setup'
+                )
+                foreach ($rp in $regPaths) {
+                    if (Test-Path $rp) {
+                        $ver = (Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue).AgentVersion
+                        if (-not $ver) {
+                            $ver = (Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue).CurrentVersion
+                        }
+                        if ($ver) {
+                            $result.AgentVersion = $ver
 
-            $result.Message       = $res.Message
+                            # Also pull install path from registry if not resolved from service
+                            if (-not $result.AgentInstallPath) {
+                                $regInstall = (Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue).InstallDirectory
+                                if ($regInstall) { $result.AgentInstallPath = $regInstall }
+                            }
+                            break
+                        }
+                    }
+                }
+            }
 
-            $result.Log           = $res.Log
-
-            $result.BackupDir     = $res.BackupDir
-
-            $result.HealthSummary = $res.HealthSummary
-
- 
-
-        } catch {
-
-            $result.Message = "Connection or execution error: $_"
-
+        } else {
+            $result.AgentStatus  = 'NOT INSTALLED'
+            $result.AgentVersion = 'N/A'
+            $result.Errors.Add("WARNING: No System Center Agent service found on this host.")
         }
-
- 
-
-        return $result
-
- 
-
-    } -ArgumentList @(
-
-        $server, $LocalInstaller, $InstallerFileName, $RemoteStagingDir,
-
-        $remoteBlockStr, $BackupRoot, $LogDir, $InstallSilentArgs,
-
-        $AgentDisplayName, $ConfigFilePatterns, $ConfigSubDirs,
-
-        $KnownServiceNames, $InstallerVersion, $Credential
-
-    )
-
- 
-
-    $jobs += [PSCustomObject]@{ Job=$job; Server=$server }
-
-    Write-Log "Job started (ID $($job.Id))" -Server $server
-
-}
-
- 
-
-# ─── COLLECT RESULTS ──────────────────────────────────────────────────────────
-
-Write-Log "Waiting for all jobs to complete..."
-
- 
-
-foreach ($j in $jobs) {
-
-    Wait-Job $j.Job | Out-Null
-
-    $res = Receive-Job $j.Job
-
-    Remove-Job $j.Job
-
- 
-
-    $level = if     ($res.Message -like "SKIPPED*") { "INFO"    }
-
-             elseif ($res.Success)                  { "SUCCESS" }
-
-             else                                   { "ERROR"   }
-
- 
-
-    Write-Log "$($res.Message)" -Server $j.Server -Level $level
-
-    if ($res.Log)       { Write-Log "Remote log : $($res.Log)"       -Server $j.Server }
-
-    if ($res.BackupDir) { Write-Log "Backup dir : $($res.BackupDir)" -Server $j.Server }
-
- 
-
-    if ($res.HealthSummary -and $res.HealthSummary.Count -gt 0) {
-
-        Write-Log "── Health ──────────────────────────────" -Server $j.Server -Level SECTION
-
-        $res.HealthSummary.GetEnumerator() | ForEach-Object {
-
-            $hl = if   ($_.Value -like "FAIL*") { "ERROR" }
-
-                  elseif ($_.Value -like "WARN*") { "WARN"  }
-
-                  else                            { "SUCCESS" }
-
-            Write-Log "  $($_.Key.PadRight(12)): $($_.Value)" -Server $j.Server -Level $hl
-
-        }
-
+    }
+    catch {
+        $result.Errors.Add("ERROR during audit: $_")
     }
 
- 
+    return $result
+}
+#endregion
 
-    $results.Add([PSCustomObject]@{
+#region Main
+if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
-        Server     = $j.Server
+$startTime = Get-Date
+Write-Log "---------------- SCOM AGENT AUDIT STARTED ----------------" -Color Cyan
+Write-Log "Started  : $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Color Gray
+Write-Log "Log file : $localLogPath" -Color Gray
+Write-Log "CSV file : $csvPath" -Color Gray
 
-        Success    = $res.Success
+$serverGroups, $totalEntries = Parse-ServersFile -Path $configFile
 
-        Message    = $res.Message
+if ($totalEntries -eq 0) {
+    Write-Log "ERROR: No valid server entries found in $configFile" -Level 'ERROR' -Color Red
+    exit 1
+}
 
-        RemoteLog  = $res.Log
+Write-Log "Servers  : $totalEntries across $($serverGroups.Keys.Count) zone(s)" -Color Gray
+Write-Log -Spacer
 
-        BackupDir  = $res.BackupDir
+# --- Queue parallel audit jobs ---
+Write-Log "Queuing audit jobs (max $maxParallelJobs parallel)..." -Color Yellow
 
-        Registry   = $res.HealthSummary.Registry
+$jobs = [System.Collections.Generic.List[pscustomobject]]::new()
 
-        InstallDir = $res.HealthSummary.InstallDir
+foreach ($group in $serverGroups.Keys) {
+    foreach ($fqdn in $serverGroups[$group]) {
 
-        ConfigIni  = $res.HealthSummary.ConfigIni
+        while ((Get-Job -State Running).Count -ge $maxParallelJobs) { Start-Sleep -Milliseconds 500 }
 
-        LocalCert  = $res.HealthSummary.LocalCert
+        $job = Invoke-Command -ComputerName $fqdn `
+            -ScriptBlock $auditScript `
+            -AsJob -ErrorAction SilentlyContinue
+        $job.Name = $fqdn
 
-        Services   = $res.HealthSummary.Services
+        $jobs.Add([pscustomobject]@{
+            Job          = $job
+            ComputerName = $fqdn
+            GroupName    = $group
+        })
+    }
+}
 
+Write-Log "All $($jobs.Count) job(s) queued. Waiting for completion..." -Color Yellow
+$jobs | ForEach-Object { $_.Job } | Wait-Job | Out-Null
+Write-Log "All jobs finished. Aggregating results." -Color Yellow
+Write-Log -Spacer
+
+# --- Collect results ---
+$allResults = [System.Collections.Generic.List[pscustomobject]]::new()
+$prevGroup  = $null
+
+foreach ($entry in ($jobs | Sort-Object GroupName, ComputerName)) {
+
+    if ($entry.GroupName -ne $prevGroup) {
+        Write-Log "########################################" -Color Magenta
+        Write-Log "# Zone: $($entry.GroupName)"            -Color Magenta
+        Write-Log "########################################" -Color Magenta
+        $prevGroup = $entry.GroupName
+    }
+
+    Write-Log "--- $($entry.ComputerName) ---" -Color Cyan
+
+    if ($entry.Job.State -ne 'Completed') {
+        $err    = $entry.Job.ChildJobs[0].Error | Select-Object -First 1
+        $errMsg = if ($err) { $err.Exception.Message } else { "Unreachable or access denied." }
+        Write-Log "  FAILED to connect: $errMsg" -Level 'ERROR' -Color Red
+
+        $allResults.Add([pscustomobject]@{
+            Zone                    = $entry.GroupName
+            ComputerName            = $entry.ComputerName
+            ContentServerInstance   = 'N/A'
+            ContentServerDir        = 'N/A'
+            AgentServiceName        = 'N/A'
+            AgentDisplayName        = 'N/A'
+            AgentStatus             = 'UNREACHABLE'
+            AgentStartType          = 'N/A'
+            AgentVersion            = 'N/A'
+            AgentInstallPath        = 'N/A'
+            AgentExePath            = 'N/A'
+            AgentDataPath           = 'N/A'
+            AgentConfigPath         = 'N/A'
+            AgentAccountName        = 'N/A'
+            AgentPID                = 'N/A'
+            Errors                  = $errMsg
+        })
+        continue
+    }
+
+    $r = $entry.Job | Receive-Job
+    $r.Zone = $entry.GroupName
+
+    # Warn messages from remote
+    $r.Errors | ForEach-Object { Write-Log "  $_" -Level 'WARN' -Color Yellow }
+
+    # Console summary
+    $agentColor = switch ($r.AgentStatus) {
+        'Running'       { 'Green'  }
+        'Stopped'       { 'Red'    }
+        'NOT INSTALLED' { 'Yellow' }
+        default         { 'Gray'   }
+    }
+
+    Write-Log "  Content Server Instance : $($r.ContentServerInstance)"   -Color Gray
+    Write-Log "  Content Server Dir      : $($r.ContentServerDir)"        -Color Gray
+    Write-Log "  Agent Service Name      : $($r.AgentServiceName)"        -Color Gray
+    Write-Log "  Agent Display Name      : $($r.AgentDisplayName)"        -Color Gray
+    Write-Log "  Agent Status            : $($r.AgentStatus)"             -Color $agentColor
+    Write-Log "  Agent Start Type        : $($r.AgentStartType)"          -Color Gray
+    Write-Log "  Agent Version           : $($r.AgentVersion)"            -Color Gray
+    Write-Log "  Agent Install Path      : $($r.AgentInstallPath)"        -Color Gray
+    Write-Log "  Agent Exe Path          : $($r.AgentExePath)"            -Color Gray
+    Write-Log "  Agent Data Path         : $($r.AgentDataPath)"           -Color Gray
+    Write-Log "  Agent Config Path       : $($r.AgentConfigPath)"         -Color Gray
+    Write-Log "  Agent Account           : $($r.AgentAccountName)"        -Color Gray
+    Write-Log "  Agent PID               : $($r.AgentPID)"                -Color Gray
+    Write-Log -Spacer
+
+    $allResults.Add([pscustomobject]@{
+        Zone                    = $r.Zone
+        ComputerName            = $r.ComputerName
+        ContentServerInstance   = $r.ContentServerInstance
+        ContentServerDir        = $r.ContentServerDir
+        AgentServiceName        = $r.AgentServiceName
+        AgentDisplayName        = $r.AgentDisplayName
+        AgentStatus             = $r.AgentStatus
+        AgentStartType          = $r.AgentStartType
+        AgentVersion            = $r.AgentVersion
+        AgentInstallPath        = $r.AgentInstallPath
+        AgentExePath            = $r.AgentExePath
+        AgentDataPath           = $r.AgentDataPath
+        AgentConfigPath         = $r.AgentConfigPath
+        AgentAccountName        = $r.AgentAccountName
+        AgentPID                = $r.AgentPID
+        Errors                  = ($r.Errors -join ' | ')
     })
-
 }
 
- 
+$jobs | ForEach-Object { $_.Job | Remove-Job -Force }
 
-# ─── SUMMARY ──────────────────────────────────────────────────────────────────
+# --- Export CSV ---
+$allResults | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+Write-Log "CSV exported : $csvPath" -Color Green
 
-Write-Section "SUMMARY"
+# --- Summary table to console ---
+Write-Log -Spacer
+Write-Log "========== AUDIT SUMMARY ==========" -Color Cyan
+$allResults | Format-Table -AutoSize `
+    Zone, ComputerName, ContentServerInstance, AgentStatus, AgentVersion, AgentInstallPath `
+    | Out-String | ForEach-Object { Write-Host $_ -ForegroundColor Gray }
 
-$passed      = ($results | Where-Object { $_.Success -and $_.Message -notlike "SKIPPED*" }).Count
-
-$skipped     = ($results | Where-Object { $_.Message -like "SKIPPED*" }).Count
-
-$unreachable = ($results | Where-Object { $_.Message -like "UNREACHABLE*" }).Count
-
-$failed      = ($results | Where-Object { -not $_.Success -and $_.Message -notlike "UNREACHABLE*" }).Count
-
- 
-
-Write-Log "Total       : $($results.Count)"
-
-Write-Log "Success     : $passed"      -Level SUCCESS
-
-Write-Log "Skipped     : $skipped"     -Level INFO
-
-Write-Log "Unreachable : $unreachable" -Level WARN
-
-if ($failed -gt 0) {
-
-    Write-Log "Failed      : $failed" -Level ERROR
-
-    $results | Where-Object { -not $_.Success -and $_.Message -notlike "UNREACHABLE*" } | ForEach-Object {
-
-        Write-Log "  FAILED -> $($_.Server): $($_.Message)" -Level ERROR
-
-    }
-
-}
-
-if ($unreachable -gt 0) {
-
-    Write-Log "Unreachable servers (WinRM/network):" -Level WARN
-
-    $results | Where-Object { $_.Message -like "UNREACHABLE*" } | ForEach-Object {
-
-        Write-Log "  UNREACHABLE -> $($_.Server): $($_.Message)" -Level WARN
-
-    }
-
-}
-
- 
-
-$csvPath = Join-Path $ScriptDir "Reinstall_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
-
-$results | Export-Csv -Path $csvPath -NoTypeInformation
-
-Write-Log "Summary log : $SummaryLog" -Level SUCCESS
-
-Write-Log "CSV report  : $csvPath"    -Level SUCCESS
+$endTime = Get-Date
+$dur     = $endTime - $startTime
+Write-Log "========================================" -Color Cyan
+Write-Log "Completed : $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Color Cyan
+Write-Log "Duration  : $($dur.ToString('mm\:ss'))"                  -Color Cyan
+Write-Log "========================================" -Color Cyan
+Write-Log "Log saved : $localLogPath" -Color Green
+Write-Log "CSV saved : $csvPath"      -Color Green
+Write-Log "---------------- SCOM AGENT AUDIT FINISHED ----------------"
+#endregion
