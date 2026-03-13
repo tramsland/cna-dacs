@@ -1,4 +1,674 @@
-#==================================================================================
+#Requires -Version 5.0
+
+<#
+
+.SYNOPSIS
+
+    Stops and restarts the OpenText (Open Text) System Center Agent on remote
+
+    servers, then validates agent connectivity to patch.dacs.dla.mil:443.
+
+ 
+
+.DESCRIPTION
+
+    - Reads servers.txt organized by zone headers [ZoneName]
+
+    - Auto-elevates to Administrator via UAC if not already elevated
+
+    - Uses the SC API over RPC (same method as services.msc) — no WinRM or
+
+      WMI required. Works with any account that has rights to manage services
+
+      remotely via the Services console.
+
+    - Resolves agent log path via the remote registry (HKLM) over named pipe,
+
+      which uses the same RPC channel as the Services console.
+
+    - Scans agent logs post-restart for successful connection to patch.dacs.dla.mil:443
+
+    - Writes a timestamped log file and opens it in Notepad on completion
+
+ 
+
+.NOTES
+
+    servers.txt format (place in same folder as script):
+
+        [Zone1-Production]
+
+        server01
+
+        server02
+
+ 
+
+        [Zone2-DR]
+
+        server03
+
+        # Lines starting with # are ignored
+
+ 
+
+    Requirements:
+
+        - PowerShell 5.0+
+
+        - Executing account must have rights to manage services remotely
+
+          (same rights needed to use services.msc against remote servers)
+
+        - TCP port 135 and dynamic RPC ports must be open to target servers
+
+        - Admin$ share must be accessible for UNC log file reads
+
+        - Remote Registry service must be running on target servers for log
+
+          path resolution (fallback UNC paths used if registry is unavailable)
+
+ 
+
+    Adjustable settings are in the Configuration block below.
+
+#>
+
+ 
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# CONFIGURATION
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+$ServersFile    = ".\servers.txt"           # Path to server list
+
+$ServiceName    = "OTSystemCenterAgent"     # OpenText System Center Agent service name
+
+$TimeoutSec     = 60                        # Max seconds to wait per service stop/start
+
+$AgentWaitSec   = 30                        # Seconds to wait after restart before reading agent logs
+
+$SuccessPattern = "patch\.dacs\.dla\.mil:443"  # Expected connection string in agent log
+
+$ErrorPatterns  = @("error","fail","unable","timeout","refused","cannot connect")
+
+$LogFile        = ".\RestartAgent_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+ 
+
+# ── Auto-Elevate to Administrator ─────────────────────────────────────────────
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+
+    Write-Host "Not running as Administrator. Relaunching elevated..." -ForegroundColor Yellow
+
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Definition)`"" -Verb RunAs
+
+    exit
+
+}
+
+ 
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+function Write-Log {
+
+    param([string]$Message, [string]$Level = "INFO")
+
+    $entry = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+
+    $entry | Tee-Object -FilePath $LogFile -Append | Write-Host -ForegroundColor $(
+
+        switch ($Level) {
+
+            "ERROR"   { "Red"    }
+
+            "WARN"    { "Yellow" }
+
+            "SUCCESS" { "Green"  }
+
+            default   { "Cyan"   }
+
+        }
+
+    )
+
+}
+
+ 
+
+# ── Resolve Log Path via Remote Registry ──────────────────────────────────────
+
+function Get-AgentInstallDir {
+
+    param([string]$Server, [string]$Zone)
+
+ 
+
+    # The remote registry is accessed over the same RPC/named-pipe channel used
+
+    # by services.msc — no WMI or WinRM needed. The service ImagePath stored in
+
+    # HKLM\SYSTEM\CurrentControlSet\Services\<name> gives us the binary location
+
+    # from which we derive the install directory and likely log paths.
+
+    try {
+
+        $reg     = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey('LocalMachine', $Server)
+
+        $svcKey  = $reg.OpenSubKey("SYSTEM\CurrentControlSet\Services\$ServiceName")
+
+ 
+
+        if (-not $svcKey) {
+
+            Write-Log "[$Zone] $Server - WARN: Service key not found in remote registry. Falling back to UNC guesses." "WARN"
+
+            return $null
+
+        }
+
+ 
+
+        $imagePath  = $svcKey.GetValue("ImagePath") -replace '"', '' -replace '%SystemRoot%', 'C:\Windows'
+
+        $svcKey.Close()
+
+        $reg.Close()
+
+ 
+
+        $installDir = Split-Path $imagePath -Parent
+
+        Write-Log "[$Zone] $Server - Registry ImagePath : $imagePath"
+
+        Write-Log "[$Zone] $Server - Resolved install dir: $installDir"
+
+        return $installDir
+
+ 
+
+    } catch {
+
+        Write-Log "[$Zone] $Server - WARN: Remote registry query failed ($($_.Exception.Message)). Falling back to UNC guesses." "WARN"
+
+        return $null
+
+    }
+
+}
+
+ 
+
+# ── Service Restart ───────────────────────────────────────────────────────────
+
+function Restart-AgentOnServer {
+
+    param([string]$Server, [string]$Zone)
+
+ 
+
+    Write-Log "[$Zone] Processing server: $Server"
+
+ 
+
+    # ── Ping Check ────────────────────────────────────────────────────────────
+
+    Write-Log "[$Zone] $Server - Testing network connectivity..."
+
+    if (-not (Test-Connection -ComputerName $Server -Count 2 -Quiet)) {
+
+        Write-Log "[$Zone] $Server - CONNECTION ERROR: Host unreachable (ping failed). Skipping." "ERROR"
+
+        return [PSCustomObject]@{ Server=$Server; Zone=$Zone; Status="Unreachable - Ping Failed" }
+
+    }
+
+    Write-Log "[$Zone] $Server - Ping OK." "SUCCESS"
+
+ 
+
+    # ── Service Lookup ────────────────────────────────────────────────────────
+
+    # Get-Service with -ComputerName uses the SC API over RPC — the same
+
+    # underlying method as the Windows Services console (services.msc).
+
+    # No WinRM or WMI is involved. Works as long as RPC port 135 is reachable
+
+    # and the account has remote service management rights.
+
+    try {
+
+        $svc = Get-Service -ComputerName $Server -Name $ServiceName -ErrorAction SilentlyContinue
+
+ 
+
+        if (-not $svc) {
+
+            Write-Log "[$Zone] $Server - Exact service name '$ServiceName' not found. Searching by wildcard..." "WARN"
+
+            $svc = Get-Service -ComputerName $Server -ErrorAction Stop | Where-Object {
+
+                $_.DisplayName -like "*OpenText*"            -or
+
+                $_.DisplayName -like "*Open Text*"           -or
+
+                $_.DisplayName -like "*System Center*"       -or
+
+                $_.DisplayName -like "*System Center Agent*" -or
+
+                $_.Name        -like "*OT*"                  -or
+
+                $_.Name        -like "*SystemCenter*"        -or
+
+                $_.Name        -like "*SysCenter*"
+
+            }
+
+            if ($svc) {
+
+                Write-Log "[$Zone] $Server - Found matching service(s): $(($svc | ForEach-Object { "'$($_.Name)' [$($_.DisplayName)]" }) -join ', ')" "WARN"
+
+                Write-Log "[$Zone] $Server - Update `$ServiceName in the config block to the correct name. Skipping." "WARN"
+
+                return [PSCustomObject]@{ Server=$Server; Zone=$Zone; Status="Service Name Mismatch - See Log" }
+
+            } else {
+
+                Write-Log "[$Zone] $Server - ERROR: No OpenText/System Center service found. Is the agent installed?" "ERROR"
+
+                return [PSCustomObject]@{ Server=$Server; Zone=$Zone; Status="Service Not Found" }
+
+            }
+
+        }
+
+ 
+
+        # ── Stop ──────────────────────────────────────────────────────────────
+
+        if ($svc.Status -ne 'Stopped') {
+
+            Write-Log "[$Zone] $Server - STOP INITIATED: '$ServiceName' is currently '$($svc.Status)'."
+
+            Stop-Service -InputObject $svc -Force -ErrorAction Stop
+
+            $svc.WaitForStatus('Stopped', (New-TimeSpan -Seconds $TimeoutSec))
+
+            $svc.Refresh()
+
+            if ($svc.Status -eq 'Stopped') {
+
+                Write-Log "[$Zone] $Server - STOP SUCCESS: '$ServiceName' is now 'Stopped'." "SUCCESS"
+
+            } else {
+
+                Write-Log "[$Zone] $Server - STOP WARNING: '$ServiceName' status is '$($svc.Status)' after stop attempt." "WARN"
+
+            }
+
+        } else {
+
+            Write-Log "[$Zone] $Server - STOP SKIPPED: '$ServiceName' was already 'Stopped'." "WARN"
+
+        }
+
+ 
+
+        # ── Start ─────────────────────────────────────────────────────────────
+
+        Write-Log "[$Zone] $Server - START INITIATED: Starting '$ServiceName'..."
+
+        Start-Service -InputObject $svc -ErrorAction Stop
+
+        $svc.WaitForStatus('Running', (New-TimeSpan -Seconds $TimeoutSec))
+
+        $svc.Refresh()
+
+        if ($svc.Status -eq 'Running') {
+
+            Write-Log "[$Zone] $Server - START SUCCESS: '$ServiceName' is now 'Running'." "SUCCESS"
+
+        } else {
+
+            Write-Log "[$Zone] $Server - START WARNING: '$ServiceName' status is '$($svc.Status)' after start attempt." "WARN"
+
+            return [PSCustomObject]@{ Server=$Server; Zone=$Zone; Status="Start Warning: $($svc.Status)" }
+
+        }
+
+ 
+
+        return [PSCustomObject]@{ Server=$Server; Zone=$Zone; Status="Restarted" }
+
+ 
+
+    } catch [System.ServiceProcess.TimeoutException] {
+
+        Write-Log "[$Zone] $Server - TIMEOUT ERROR: Service did not change state within ${TimeoutSec}s. The service may be hung. Consider increasing `$TimeoutSec." "ERROR"
+
+        return [PSCustomObject]@{ Server=$Server; Zone=$Zone; Status="Timeout" }
+
+    } catch {
+
+        Write-Log "[$Zone] $Server - ERROR: $($_.Exception.Message)" "ERROR"
+
+        return [PSCustomObject]@{ Server=$Server; Zone=$Zone; Status="Error: $($_.Exception.Message)" }
+
+    }
+
+}
+
+ 
+
+# ── Agent Log Check ───────────────────────────────────────────────────────────
+
+function Read-AgentLog {
+
+    param([string]$Server, [string]$Zone)
+
+ 
+
+    Write-Log ""
+
+    Write-Log "[$Zone] Checking agent log on: $Server"
+
+ 
+
+    # Attempt to resolve install dir from remote registry first.
+
+    # Falls back to common UNC guesses if the Remote Registry service is
+
+    # not running or the key is not accessible.
+
+    $installDir = Get-AgentInstallDir -Server $Server -Zone $Zone
+
+    $parentDir  = if ($installDir) { Split-Path $installDir -Parent } else { $null }
+
+ 
+
+    if ($installDir) {
+
+        $candidatePaths = @(
+
+            "$installDir\Logs\agent.log",
+
+            "$installDir\Logs\SystemCenterAgent.log",
+
+            "$installDir\log\agent.log",
+
+            "$installDir\log\SystemCenterAgent.log",
+
+            "$parentDir\Logs\agent.log",
+
+            "$parentDir\Logs\SystemCenterAgent.log"
+
+        )
+
+    } else {
+
+        # Fallback: common default install locations
+
+        $candidatePaths = @(
+
+            "C:\Program Files\OpenText\System Center Agent\Logs\agent.log",
+
+            "C:\Program Files\OpenText\System Center\Logs\agent.log",
+
+            "C:\Program Files (x86)\OpenText\System Center Agent\Logs\agent.log",
+
+            "C:\Program Files (x86)\OpenText\System Center\Logs\agent.log",
+
+            "C:\ProgramData\OpenText\System Center\Logs\agent.log"
+
+        )
+
+        Write-Log "[$Zone] $Server - Using fallback UNC path list." "WARN"
+
+    }
+
+ 
+
+    $logFound = $false
+
+    foreach ($remotePath in $candidatePaths) {
+
+        $uncPath = "\\$Server\" + $remotePath.Replace(":\", "$\")
+
+ 
+
+        if (Test-Path $uncPath -ErrorAction SilentlyContinue) {
+
+            $logFound = $true
+
+            Write-Log "[$Zone] $Server - Found agent log: $uncPath"
+
+ 
+
+            # Read last 200 lines — enough to capture activity since restart
+
+            $logLines = Get-Content $uncPath -Tail 200 -ErrorAction SilentlyContinue
+
+ 
+
+            if (-not $logLines) {
+
+                Write-Log "[$Zone] $Server - Log file exists but is empty or unreadable." "WARN"
+
+                break
+
+            }
+
+ 
+
+            # ── Success Check ─────────────────────────────────────────────────
+
+            $successLines = $logLines | Select-String -Pattern $SuccessPattern
+
+            if ($successLines) {
+
+                Write-Log "[$Zone] $Server - SUCCESS: Connected to patch.dacs.dla.mil:443" "SUCCESS"
+
+                $successLines | ForEach-Object { Write-Log "[$Zone] $Server -   >> $($_.Line.Trim())" "SUCCESS" }
+
+            } else {
+
+                Write-Log "[$Zone] $Server - WARNING: No successful connection to patch.dacs.dla.mil:443 detected." "WARN"
+
+                Write-Log "[$Zone] $Server -   Agent may still be initializing, or a firewall may be blocking patch.dacs.dla.mil:443." "WARN"
+
+            }
+
+ 
+
+            # ── Error Check ───────────────────────────────────────────────────
+
+            $errorLines = $logLines | Select-String -Pattern ($ErrorPatterns -join "|")
+
+            if ($errorLines) {
+
+                Write-Log "[$Zone] $Server - Connection-related errors found in agent log:" "ERROR"
+
+                $errorLines | ForEach-Object { Write-Log "[$Zone] $Server -   >> $($_.Line.Trim())" "ERROR" }
+
+            } else {
+
+                Write-Log "[$Zone] $Server - No connection errors detected in agent log." "SUCCESS"
+
+            }
+
+ 
+
+            break
+
+        }
+
+    }
+
+ 
+
+    if (-not $logFound) {
+
+        Write-Log "[$Zone] $Server - WARNING: Agent log not found. Paths checked:" "WARN"
+
+        $candidatePaths | ForEach-Object { Write-Log "[$Zone] $Server -   Tried: $_" "WARN" }
+
+        Write-Log "[$Zone] $Server -   Confirm the log location manually on the server." "WARN"
+
+    }
+
+}
+
+ 
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+# MAIN
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+ 
+
+if (-not (Test-Path $ServersFile)) {
+
+    Write-Log "servers.txt not found at path: $ServersFile" "ERROR"
+
+    exit 1
+
+}
+
+ 
+
+Write-Log "Starting OpenText System Center Agent restart job."
+
+Write-Log "Server list : $ServersFile"
+
+Write-Log "Service name: $ServiceName"
+
+Write-Log "Log file    : $LogFile"
+
+ 
+
+$results     = @()
+
+$currentZone = "Unknown"
+
+ 
+
+foreach ($line in Get-Content $ServersFile) {
+
+    $line = $line.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) { continue }
+
+ 
+
+    if ($line -match '^\[(.+)\]$') {
+
+        $currentZone = $Matches[1]
+
+        Write-Log ""
+
+        Write-Log "═══ Zone: $currentZone ═══"
+
+        continue
+
+    }
+
+ 
+
+    $results += Restart-AgentOnServer -Server $line -Zone $currentZone
+
+}
+
+ 
+
+# ── Restart Summary ───────────────────────────────────────────────────────────
+
+Write-Log ""
+
+Write-Log "══════════════ RESTART SUMMARY ══════════════"
+
+$results | Format-Table -AutoSize | Out-String | ForEach-Object { Write-Log $_ }
+
+ 
+
+$restarted = ($results | Where-Object Status -eq "Restarted").Count
+
+$failed    = ($results | Where-Object Status -ne "Restarted").Count
+
+Write-Log "Total Servers : $($results.Count)"
+
+Write-Log "Restarted     : $restarted" "SUCCESS"
+
+if ($failed -gt 0) { Write-Log "Failed/Skipped: $failed" "WARN" }
+
+ 
+
+# ── Connection Error Summary ──────────────────────────────────────────────────
+
+Write-Log ""
+
+Write-Log "Scanning script log for connection errors..."
+
+$connErrors = Select-String -Path $LogFile -Pattern "CONNECTION ERROR"
+
+if ($connErrors) {
+
+    Write-Host "`n══════════════ CONNECTION ERRORS FOUND ══════════════" -ForegroundColor Red
+
+    $connErrors | ForEach-Object { Write-Host $_.Line -ForegroundColor Red }
+
+    Write-Host "═════════════════════════════════════════════════════`n" -ForegroundColor Red
+
+} else {
+
+    Write-Log "No connection errors detected." "SUCCESS"
+
+}
+
+ 
+
+# ── Agent Log Validation ──────────────────────────────────────────────────────
+
+Write-Log ""
+
+Write-Log "Waiting ${AgentWaitSec}s for agents to initialize before reading logs..."
+
+Start-Sleep -Seconds $AgentWaitSec
+
+ 
+
+Write-Log ""
+
+Write-Log "══════════════ AGENT CONNECTION LOG CHECK ══════════════"
+
+foreach ($result in ($results | Where-Object Status -eq "Restarted")) {
+
+    Read-AgentLog -Server $result.Server -Zone $result.Zone
+
+}
+
+Write-Log "══════════════ AGENT LOG CHECK COMPLETE ══════════════"
+
+ 
+
+# ── Open Log ──────────────────────────────────────────────────────────────────
+
+Write-Log ""
+
+Write-Log "Job complete. Log saved to: $LogFile"
+
+Start-Process notepad.exe -ArgumentList $LogFile
+
+ #==================================================================================
 
 #
 
