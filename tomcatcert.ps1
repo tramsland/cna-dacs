@@ -555,76 +555,7 @@ function Get-RemoteTomcatInfo {
         return $null
     }
 
-    # WMI query with timeout handling
-    $wmiSvc = $null
-    try {
-        $job = Start-Job {
-            param($s)
-            Get-WmiObject Win32_Service -ComputerName $s -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match "tomcat" -or $_.DisplayName -match "tomcat" } |
-            Select-Object -First 1
-        } -ArgumentList $targetServer
-        $done = Wait-Job $job -Timeout $wmiTimeout
-        if ($done) {
-            $wmiSvc = Receive-Job $job
-        } else {
-            Write-Log "WMI query timed out on $targetServer" -Level WARN -Server $targetServer
-        }
-        Remove-Job $job -Force
-    } catch {
-        Write-Log "WMI query failed on ${targetServer}: $_" -Level WARN -Server $targetServer
-    }
-
-    # Fall back to description search
-    if (-not $wmiSvc) {
-        try {
-            $job = Start-Job {
-                param($s)
-                Get-WmiObject Win32_Service -ComputerName $s -ErrorAction SilentlyContinue |
-                Where-Object { $_.Description -match "Apache Tomcat" } |
-                Select-Object -First 1
-            } -ArgumentList $targetServer
-            $done = Wait-Job $job -Timeout $wmiTimeout
-            if ($done) { $wmiSvc = Receive-Job $job }
-            Remove-Job $job -Force
-        } catch {
-            Write-Log "WMI description search failed on ${targetServer}: $_" -Level WARN -Server $targetServer
-        }
-    }
-
-    $svcName    = $null
-    $tomcatBase = $null
-    $ksPath     = $null
-
-    if ($wmiSvc) {
-        $svcName    = $wmiSvc.Name
-        $exePath    = $wmiSvc.PathName.Trim('"') -replace "\s.+$", ""
-        $tomcatBase = Split-Path (Split-Path $exePath)
-        Write-Log "Service: $svcName  Base: $tomcatBase" -Level INFO -Server $targetServer
-
-        $uncConf = "\\$targetServer\$($tomcatBase -replace ':','$')\conf\server.xml"
-        if (Test-Path $uncConf) {
-            [xml]$xml  = Get-Content $uncConf -ErrorAction SilentlyContinue
-            $conn      = $xml.Server.Service.Connector |
-                         Where-Object { $_.SSLEnabled -eq "true" -or $_.scheme -eq "https" } |
-                         Select-Object -First 1
-            if ($conn) {
-                $ksFile = $conn.keystoreFile
-                if ($conn.SSLHostConfig -and $conn.SSLHostConfig.Certificate.certificateKeystoreFile) {
-                    $ksFile = $conn.SSLHostConfig.Certificate.certificateKeystoreFile
-                }
-                if ($ksFile) {
-                    if (-not [System.IO.Path]::IsPathRooted($ksFile)) {
-                        $ksFile = Join-Path $tomcatBase $ksFile
-                    }
-                    $ksPath = $ksFile
-                    Write-Log "Keystore from server.xml: $ksPath" -Level INFO -Server $targetServer
-                }
-            }
-        }
-    }
-
-    # Fall back to known paths
+    # 6. Fall back to known paths if nothing found yet
     if (-not $ksPath) {
         Write-Log "Trying known Tomcat paths..." -Level WARN -Server $targetServer
         foreach ($base in @("E:\customers\shared\dacs\tomcat10","E:\customers\shared\dacs\tomcat")) {
