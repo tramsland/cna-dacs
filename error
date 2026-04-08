@@ -1,0 +1,59 @@
+At C:\DLA-FAILSAFE\patching\tomcat_cert2.ps1:127 char:53
++ ... Where-Object { $_.SSLEnabled -eq 'true' -or $_.scheme -eq 'https' } |
++                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unexpected token 'true' -or $_.scheme -eq 'https' } |
+                  Select-Object -First 1
+    if (-not $connector) {
+        Write-Log "No HTTPS connector found in server.xml." -Level ERROR; exit 1
+    }
+    # Support nested SSLHostConfig
+    $ksFile = $connector.keystoreFile
+    $ksPass = $connector.keystorePass
+    $ksType = $connector.keystoreType
+    $keyPass = $connector.keyPass
+    $sslHost = $connector.SSLHostConfig
+    if ($sslHost) {
+        $cert    = $sslHost.Certificate
+        $ksFile  = if ($cert.certificateKeystoreFile) { $cert.certificateKeystoreFile } else { $ksFile }
+        $ksPass  = if ($cert.certificateKeystorePassword) { $cert.certificateKeystorePassword } else { $ksPass }
+        $ksType  = if ($cert.certificateKeystoreType) { $cert.certificateKeystoreType } else { $ksType }
+        $keyPass = if ($cert.certificateKeyPassword) { $cert.certificateKeyPassword } else { $keyPass }
+    }
+    # Resolve relative paths
+    $tomcatBase = Split-Path (Split-Path $serverXml)
+    if ($ksFile -and -not [System.IO.Path]::IsPathRooted($ksFile)) {
+        $ksFile = Join-Path $tomcatBase $ksFile
+    }
+    if (-not $ksType) { $ksType = "PKCS12" }
+    # Detect placeholder passwords
+    foreach ($passVar in @('ksPass','keyPass')) {
+        $val = Get-Variable $passVar -ValueOnly
+        if ($val -match "^\$\{.+\}$") {
+            Write-Log "Password is a property placeholder ($val) — enter value manually." -Level WARN
+            Set-Variable $passVar (Read-Host "Enter $passVar value")
+        }
+    }
+    # Detect Tomcat service name — try Name/DisplayName first, fall back to description
+    $svc = Get-Service | Where-Object {
+        $_.DisplayName -match 'tomcat' -or $_.Name -match 'tomcat'
+    } | Select-Object -First 1
+    if (-not $svc) {
+        Write-Log "Service not found by name — searching service descriptions for 'Apache' in expression or statement.
+At C:\DLA-FAILSAFE\patching\tomcat_cert2.ps1:1714 char:23
++ elseif ($choice -eq 'X') {
++                       ~~~~
+The string is missing the terminator: '.
+At C:\DLA-FAILSAFE\patching\tomcat_cert2.ps1:121 char:44
++         if ($wmiSvc -and $wmiSvc.PathName) {
++                                            ~
+Missing closing '}' in statement block or type definition.
+At C:\DLA-FAILSAFE\patching\tomcat_cert2.ps1:118 char:15
++     if ($svc) {
++               ~
+Missing closing '}' in statement block or type definition.
+At C:\DLA-FAILSAFE\patching\tomcat_cert2.ps1:100 char:35
++ function Get-TomcatKeystoreConfig {
++                                   ~
+Missing closing '}' in statement block or type definition.
+    + CategoryInfo          : ParserError: (:) [], ParseException
+    + FullyQualifiedErrorId : UnexpectedToken
