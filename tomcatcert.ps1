@@ -22,7 +22,6 @@ $accessLogPattern = "localhost_access_log*"
 $iisLinesToScan   = 500
 $svcStopTimeout   = 60   # seconds to wait for service to stop
 $svcStartTimeout  = 60   # seconds to wait for service to start
-$wmiTimeout       = 30   # seconds before giving up on remote WMI
 $certWarnDays     = 30   # warn if cert expires within this many days
 $scriptDir        = Split-Path -Parent $MyInvocation.MyCommand.Path
 
