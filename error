@@ -1,7 +1,4 @@
-[2026-04-08 15:00:37] [WARN] [azasvwpp043.dir.ad.dla.mil] WMI query failed on azasvwpp043.dir.ad.dla.mil: Cannot validate arg
-ument on parameter 'Timeout'. The argument is null, empty, or an element of the argument collection contains a null value. Su
-pply a collection that does not contain any null values and then try the command again.
-[2026-04-08 15:00:38] [WARN] [azasvwpp043.dir.ad.dla.mil] WMI description search failed on azasvwpp043.dir.ad.dla.mil: Cannot
- validate argument on parameter 'Timeout'. The argument is null, empty, or an element of the argument collection contains a n
-ull value. Supply a collection that does not contain any null values and then try the command again.
-[2026-04-08 15:00:38] [WARN] [azasvwpp043.dir.ad.dla.mil] Trying known Tomcat paths...
+keytool -exportcert -alias tomcat ^
+  -keystore "E:\customers\shared\dacs\tomcat10\conf\keystore.p12" ^
+  -storetype PKCS12 ^
+  -storepass changeit ^
