@@ -1,12 +1,13 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Tomcat Keystore Management Script v6
+    Tomcat Keystore Management Script v7
 .DESCRIPTION
     Manages Java keystores used by Tomcat. Derives Tomcat base from service
     executable path. After renewal exports cert to script directory and
-    provides instructions for running the companion IIS import script locally
-    on the IIS server. No WinRM or stored credentials required.
+    imports to IIS Trusted Root via scheduled task. Pushes keystore to SAN
+    servers via UNC and restarts remote Tomcat via sc.exe.
+    No WinRM or stored credentials required - run from admin console.
 .PARAMETER WhatIf
     Show what would be executed without making any changes.
 #>
@@ -19,6 +20,10 @@ $storagePath      = "C:\temp\cert-backups"
 $retentionDays    = 90
 $accessLogPattern = "localhost_access_log*"
 $iisLinesToScan   = 500
+$svcStopTimeout   = 60   # seconds to wait for service to stop
+$svcStartTimeout  = 60   # seconds to wait for service to start
+$wmiTimeout       = 30   # seconds before giving up on remote WMI
+$certWarnDays     = 30   # warn if cert expires within this many days
 $scriptDir        = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # ============================================================
@@ -29,6 +34,19 @@ if (-not (Test-Path $storagePath)) {
 }
 $ts      = Get-Date -Format "yyyy-MM-dd-HH-mm-ss"
 $logFile = Join-Path $storagePath "keystore-mgmt-$ts.log"
+
+# Create log file and restrict ACL before first write
+New-Item -Path $logFile -ItemType File -Force | Out-Null
+try {
+    $acl = New-Object System.Security.AccessControl.FileSecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        "Administrators","FullControl","Allow"
+    )))
+    Set-Acl -Path $logFile -AclObject $acl -ErrorAction Stop
+} catch {
+    Write-Host "[WARN] Could not restrict log file ACL: $_" -ForegroundColor Yellow
+}
 
 # ============================================================
 # LOGGING
@@ -51,20 +69,61 @@ function Write-Log {
 }
 
 # ============================================================
+# RUN SUMMARY - tracks outcomes across all post-renewal steps
+# ============================================================
+$runSummary = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Summary {
+    param([string]$Step, [string]$Target, [string]$Status, [string]$Note = "")
+    $script:runSummary.Add([PSCustomObject]@{
+        Step   = $Step
+        Target = $Target
+        Status = $Status
+        Note   = $Note
+    })
+}
+
+function Show-Summary {
+    Write-Host ""
+    Write-Host "  ================================================" -ForegroundColor Cyan
+    Write-Host "  POST-RENEWAL SUMMARY" -ForegroundColor Cyan
+    Write-Host "  ================================================" -ForegroundColor Cyan
+    foreach ($row in $script:runSummary) {
+        $color = switch ($row.Status) {
+            "OK"      { "Green" }
+            "WARN"    { "Yellow" }
+            "FAILED"  { "Red" }
+            "SKIPPED" { "Gray" }
+            default   { "White" }
+        }
+        $line = "  [{0}] {1,-22} {2,-10} {3}" -f $row.Status, $row.Step, $row.Target, $row.Note
+        Write-Host $line -ForegroundColor $color
+    }
+    Write-Host "  ================================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Flag any items needing manual action
+    $manual = $script:runSummary | Where-Object { $_.Status -in @("FAILED","WARN") }
+    if ($manual) {
+        Write-Host "  Items requiring manual attention:" -ForegroundColor Yellow
+        foreach ($m in $manual) {
+            Write-Host "  - $($m.Step) on $($m.Target): $($m.Note)" -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
+}
+
+# ============================================================
 # FIND KEYTOOL
 # ============================================================
 function Find-Keytool {
-    # 1. JAVA_HOME env var
     if ($env:JAVA_HOME) {
         $p = Join-Path $env:JAVA_HOME "bin\keytool.exe"
         if (Test-Path $p) { return $p }
     }
-
-    # 2. Already on PATH
     $inPath = Get-Command keytool.exe -ErrorAction SilentlyContinue
     if ($inPath) { return $inPath.Source }
 
-    # 3. Known customer Java location - one level deep, no recursion
     $customerJavaRoot = "E:\customers\shared\dacs\java"
     if (Test-Path $customerJavaRoot) {
         $p = Join-Path $customerJavaRoot "bin\keytool.exe"
@@ -75,7 +134,6 @@ function Find-Keytool {
         }
     }
 
-    # 4. Manual entry
     Write-Log "keytool.exe not found automatically." -Level WARN
     $manual = Read-Host "Enter full path to keytool.exe (or leave blank to exit)"
     if ($manual -and (Test-Path $manual)) { return $manual }
@@ -86,12 +144,10 @@ function Find-Keytool {
 # READ TOMCAT CONFIG FROM SERVICE + SERVER.XML
 # ============================================================
 function Get-TomcatKeystoreConfig {
-    # 1. Find Tomcat service by name/displayname
     $svc = Get-Service | Where-Object {
         $_.DisplayName -match "tomcat" -or $_.Name -match "tomcat"
     } | Select-Object -First 1
 
-    # 2. Fall back to service description
     if (-not $svc) {
         Write-Log "Service not found by name - searching descriptions..." -Level WARN
         $wmi = Get-WmiObject Win32_Service |
@@ -102,7 +158,6 @@ function Get-TomcatKeystoreConfig {
         }
     }
 
-    # 3. Derive TomcatBase from service executable path
     $tomcatBase = $null
     $svcName    = $null
     if ($svc) {
@@ -115,15 +170,9 @@ function Get-TomcatKeystoreConfig {
         }
     }
 
-    # 4. Fall back to known fixed paths
     if (-not $tomcatBase -or -not (Test-Path $tomcatBase)) {
         Write-Log "Could not derive Tomcat base from service - trying known paths..." -Level WARN
-        $knownBases = @(
-            "E:\customers\shared\dacs\tomcat10",
-            "E:\customers\shared\dacs\tomcat",
-            "C:\Tomcat"
-        )
-        foreach ($base in $knownBases) {
+        foreach ($base in @("E:\customers\shared\dacs\tomcat10","E:\customers\shared\dacs\tomcat","C:\Tomcat")) {
             if (Test-Path (Join-Path $base "conf\server.xml")) {
                 $tomcatBase = $base
                 Write-Log "Tomcat base from known path: $tomcatBase" -Level INFO
@@ -132,13 +181,11 @@ function Get-TomcatKeystoreConfig {
         }
     }
 
-    # 5. Manual entry
     if (-not $tomcatBase) {
         Write-Log "Tomcat base not found automatically." -Level WARN
         $tomcatBase = Read-Host "Enter Tomcat base path (e.g. E:\customers\shared\dacs\tomcat10)"
         if (-not (Test-Path $tomcatBase)) {
-            Write-Log "Path not found: $tomcatBase" -Level ERROR
-            exit 1
+            Write-Log "Path not found: $tomcatBase" -Level ERROR; exit 1
         }
     }
 
@@ -147,8 +194,7 @@ function Get-TomcatKeystoreConfig {
         Write-Log "server.xml not found at $serverXml" -Level WARN
         $serverXml = Read-Host "Enter full path to server.xml"
         if (-not (Test-Path $serverXml)) {
-            Write-Log "server.xml not found at: $serverXml" -Level ERROR
-            exit 1
+            Write-Log "server.xml not found at: $serverXml" -Level ERROR; exit 1
         }
     }
 
@@ -157,34 +203,31 @@ function Get-TomcatKeystoreConfig {
     $connector = $xml.Server.Service.Connector |
                  Where-Object { $_.SSLEnabled -eq "true" -or $_.scheme -eq "https" } |
                  Select-Object -First 1
-
     if (-not $connector) {
-        Write-Log "No HTTPS connector found in server.xml." -Level ERROR
-        exit 1
+        Write-Log "No HTTPS connector found in server.xml." -Level ERROR; exit 1
     }
 
     $ksFile  = $connector.keystoreFile
     $ksPass  = $connector.keystorePass
     $ksType  = $connector.keystoreType
     $keyPass = $connector.keyPass
+    $keyAlias = $connector.keyAlias
 
-    # Support nested SSLHostConfig
     $sslHost = $connector.SSLHostConfig
     if ($sslHost) {
         $cert = $sslHost.Certificate
-        if ($cert.certificateKeystoreFile)     { $ksFile  = $cert.certificateKeystoreFile }
-        if ($cert.certificateKeystorePassword) { $ksPass  = $cert.certificateKeystorePassword }
-        if ($cert.certificateKeystoreType)     { $ksType  = $cert.certificateKeystoreType }
-        if ($cert.certificateKeyPassword)      { $keyPass = $cert.certificateKeyPassword }
+        if ($cert.certificateKeystoreFile)     { $ksFile   = $cert.certificateKeystoreFile }
+        if ($cert.certificateKeystorePassword) { $ksPass   = $cert.certificateKeystorePassword }
+        if ($cert.certificateKeystoreType)     { $ksType   = $cert.certificateKeystoreType }
+        if ($cert.certificateKeyPassword)      { $keyPass  = $cert.certificateKeyPassword }
+        if ($cert.certificateKeyAlias)         { $keyAlias = $cert.certificateKeyAlias }
     }
 
-    # Resolve relative paths
     if ($ksFile -and -not [System.IO.Path]::IsPathRooted($ksFile)) {
         $ksFile = Join-Path $tomcatBase $ksFile
     }
     if (-not $ksType) { $ksType = "PKCS12" }
 
-    # Detect placeholder passwords
     foreach ($passVar in @("ksPass","keyPass")) {
         $val = Get-Variable $passVar -ValueOnly
         if ($val -match "^\$\{.+\}$") {
@@ -193,16 +236,13 @@ function Get-TomcatKeystoreConfig {
         }
     }
 
-    # Derive log dir from server.xml AccessLog valve
     $logDir = Join-Path $tomcatBase "logs"
     $valve  = $xml.Server.Service.Engine.Host.Valve |
               Where-Object { $_.className -match "AccessLog" } |
               Select-Object -First 1
     if ($valve -and $valve.directory) {
         $vDir = $valve.directory
-        if (-not [System.IO.Path]::IsPathRooted($vDir)) {
-            $vDir = Join-Path $tomcatBase $vDir
-        }
+        if (-not [System.IO.Path]::IsPathRooted($vDir)) { $vDir = Join-Path $tomcatBase $vDir }
         $logDir = $vDir
     }
 
@@ -211,6 +251,7 @@ function Get-TomcatKeystoreConfig {
         KeystoreType = $ksType
         KeystorePass = $ksPass
         KeyPass      = $keyPass
+        KeyAlias     = $keyAlias
         ServiceName  = $svcName
         TomcatBase   = $tomcatBase
         LogDir       = $logDir
@@ -234,14 +275,9 @@ function Get-BaseArgs {
 # ============================================================
 function Invoke-Keytool {
     param($keytool, [string[]]$ktArgs)
-    $safeArgs = @()
-    $prev = ""
+    $safeArgs = @(); $prev = ""
     foreach ($a in $ktArgs) {
-        if ($prev -in @("-storepass","-keypass","-srcstorepass","-deststorepass")) {
-            $safeArgs += "****"
-        } else {
-            $safeArgs += $a
-        }
+        $safeArgs += if ($prev -in @("-storepass","-keypass","-srcstorepass","-deststorepass")) { "****" } else { $a }
         $prev = $a
     }
     Write-Log "keytool $($safeArgs -join ' ')" -Level DETAIL
@@ -251,6 +287,61 @@ function Invoke-Keytool {
     }
     & $keytool @ktArgs 2>&1 | ForEach-Object { Write-Log $_ -Level DETAIL }
     return $LASTEXITCODE
+}
+
+# ============================================================
+# VALIDATE KEYSTORE PASSWORD
+# ============================================================
+function Test-KeystorePassword {
+    param($keytool, $config)
+    Write-Log "Validating keystore password..." -Level INFO
+    $baseArgs = Get-BaseArgs $config
+    & $keytool -list @baseArgs 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "Keystore password validation failed - check KeystorePass in server.xml." -Level ERROR
+        return $false
+    }
+    Write-Log "Keystore password validated." -Level INFO
+    return $true
+}
+
+# ============================================================
+# CHECK CERT EXPIRY
+# ============================================================
+function Show-CertExpiry {
+    param($keytool, $config)
+    $baseArgs = Get-BaseArgs $config
+    $details  = & $keytool -list -v @baseArgs 2>&1
+    $entries  = $details | Where-Object { $_ -match "Alias name:" }
+    if (-not $entries) { return }
+
+    Write-Host ""
+    Write-Host "  Current keystore entries:" -ForegroundColor Cyan
+    $currentAlias = $null
+    foreach ($line in $details) {
+        if ($line -match "Alias name:\s*(.+)") {
+            $currentAlias = $Matches[1].Trim()
+        }
+        if ($line -match "Valid from:.+until:\s*(.+)") {
+            $expiryStr = $Matches[1].Trim()
+            try {
+                $expiry  = [datetime]::Parse($expiryStr)
+                $daysLeft = ($expiry - (Get-Date)).Days
+                $color   = if ($daysLeft -lt 0) { "Red" }
+                           elseif ($daysLeft -le $certWarnDays) { "Yellow" }
+                           else { "Green" }
+                Write-Host ("  {0,-30} Expires: {1:yyyy-MM-dd}  ({2} days)" -f $currentAlias, $expiry, $daysLeft) -ForegroundColor $color
+                if ($daysLeft -lt 0) {
+                    Write-Log "EXPIRED: Alias '$currentAlias' expired $([Math]::Abs($daysLeft)) days ago." -Level ERROR
+                } elseif ($daysLeft -le $certWarnDays) {
+                    Write-Log "WARNING: Alias '$currentAlias' expires in $daysLeft days." -Level WARN
+                }
+            } catch {
+                Write-Host "  $currentAlias  - could not parse expiry" -ForegroundColor Gray
+            }
+        }
+    }
+    Write-Host ""
 }
 
 # ============================================================
@@ -264,8 +355,8 @@ function Get-CertSANs {
         $t = $line.Trim()
         if ($t -match "SubjectAlternativeName") { $inSan = $true; continue }
         if ($inSan) {
-            if ($t.StartsWith("DNSName:"))   { $sanList.Add("dns:$(($t -split ":",2)[1].Trim())") }
-            if ($t.StartsWith("IPAddress:")) { $sanList.Add("ip:$(($t -split ":",2)[1].Trim())") }
+            if ($t.StartsWith("DNSName:"))   { $sanList.Add("dns:$(($t -split ':',2)[1].Trim())") }
+            if ($t.StartsWith("IPAddress:")) { $sanList.Add("ip:$(($t -split ':',2)[1].Trim())") }
             if ($t -eq "]" -or ($t -eq "" -and $sanList.Count -gt 0)) { break }
         }
     }
@@ -293,14 +384,11 @@ function Backup-Keystore {
 # ============================================================
 function Export-TomcatCert {
     param($keytool, $config, [string]$alias)
-    $cerName = "$(Split-Path $config.KeystoreFile -Leaf)-$(Get-Date -Format 'yyyyMMdd').cer"
-    $cerPath = Join-Path $scriptDir $cerName
+    $cerName  = "$(Split-Path $config.KeystoreFile -Leaf)-$(Get-Date -Format 'yyyyMMdd').cer"
+    $cerPath  = Join-Path $scriptDir $cerName
     $baseArgs = Get-BaseArgs $config
     $rc = Invoke-Keytool $keytool (@(
-        "-exportcert",
-        "-alias", $alias,
-        "-file",  $cerPath,
-        "-rfc"
+        "-exportcert", "-alias", $alias, "-file", $cerPath, "-rfc"
     ) + $baseArgs)
     if ($rc -eq 0) {
         $x509 = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($cerPath)
@@ -309,9 +397,23 @@ function Export-TomcatCert {
         Write-Log "Subject    : $($x509.Subject)" -Level INFO
         Write-Log "Expires    : $($x509.NotAfter)" -Level INFO
         return $cerPath
-    } else {
-        Write-Log "Failed to export cert." -Level ERROR
-        return $null
+    }
+    Write-Log "Failed to export cert." -Level ERROR
+    return $null
+}
+
+# ============================================================
+# CLEAN UP OLD .CER AND .CSR FILES IN SCRIPT DIRECTORY
+# ============================================================
+function Remove-OldCertFiles {
+    $cutoff = (Get-Date).AddDays(-$retentionDays)
+    foreach ($ext in @("*.cer","*.csr")) {
+        $old = Get-ChildItem $scriptDir -Filter $ext -ErrorAction SilentlyContinue |
+               Where-Object { $_.LastWriteTime -lt $cutoff }
+        if ($old) {
+            $old | Remove-Item -Force
+            Write-Log "Removed $($old.Count) old $ext file(s) from script directory." -Level INFO
+        }
     }
 }
 
@@ -327,30 +429,41 @@ function Get-IISServerFromLog {
         Write-Log "No access log files found in $logDir" -Level WARN
         return $null
     }
-    $ipCounts  = @{}
-    $linesRead = 0
-    foreach ($f in $logFiles) {
-        $lines = Get-Content $f.FullName -ErrorAction SilentlyContinue
-        foreach ($line in ($lines | Select-Object -Last $iisLinesToScan)) {
+
+    # Count IP hits per log file then find IPs consistent across multiple files
+    $ipPerFile = @{}
+    $filesRead = 0
+    foreach ($f in $logFiles | Select-Object -First 5) {
+        $lines = Get-Content $f.FullName -ErrorAction SilentlyContinue |
+                 Select-Object -Last $iisLinesToScan
+        $seen  = @{}
+        foreach ($line in $lines) {
             if ($line -match "^(\d{1,3}(\.\d{1,3}){3})") {
                 $ip = $Matches[1]
-                $ipCounts[$ip] = ($ipCounts[$ip] -as [int]) + 1
+                if (-not $seen[$ip]) {
+                    $ipPerFile[$ip] = ($ipPerFile[$ip] -as [int]) + 1
+                    $seen[$ip] = $true
+                }
             }
-            $linesRead++
-            if ($linesRead -ge $iisLinesToScan) { break }
         }
-        if ($linesRead -ge $iisLinesToScan) { break }
+        $filesRead++
     }
-    if ($ipCounts.Count -eq 0) {
+
+    if ($ipPerFile.Count -eq 0) {
         Write-Log "No IPs found in access logs." -Level WARN
         return $null
     }
-    $topIPs = $ipCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 5
+
+    # Sort by consistency (appears in most log files) then frequency
+    $topIPs = $ipPerFile.GetEnumerator() |
+              Sort-Object Value -Descending |
+              Select-Object -First 5
+
     Write-Host ""
-    Write-Host "  Top IPs found in access logs:" -ForegroundColor Cyan
+    Write-Host "  IPs found consistently across log files:" -ForegroundColor Cyan
     $i = 1
     foreach ($entry in $topIPs) {
-        Write-Host "  [$i] $($entry.Key)  ($($entry.Value) hits)"
+        Write-Host "  [$i] $($entry.Key)  (seen in $($entry.Value) of $filesRead log files)"
         $i++
     }
     Write-Host "  [M] Enter manually"
@@ -366,61 +479,274 @@ function Get-IISServerFromLog {
 }
 
 # ============================================================
-# PUSH KEYSTORE TO SAN SERVER - no credentials, uses current session
+# IMPORT CERT TO IIS TRUSTED ROOT - admin console, no WinRM
 # ============================================================
-function Push-KeystoreToSanServer {
-    param(
-        [string]$targetServer,
-        [string]$localKeystorePath,
-        [string]$remoteKeystorePath,
-        [string]$remoteServiceName
-    )
-    Write-Log "Pushing keystore to $targetServer..." -Level INFO -Server $targetServer
+function Import-CertToIIS {
+    param([string]$iisServer, [string]$cerPath)
+    Write-Log "Importing cert to IIS Trusted Root on $iisServer..." -Level INFO
 
-    # Map a temp drive to the remote server using current admin session
-    $driveName = "TempCertPush"
-    $remoteDir = Split-Path $remoteKeystorePath
-    $uncPath   = "\\$targetServer\$($remoteDir -replace ':','$')"
+    # Verify admin share reachable
+    if (-not (Test-Path "\\$iisServer\C$")) {
+        Write-Log "Cannot reach \\$iisServer\C$ - check admin share access." -Level ERROR
+        Add-Summary "IIS Cert Import" $iisServer "FAILED" "Admin share unreachable"
+        return $false
+    }
+
+    $remoteTemp    = "\\$iisServer\C$\Windows\Temp"
+    $remoteCer     = "$remoteTemp\$(Split-Path $cerPath -Leaf)"
+    $remoteCerLocal = "C:\Windows\Temp\$(Split-Path $cerPath -Leaf)"
+    $taskName      = "TomcatCertImport_$ts"
+
+    if ($WhatIf) {
+        Write-Host "  [WHATIF] Would copy $cerPath to $remoteCer" -ForegroundColor Magenta
+        Write-Host "  [WHATIF] Would run certutil -addstore Root on $iisServer" -ForegroundColor Magenta
+        Add-Summary "IIS Cert Import" $iisServer "OK" "WhatIf"
+        return $true
+    }
 
     try {
-        # Backup remote keystore via UNC
-        if (Test-Path "$uncPath\$(Split-Path $remoteKeystorePath -Leaf)") {
-            $bkDest = "$uncPath\$(Split-Path $remoteKeystorePath -Leaf).backup.$ts"
-            Copy-Item "$uncPath\$(Split-Path $remoteKeystorePath -Leaf)" $bkDest -Force
-            Write-Log "Remote keystore backed up to $bkDest" -Level INFO -Server $targetServer
-        }
+        Copy-Item $cerPath $remoteCer -Force -ErrorAction Stop
+        Write-Log "Cert copied to $remoteCer" -Level INFO
+    } catch {
+        Write-Log "Failed to copy cert to $remoteTemp : $_" -Level ERROR
+        Add-Summary "IIS Cert Import" $iisServer "FAILED" "Copy failed: $_"
+        return $false
+    }
 
-        # Copy new keystore
-        if ($WhatIf) {
-            Write-Host "  [WHATIF] Would copy $localKeystorePath to $uncPath" -ForegroundColor Magenta
+    $cmd = "certutil -addstore -f Root `"$remoteCerLocal`""
+    & schtasks.exe /create /s $iisServer /tn $taskName /ru "SYSTEM" `
+        /sc ONCE /st 00:00 /tr "cmd.exe /c $cmd" /f 2>&1 |
+        ForEach-Object { Write-Log $_ -Level DETAIL }
+    & schtasks.exe /run /s $iisServer /tn $taskName 2>&1 |
+        ForEach-Object { Write-Log $_ -Level DETAIL }
+    Start-Sleep -Seconds 5
+    & schtasks.exe /delete /s $iisServer /tn $taskName /f 2>&1 |
+        ForEach-Object { Write-Log $_ -Level DETAIL }
+    Remove-Item $remoteCer -Force -ErrorAction SilentlyContinue
+
+    Write-Log "Cert import task completed on $iisServer - verify in certlm.msc" -Level INFO
+    Add-Summary "IIS Cert Import" $iisServer "OK" "Verify in certlm.msc"
+    return $true
+}
+
+# ============================================================
+# WAIT FOR SERVICE STATE
+# ============================================================
+function Wait-ServiceState {
+    param([string]$server, [string]$svcName, [string]$desiredState, [int]$timeoutSec)
+    $elapsed = 0
+    while ($elapsed -lt $timeoutSec) {
+        $query = & sc.exe "\\$server" query $svcName 2>&1
+        if ($query -match $desiredState) { return $true }
+        Start-Sleep -Seconds 3
+        $elapsed += 3
+    }
+    return $false
+}
+
+# ============================================================
+# FIND TOMCAT SERVICE + KEYSTORE PATH ON REMOTE SERVER
+# ============================================================
+function Get-RemoteTomcatInfo {
+    param([string]$targetServer, [string]$localKeystoreLeaf)
+
+    # Check server is reachable first
+    if (-not (Test-Path "\\$targetServer\C$")) {
+        Write-Log "Cannot reach \\$targetServer\C$ - server may be offline or admin share blocked." -Level ERROR -Server $targetServer
+        return $null
+    }
+
+    # WMI query with timeout handling
+    $wmiSvc = $null
+    try {
+        $job = Start-Job {
+            param($s)
+            Get-WmiObject Win32_Service -ComputerName $s -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match "tomcat" -or $_.DisplayName -match "tomcat" } |
+            Select-Object -First 1
+        } -ArgumentList $targetServer
+        $done = Wait-Job $job -Timeout $wmiTimeout
+        if ($done) {
+            $wmiSvc = Receive-Job $job
         } else {
-            Copy-Item $localKeystorePath "$uncPath\$(Split-Path $remoteKeystorePath -Leaf)" -Force
-            Write-Log "Keystore copied to $uncPath" -Level INFO -Server $targetServer
+            Write-Log "WMI query timed out on $targetServer" -Level WARN -Server $targetServer
+        }
+        Remove-Job $job -Force
+    } catch {
+        Write-Log "WMI query failed on ${targetServer}: $_" -Level WARN -Server $targetServer
+    }
+
+    # Fall back to description search
+    if (-not $wmiSvc) {
+        try {
+            $job = Start-Job {
+                param($s)
+                Get-WmiObject Win32_Service -ComputerName $s -ErrorAction SilentlyContinue |
+                Where-Object { $_.Description -match "Apache Tomcat" } |
+                Select-Object -First 1
+            } -ArgumentList $targetServer
+            $done = Wait-Job $job -Timeout $wmiTimeout
+            if ($done) { $wmiSvc = Receive-Job $job }
+            Remove-Job $job -Force
+        } catch {
+            Write-Log "WMI description search failed on ${targetServer}: $_" -Level WARN -Server $targetServer
+        }
+    }
+
+    $svcName    = $null
+    $tomcatBase = $null
+    $ksPath     = $null
+
+    if ($wmiSvc) {
+        $svcName    = $wmiSvc.Name
+        $exePath    = $wmiSvc.PathName.Trim('"') -replace "\s.+$", ""
+        $tomcatBase = Split-Path (Split-Path $exePath)
+        Write-Log "Service: $svcName  Base: $tomcatBase" -Level INFO -Server $targetServer
+
+        $uncConf = "\\$targetServer\$($tomcatBase -replace ':','$')\conf\server.xml"
+        if (Test-Path $uncConf) {
+            [xml]$xml  = Get-Content $uncConf -ErrorAction SilentlyContinue
+            $conn      = $xml.Server.Service.Connector |
+                         Where-Object { $_.SSLEnabled -eq "true" -or $_.scheme -eq "https" } |
+                         Select-Object -First 1
+            if ($conn) {
+                $ksFile = $conn.keystoreFile
+                if ($conn.SSLHostConfig -and $conn.SSLHostConfig.Certificate.certificateKeystoreFile) {
+                    $ksFile = $conn.SSLHostConfig.Certificate.certificateKeystoreFile
+                }
+                if ($ksFile) {
+                    if (-not [System.IO.Path]::IsPathRooted($ksFile)) {
+                        $ksFile = Join-Path $tomcatBase $ksFile
+                    }
+                    $ksPath = $ksFile
+                    Write-Log "Keystore from server.xml: $ksPath" -Level INFO -Server $targetServer
+                }
+            }
+        }
+    }
+
+    # Fall back to known paths
+    if (-not $ksPath) {
+        Write-Log "Trying known Tomcat paths..." -Level WARN -Server $targetServer
+        foreach ($base in @("E:\customers\shared\dacs\tomcat10","E:\customers\shared\dacs\tomcat")) {
+            $uncBase = "\\$targetServer\$($base -replace ':','$')"
+            if (Test-Path $uncBase) {
+                $tomcatBase = $base
+                $uncConf    = "$uncBase\conf\server.xml"
+                if (Test-Path $uncConf) {
+                    [xml]$xml = Get-Content $uncConf -ErrorAction SilentlyContinue
+                    $conn     = $xml.Server.Service.Connector |
+                                Where-Object { $_.SSLEnabled -eq "true" -or $_.scheme -eq "https" } |
+                                Select-Object -First 1
+                    if ($conn) {
+                        $ksFile = $conn.keystoreFile
+                        if ($conn.SSLHostConfig -and $conn.SSLHostConfig.Certificate.certificateKeystoreFile) {
+                            $ksFile = $conn.SSLHostConfig.Certificate.certificateKeystoreFile
+                        }
+                        if ($ksFile) {
+                            if (-not [System.IO.Path]::IsPathRooted($ksFile)) {
+                                $ksFile = Join-Path $tomcatBase $ksFile
+                            }
+                            $ksPath = $ksFile
+                        }
+                    }
+                }
+                if (-not $ksPath) {
+                    $ksPath = Join-Path $tomcatBase "conf\$localKeystoreLeaf"
+                }
+                Write-Log "Using known path: $tomcatBase  Keystore: $ksPath" -Level INFO -Server $targetServer
+                break
+            }
+        }
+    }
+
+    if (-not $ksPath) { return $null }
+
+    return [PSCustomObject]@{
+        ServiceName  = $svcName
+        TomcatBase   = $tomcatBase
+        KeystorePath = $ksPath
+    }
+}
+
+# ============================================================
+# PUSH KEYSTORE TO SAN SERVER
+# ============================================================
+function Push-KeystoreToSanServer {
+    param([string]$targetServer, [string]$localKeystorePath)
+    Write-Log "Starting push to $targetServer..." -Level INFO -Server $targetServer
+
+    $remoteInfo = Get-RemoteTomcatInfo -targetServer $targetServer `
+                  -localKeystoreLeaf (Split-Path $localKeystorePath -Leaf)
+
+    if (-not $remoteInfo) {
+        Write-Log "Could not determine remote config - skipping $targetServer." -Level ERROR -Server $targetServer
+        Add-Summary "Keystore Push" $targetServer "FAILED" "Could not determine remote config"
+        return $false
+    }
+
+    $ksLeaf    = Split-Path $remoteInfo.KeystorePath -Leaf
+    $remoteDir = Split-Path $remoteInfo.KeystorePath
+    $uncDir    = "\\$targetServer\$($remoteDir -replace ':','$')"
+    $uncKs     = "$uncDir\$ksLeaf"
+
+    Write-Log "Remote keystore: $($remoteInfo.KeystorePath)" -Level INFO -Server $targetServer
+    Write-Log "Service        : $($remoteInfo.ServiceName)" -Level INFO -Server $targetServer
+
+    try {
+        # Backup
+        if (Test-Path $uncKs) {
+            $bkDest = "$uncKs.backup.$ts"
+            if ($WhatIf) {
+                Write-Host "  [WHATIF] Would backup $uncKs to $bkDest" -ForegroundColor Magenta
+            } else {
+                Copy-Item $uncKs $bkDest -Force
+                Write-Log "Remote keystore backed up to $bkDest" -Level INFO -Server $targetServer
+            }
         }
 
-        # Restart Tomcat service on remote server via sc.exe (no WinRM needed)
-        $svcToRestart = $remoteServiceName
-        if (-not $WhatIf) {
-            Write-Log "Stopping $svcToRestart on $targetServer..." -Level INFO -Server $targetServer
-            $stop = & sc.exe "\\$targetServer" stop $svcToRestart 2>&1
-            Start-Sleep -Seconds 5
-            $start = & sc.exe "\\$targetServer" start $svcToRestart 2>&1
-            Write-Log "sc stop : $stop"  -Level DETAIL -Server $targetServer
-            Write-Log "sc start: $start" -Level DETAIL -Server $targetServer
+        # Copy
+        if ($WhatIf) {
+            Write-Host "  [WHATIF] Would copy $localKeystorePath to $uncKs" -ForegroundColor Magenta
+        } else {
+            Copy-Item $localKeystorePath $uncKs -Force -ErrorAction Stop
+            Write-Log "Keystore copied to $uncKs" -Level INFO -Server $targetServer
+        }
 
-            # Verify service is running
-            $status = & sc.exe "\\$targetServer" query $svcToRestart 2>&1
-            if ($status -match "RUNNING") {
-                Write-Log "Service is running." -Level INFO -Server $targetServer
+        # Restart service
+        if ($remoteInfo.ServiceName) {
+            if ($WhatIf) {
+                Write-Host "  [WHATIF] Would restart $($remoteInfo.ServiceName) on $targetServer" -ForegroundColor Magenta
             } else {
-                Write-Log "Service may not have started - verify manually." -Level WARN -Server $targetServer
+                Write-Log "Stopping $($remoteInfo.ServiceName)..." -Level INFO -Server $targetServer
+                & sc.exe "\\$targetServer" stop $remoteInfo.ServiceName 2>&1 |
+                    ForEach-Object { Write-Log $_ -Level DETAIL -Server $targetServer }
+
+                $stopped = Wait-ServiceState $targetServer $remoteInfo.ServiceName "STOPPED" $svcStopTimeout
+                if (-not $stopped) {
+                    Write-Log "Service did not stop within $svcStopTimeout seconds." -Level WARN -Server $targetServer
+                }
+
+                & sc.exe "\\$targetServer" start $remoteInfo.ServiceName 2>&1 |
+                    ForEach-Object { Write-Log $_ -Level DETAIL -Server $targetServer }
+
+                $started = Wait-ServiceState $targetServer $remoteInfo.ServiceName "RUNNING" $svcStartTimeout
+                if ($started) {
+                    Write-Log "Service is running." -Level INFO -Server $targetServer
+                    Add-Summary "Keystore Push" $targetServer "OK" "Service restarted"
+                } else {
+                    Write-Log "Service did not start within $svcStartTimeout seconds - verify manually." -Level WARN -Server $targetServer
+                    Add-Summary "Keystore Push" $targetServer "WARN" "Service may not have started"
+                }
             }
         } else {
-            Write-Host "  [WHATIF] Would restart $svcToRestart on $targetServer via sc.exe" -ForegroundColor Magenta
+            Write-Log "No service found - restart Tomcat manually on $targetServer." -Level WARN -Server $targetServer
+            Add-Summary "Keystore Push" $targetServer "WARN" "Keystore copied - restart Tomcat manually"
         }
         return $true
     } catch {
-        Write-Log "Failed to push to ${targetServer}: $_" -Level ERROR -Server $targetServer
+        Write-Log "Push failed for ${targetServer}: $_" -Level ERROR -Server $targetServer
+        Add-Summary "Keystore Push" $targetServer "FAILED" "$_"
         return $false
     }
 }
@@ -432,23 +758,39 @@ function Invoke-TomcatRestart {
     param($config)
     if (-not $config.ServiceName) {
         Write-Log "Tomcat service name not detected - restart manually." -Level WARN
+        Add-Summary "Local Restart" $env:COMPUTERNAME "WARN" "Service name not detected"
         return
     }
     $restart = (Read-Host "  Restart Tomcat service '$($config.ServiceName)' now? (y/n)").ToLower()
     if ($restart -ne "y") {
         Write-Log "Tomcat restart skipped." -Level WARN
+        Add-Summary "Local Restart" $env:COMPUTERNAME "SKIPPED" "User skipped restart"
         return
     }
     if ($WhatIf) {
         Write-Host "  [WHATIF] Would restart service: $($config.ServiceName)" -ForegroundColor Magenta
+        Add-Summary "Local Restart" $env:COMPUTERNAME "OK" "WhatIf"
         return
     }
     try {
-        Write-Log "Restarting $($config.ServiceName)..." -Level INFO
-        Restart-Service -Name $config.ServiceName -Force -ErrorAction Stop
-        Write-Log "Service restarted successfully." -Level INFO
+        Write-Log "Stopping $($config.ServiceName)..." -Level INFO
+        Stop-Service -Name $config.ServiceName -Force -ErrorAction Stop
+        $stopped = Wait-ServiceState $env:COMPUTERNAME $config.ServiceName "STOPPED" $svcStopTimeout
+        if (-not $stopped) {
+            Write-Log "Service did not stop within $svcStopTimeout seconds." -Level WARN
+        }
+        Start-Service -Name $config.ServiceName -ErrorAction Stop
+        $started = Wait-ServiceState $env:COMPUTERNAME $config.ServiceName "RUNNING" $svcStartTimeout
+        if ($started) {
+            Write-Log "Service is running." -Level INFO
+            Add-Summary "Local Restart" $env:COMPUTERNAME "OK" ""
+        } else {
+            Write-Log "Service did not start within $svcStartTimeout seconds - verify manually." -Level WARN
+            Add-Summary "Local Restart" $env:COMPUTERNAME "WARN" "Did not start within timeout"
+        }
     } catch {
         Write-Log "Failed to restart service: $_" -Level ERROR
+        Add-Summary "Local Restart" $env:COMPUTERNAME "FAILED" "$_"
     }
 }
 
@@ -461,7 +803,7 @@ function Show-SanServerMenu {
     $servers   = @()
     foreach ($san in $sanList) {
         $h = ($san -replace "^dns:", "").ToLower()
-        if ($h -ne $localHost -and $h -notmatch "^\d") { $servers += $h }
+        if ($h -ne $localHost) { $servers += $h }
     }
     if ($servers.Count -eq 0) {
         Write-Log "No remote SAN servers found." -Level WARN
@@ -483,10 +825,8 @@ function Show-SanServerMenu {
             continue
         }
         Push-KeystoreToSanServer `
-            -targetServer       $servers[$idx] `
-            -localKeystorePath  $config.KeystoreFile `
-            -remoteKeystorePath $config.KeystoreFile `
-            -remoteServiceName  $config.ServiceName
+            -targetServer      $servers[$idx] `
+            -localKeystorePath $config.KeystoreFile
     }
 }
 
@@ -513,23 +853,23 @@ function Invoke-PostRenewal {
     Write-Host ""
     Write-Host "  -- Post-Renewal Steps --" -ForegroundColor Cyan
 
-    # 1. Export cert to script directory
+    # 1. Export cert
     $cerPath = Export-TomcatCert $keytool $config $alias
+    if ($cerPath) {
+        Add-Summary "Cert Export" $env:COMPUTERNAME "OK" $cerPath
+    } else {
+        Add-Summary "Cert Export" $env:COMPUTERNAME "FAILED" ""
+    }
 
-    # 2. Identify IIS server and show instructions
+    # 2. IIS import
     if ($cerPath) {
         $iisServer = Get-IISServerFromLog -logDir $config.LogDir
-        Write-Host ""
-        Write-Host "  -- IIS Import Instructions --" -ForegroundColor Cyan
         if ($iisServer) {
-            Write-Host "  IIS server identified as: $iisServer" -ForegroundColor White
+            Import-CertToIIS -iisServer $iisServer -cerPath $cerPath
+        } else {
+            Write-Log "IIS server not identified - import cert manually from: $cerPath" -Level WARN
+            Add-Summary "IIS Cert Import" "(manual)" "SKIPPED" "Copy $cerPath to IIS server"
         }
-        Write-Host "  Copy this file to the IIS server and run the companion script:" -ForegroundColor White
-        Write-Host "  Cert : $cerPath" -ForegroundColor Yellow
-        Write-Host "  Then : Run Import-TomcatCertToIIS.ps1 -CerPath <path>" -ForegroundColor Yellow
-        Write-Host ""
-        Write-Log "Cert ready for IIS import at: $cerPath" -Level INFO
-        if ($iisServer) { Write-Log "IIS server identified as: $iisServer" -Level INFO }
     }
 
     # 3. Push to SAN servers
@@ -540,11 +880,19 @@ function Invoke-PostRenewal {
         $push = (Read-Host "  Push updated keystore to other SAN servers? (y/n)").ToLower()
         if ($push -eq "y") {
             Show-SanServerMenu -config $config -sanList $sanList -mode "push"
+        } else {
+            Add-Summary "SAN Push" "(skipped)" "SKIPPED" "User skipped"
         }
     }
 
     # 4. Restart local Tomcat
     Invoke-TomcatRestart $config
+
+    # 5. Clean up old cert files
+    Remove-OldCertFiles
+
+    # 6. Show summary
+    Show-Summary
 }
 
 # ============================================================
@@ -565,7 +913,7 @@ function Remove-OldBackups {
 # ============================================================
 Clear-Host
 Write-Host "================================================" -ForegroundColor Cyan
-Write-Host "  Tomcat Keystore Management Script v6$(if($WhatIf){' [WHATIF]'})" -ForegroundColor Cyan
+Write-Host "  Tomcat Keystore Management Script v7$(if($WhatIf){' [WHATIF]'})" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host ""
 if ($WhatIf) { Write-Host "  WHATIF MODE - no changes will be made`n" -ForegroundColor Magenta }
@@ -574,8 +922,7 @@ Write-Log "--- Script started. Log: $logFile ---" -Level INFO
 
 $keytool = Find-Keytool
 if (-not $keytool) {
-    Write-Log "keytool.exe not found. Exiting." -Level ERROR
-    exit 1
+    Write-Log "keytool.exe not found. Exiting." -Level ERROR; exit 1
 }
 Write-Log "keytool: $keytool" -Level INFO
 
@@ -586,9 +933,16 @@ Write-Host ""
 Write-Host "  Keystore : $($config.KeystoreFile)$(if(-not $ksExists){' (not found)'})" -ForegroundColor White
 Write-Host "  Type     : $($config.KeystoreType)" -ForegroundColor White
 Write-Host "  Service  : $(if($config.ServiceName){$config.ServiceName}else{'(not detected)'})" -ForegroundColor White
+Write-Host "  Alias    : $(if($config.KeyAlias){$config.KeyAlias}else{'(not set in server.xml)'})" -ForegroundColor White
 Write-Host "  Log Dir  : $($config.LogDir)" -ForegroundColor White
 Write-Host "  Log      : $logFile" -ForegroundColor White
-Write-Host ""
+
+# Validate password and show cert expiry before menu
+if ($ksExists) {
+    if (-not (Test-KeystorePassword $keytool $config)) { exit 1 }
+    Show-CertExpiry $keytool $config
+}
+
 Write-Host "  [U] Update / renew existing certificate (self-signed)"
 Write-Host "  [C] Create CSR for CA signing"
 Write-Host "  [I] Import CA-signed certificate"
@@ -606,6 +960,16 @@ if ($choice -eq "U") {
     if ([string]::IsNullOrWhiteSpace($aliasName)) {
         Write-Log "Alias cannot be empty." -Level ERROR; exit 1
     }
+
+    # Warn if alias does not match server.xml keyAlias
+    if ($config.KeyAlias -and $aliasName -ne $config.KeyAlias) {
+        Write-Host ""
+        Write-Host "  WARNING: Entered alias '$aliasName' does not match keyAlias '$($config.KeyAlias)' in server.xml." -ForegroundColor Yellow
+        Write-Host "  Tomcat will use '$($config.KeyAlias)' - the new cert may not be loaded." -ForegroundColor Yellow
+        $cont = (Read-Host "  Continue anyway? (y/n)").ToLower()
+        if ($cont -ne "y") { exit 0 }
+    }
+
     $baseArgs        = Get-BaseArgs $config
     $existingDetails = & $keytool -list -v @baseArgs -alias $aliasName 2>&1
     $aliasExists     = $LASTEXITCODE -eq 0
@@ -664,16 +1028,10 @@ if ($choice -eq "U") {
         Write-Log "Old alias deleted." -Level INFO
     }
 
-    $genArgs = @(
-        "-genkeypair",
-        "-alias",    $aliasName,
-        "-keyalg",   $keyAlg
-    ) + $keySizeArg + @(
-        "-validity", $validity,
-        "-dname",    $dNameToUse,
-        "-ext",      $sanExt,
-        "-keypass",  $config.KeyPass
-    ) + $baseArgs
+    $genArgs = @("-genkeypair","-alias",$aliasName,"-keyalg",$keyAlg) +
+               $keySizeArg +
+               @("-validity",$validity,"-dname",$dNameToUse,"-ext",$sanExt,"-keypass",$config.KeyPass) +
+               $baseArgs
 
     $rc = Invoke-Keytool $keytool $genArgs
     if ($rc -ne 0) { Write-Log "genkeypair failed." -Level ERROR; exit 1 }
@@ -699,8 +1057,7 @@ elseif ($choice -eq "C") {
     $baseArgs        = Get-BaseArgs $config
     $existingDetails = & $keytool -list -v @baseArgs -alias $aliasName 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Write-Log "Alias '$aliasName' not found. Generate a key pair first (option U)." -Level ERROR
-        exit 1
+        Write-Log "Alias '$aliasName' not found. Generate a key pair first (option U)." -Level ERROR; exit 1
     }
     $sanListToUse = Get-CertSANs $existingDetails
     $sanExt       = "san=" + ($sanListToUse -join ",")
@@ -777,6 +1134,7 @@ elseif ($choice -eq "R") {
         Copy-Item $src $config.KeystoreFile -Force
         Write-Log "Restored $src to $($config.KeystoreFile)" -Level INFO
         Invoke-TomcatRestart $config
+        Show-Summary
     }
 }
 
@@ -786,6 +1144,7 @@ elseif ($choice -eq "R") {
 elseif ($choice -eq "X") {
     Write-Log "User selected [Copy cert to SAN server]." -Level INFO
     Invoke-CopyCertToSanServer -config $config -keytool $keytool
+    Show-Summary
 }
 
 else {
