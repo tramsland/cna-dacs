@@ -1,4 +1,7 @@
-keytool -exportcert -alias tomcat ^
+E:\customers\shared\dacs\java\bin\keytool.exe -exportcert ^
+  -alias tomcat ^
   -keystore "E:\customers\shared\dacs\tomcat10\conf\keystore.p12" ^
   -storetype PKCS12 ^
   -storepass changeit ^
+  -file "C:\DLA-FAILSAFE\patching\tomcat.cer" ^
+  -rfc
