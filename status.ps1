@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 # Remote Service Status Checker (Parallel with Logging)
 # Checks Tomcat, Content Server, and Content Server Admin on remote Windows servers
-# v3.1 -- all quick fixes applied
+# v3.2 -- fixed KeyAvailable terminating error in non-interactive sessions
 
 #region Parameters
 param(
@@ -948,23 +948,39 @@ try {
 } catch { }
 
 if ($consoleAvailable) {
+    # Drain any buffered keystrokes
     try { while ([System.Console]::KeyAvailable) { [System.Console]::ReadKey($true) | Out-Null } } catch { }
+
     Write-Host "Use alternate credentials? (y/n)  [auto-skipping in 10 seconds]" -ForegroundColor Cyan
     $useCreds = ""; $deadline = (Get-Date).AddSeconds(10)
     while ((Get-Date) -lt $deadline) {
+        # FIX: wrap KeyAvailable in its own try/catch on every iteration.
+        # Console availability can change mid-run (scheduled task, redirected stdin).
+        # A bare 'catch { break }' on the outer try still lets the exception surface
+        # as a terminating error and repeat every 100ms. Isolating it here stops that.
         $keyAvail = $false
-        try { $keyAvail = [System.Console]::KeyAvailable } catch { break }
+        try {
+            $keyAvail = [System.Console]::KeyAvailable
+        } catch {
+            # Console became unavailable - treat as non-interactive and bail out
+            $consoleAvailable = $false
+            break
+        }
         if ($keyAvail) {
-            $key      = [System.Console]::ReadKey($true)
-            $useCreds = $key.KeyChar.ToString().ToLower()
-            Write-Host $useCreds; break
+            try {
+                $key      = [System.Console]::ReadKey($true)
+                $useCreds = $key.KeyChar.ToString().ToLower()
+                Write-Host $useCreds
+            } catch { }
+            break
         }
         Start-Sleep -Milliseconds 100
     }
     if ($useCreds -eq "y") {
         $Credential = Get-Credential -Message "Enter credentials for remote servers"
     }
-} else {
+}
+if (-not $consoleAvailable) {
     Write-Host "Non-interactive session detected - skipping credential prompt, using default credentials." -ForegroundColor Gray
 }
 
