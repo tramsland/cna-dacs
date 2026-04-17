@@ -2649,3 +2649,133 @@ Write-Log "========================================" -Color Cyan
 Write-Log "Log  : $logFile" -Color Green
 Write-Log "CSV  : $csvFile" -Color Green
 Write-Log "HTML : $htmlFile" -Color Green
+
+# ── Auto-publish to Tomcat webapps ─────────────────────────────────────────────
+$publishUrl = $null
+
+# Find Tomcat service on this host
+$localTomcat = Get-CimInstance -ClassName Win32_Service | Where-Object {
+    $_.DisplayName -like "*Apache*Tomcat*" -or $_.Name -like "*Tomcat*"
+} | Select-Object -First 1
+
+if ($localTomcat) {
+    $tomcatHome = $null
+
+    # Try registry first (same logic as the remote job)
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0\$($localTomcat.Name)\Parameters\Java",
+        "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Procrun 2.0\$($localTomcat.Name)\Parameters\Java"
+    )
+    foreach ($reg in $regPaths) {
+        if (Test-Path $reg) {
+            $regProps = Get-ItemProperty $reg -ErrorAction SilentlyContinue
+            if ($regProps.Classpath -match "^(.+?)\\lib\\") {
+                $tomcatHome = $Matches[1]
+                break
+            }
+        }
+    }
+
+    # Fallback: derive from service executable path
+    if (-not $tomcatHome -and $localTomcat.PathName -match `
+        ("^" + [char]34 + "?([^" + [char]34 + "]+\.exe)" + [char]34 + "?")) {
+        $exeDir = Split-Path $Matches[1] -Parent
+        foreach ($candidate in @((Split-Path $exeDir -Parent), $exeDir)) {
+            if (Test-Path (Join-Path $candidate "lib")) {
+                $tomcatHome = $candidate
+                break
+            }
+        }
+    }
+
+    # Fallback: CATALINA_HOME environment variable
+    if (-not $tomcatHome) {
+        $cat = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME", "Machine")
+        if ($cat -and (Test-Path $cat)) { $tomcatHome = $cat }
+    }
+
+    if ($tomcatHome) {
+        $webappsRoot = Join-Path $tomcatHome "webapps"
+        $monitorDir  = Join-Path $webappsRoot "monitoring"
+
+        # Create monitoring folder if it doesn't exist
+        if (-not (Test-Path $monitorDir)) {
+            New-Item -ItemType Directory -Path $monitorDir -Force | Out-Null
+            Write-Log "Created webapps folder: $monitorDir" -Color Gray
+        }
+
+        # Always overwrite a stable 'latest' copy
+        $latestPath = Join-Path $monitorDir "index.html"
+        Copy-Item -Path $htmlFile -Destination $latestPath -Force
+
+        # Also keep a timestamped archive copy
+        $archivePath = Join-Path $monitorDir (Split-Path $htmlFile -Leaf)
+        Copy-Item -Path $htmlFile -Destination $archivePath -Force
+
+        # Detect Tomcat HTTP port from server.xml
+        $port = "8080"
+        $serverXml = Join-Path $tomcatHome "conf\server.xml"
+        if (Test-Path $serverXml) {
+            $xmlContent = Get-Content $serverXml -Raw -ErrorAction SilentlyContinue
+            if ($xmlContent -match '<Connector[^>]+port="(\d+)"[^>]+protocol="HTTP') {
+                $port = $Matches[1]
+            }
+        }
+
+        $publishUrl = "http://$($env:COMPUTERNAME):$port/monitoring/"
+        Write-Log "Published to   : $publishUrl" -Color Green
+        Write-Log "Tomcat home    : $tomcatHome" -Color Gray
+        Write-Log "Webapps path   : $monitorDir" -Color Gray
+
+        # Generate a simple index listing all archived reports
+        $archiveFiles = Get-ChildItem -Path $monitorDir -Filter "ServiceCheck_*.html" |
+                        Sort-Object Name -Descending
+        $archiveRows  = $archiveFiles | ForEach-Object {
+            $ts      = $_.BaseName -replace "ServiceCheck_", ""
+            $display = "$($ts.Substring(0,4))-$($ts.Substring(4,2))-$($ts.Substring(6,2)) " +
+                       "$($ts.Substring(9,2)):$($ts.Substring(11,2)):$($ts.Substring(13,2))"
+            $size    = [math]::Round($_.Length / 1KB, 1)
+            "<tr><td><a href='$($_.Name)'>$display</a></td><td>${size} KB</td></tr>"
+        }
+
+        $indexHtml = @"
+<!DOCTYPE html>
+<html lang='en'><head><meta charset='UTF-8'>
+<meta http-equiv='refresh' content='300'>
+<title>Service Check Reports</title>
+<style>
+  body { font-family: 'Segoe UI', sans-serif; background: #0f1117; color: #c9d1d9; padding: 32px; }
+  h1   { font-size: 20px; color: #e6edf3; margin-bottom: 8px; }
+  p    { font-size: 13px; color: #8b949e; margin-bottom: 24px; }
+  table { border-collapse: collapse; width: 100%; max-width: 600px;
+          background: #161b22; border: 1px solid #21262d; border-radius: 8px; overflow: hidden; }
+  th   { background: #1c2128; color: #8b949e; font-size: 11px; text-transform: uppercase;
+         letter-spacing: 0.06em; padding: 10px 16px; text-align: left; }
+  td   { padding: 9px 16px; font-size: 13px; border-top: 1px solid #21262d; }
+  a    { color: #79c0ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .latest { display:inline-block; margin-bottom:20px; padding: 10px 20px;
+            background:#0d1f12; border:1px solid #238636; border-radius:8px;
+            color:#3fb950; font-weight:600; font-size:14px; }
+</style></head><body>
+<h1>Service Check Reports</h1>
+<p>Page auto-refreshes every 5 minutes. Latest report is always served as index.html.</p>
+<a class='latest' href='index.html'>&#x25B6; View Latest Report</a>
+<table>
+  <thead><tr><th>Run Time</th><th>Size</th></tr></thead>
+  <tbody>$($archiveRows -join '')</tbody>
+</table>
+</body></html>
+"@
+        $indexListPath = Join-Path $monitorDir "reports.html"
+        [System.IO.File]::WriteAllText($indexListPath, $indexHtml,
+            (New-Object System.Text.UTF8Encoding $true))
+        Write-Log "Archive index  : $($publishUrl)reports.html" -Color Green
+
+    } else {
+        Write-Log "Could not determine Tomcat home - skipping publish." -Color Yellow
+    }
+} else {
+    Write-Log "Tomcat service not found on this host - skipping publish." -Color Yellow
+}
+#endregion
