@@ -1,7 +1,399 @@
-E:\customers\shared\dacs\java\bin\keytool.exe -exportcert ^
-  -alias tomcat ^
-  -keystore "E:\customers\shared\dacs\tomcat10\conf\keystore.p12" ^
-  -storetype PKCS12 ^
-  -storepass changeit ^
-  -file "C:\DLA-FAILSAFE\patching\tomcat.cer" ^
-  -rfc
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
+ 
+Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
+from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
++     if ([System.Console]::KeyAvailable) {
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
+    + FullyQualifiedErrorId : System.InvalidOperationException
