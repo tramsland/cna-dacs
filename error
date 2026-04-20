@@ -1,398 +1,374 @@
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console 
+input has been redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
     + FullyQualifiedErrorId : System.InvalidOperationException
  
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
-+     if ([System.Console]::KeyAvailable) {
-+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
-    + FullyQualifiedErrorId : System.InvalidOperationException
- 
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
-+     if ([System.Console]::KeyAvailable) {
-+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
-    + FullyQualifiedErrorId : System.InvalidOperationException
- 
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
-+     if ([System.Console]::KeyAvailable) {
-+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
-    + FullyQualifiedErrorId : System.InvalidOperationException
- 
-Cannot see if a key has been pressed when either application does not have a console or when console input has been redirected 
-from a file. Try Console.In.Peek.
-At C:\DLA-FAILSAFE\patching\status.ps1:626 char:9
+Cannot see if a key has been pressed when either application does not have a console or when console input has been 
+redirected from a file. Try Console.In.Peek.
+At C:\DLA-FAILSAFE\patching\tomcatcert.ps1:626 char:9
 +     if ([System.Console]::KeyAvailable) {
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (:) [], InvalidOperationException
