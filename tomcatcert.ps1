@@ -4,6 +4,7 @@
 #region Parameters
 param(
     [switch]$QuietOK,
+    [switch]$SkipCredentialPrompt,
     [string]$SmtpServer   = "smtp.domain.com",
     [string]$EmailFrom    = "monitoring@domain.com",
     [string]$EmailTo      = "ops@domain.com",
@@ -94,7 +95,7 @@ $checkServicesScript = {
         [int]$PortCheckTimeout
     )
 
-    # â”€â”€ Inline helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Inline helpers ────────────────────────────────────────────────────────
     function Get-UptimeString {
         param([datetime]$LastBootTime)
         $u = (Get-Date) - $LastBootTime
@@ -201,7 +202,7 @@ $checkServicesScript = {
         $List.Add("  CPU Usage : $bar $CpuPct% (avg over $SampleCount samples)$tag")
     }
 
-    # â”€â”€ Parallel Informant health checks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Parallel Informant health checks ─────────────────────────────────────
     function Invoke-InformantChecks {
         param([string]$BaseUrl, [string[]]$Components, [int]$TimeoutSec, [int]$WarnMs)
         $jobs = @{}
@@ -237,7 +238,7 @@ $checkServicesScript = {
 
     $instanceResults = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    # â”€â”€ Ping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Ping ──────────────────────────────────────────────────────────────────
     $pingOk = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
     if (-not $pingOk) {
         $out = [System.Collections.Generic.List[string]]::new()
@@ -254,7 +255,7 @@ $checkServicesScript = {
         return $instanceResults
     }
 
-    # â”€â”€ CIM session â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── CIM session ───────────────────────────────────────────────────────────
     $cimParams = @{ ComputerName = $ComputerName; ErrorAction = "Stop" }
     if ($Credential) { $cimParams["Credential"] = $Credential }
     try { $session = New-CimSession @cimParams }
@@ -273,7 +274,7 @@ $checkServicesScript = {
         return $instanceResults
     }
 
-    # â”€â”€ System-wide data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── System-wide data ──────────────────────────────────────────────────────
     $os         = Get-CimInstance -CimSession $session -ClassName Win32_OperatingSystem -ErrorAction Stop
     $allCimSvcs = Get-CimInstance -CimSession $session -ClassName Win32_Service         -ErrorAction Stop
     $allDisks   = Get-CimInstance -CimSession $session -ClassName Win32_LogicalDisk `
@@ -314,7 +315,7 @@ $checkServicesScript = {
         }) -join "`n"
     } else { "    No fixed drives found." }
 
-    # â”€â”€ Event log scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Event log scan ────────────────────────────────────────────────────────
     $recentEvents = @()
     try {
         $recentEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
@@ -326,7 +327,7 @@ $checkServicesScript = {
         Select-Object -First $EventLogCount
     } catch { }
 
-    # â”€â”€ Locate services â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Locate services ───────────────────────────────────────────────────────
     $tomcatSvc = $allCimSvcs | Where-Object {
         $_.DisplayName -like "*Apache*Tomcat*" -or $_.Name -like "*Tomcat*"
     } | Select-Object -First 1
@@ -339,7 +340,7 @@ $checkServicesScript = {
         $_.Description -like "*Content Server Admin*"
     } | Select-Object -First 1
 
-    # â”€â”€ Port check (port 80 only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Port check (port 80 only) ─────────────────────────────────────────────
     $port80ok   = $false
     $port80text = "N/A"
     if ($tomcatSvc) {
@@ -349,7 +350,7 @@ $checkServicesScript = {
         $port80text = if ($port80ok) { "[OPEN]" } else { "[CLOSED]" }
     }
 
-    # â”€â”€ Tomcat version â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Tomcat version ────────────────────────────────────────────────────────
     $tomcatVersion = "N/A"
     if ($tomcatSvc) {
         $icParams = @{
@@ -419,7 +420,7 @@ $checkServicesScript = {
         $tomcatVersion = try { Invoke-Command @icParams } catch { "Unable to retrieve" }
     }
 
-    # â”€â”€ JVM heap via Win32_Process working set (JMX not available) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── JVM heap via Win32_Process working set (JMX not available) ───────────
     $wsMB          = $null
     $jvmHeapText   = "N/A"
     $jvmHeapCsvStr = "N/A"
@@ -431,7 +432,7 @@ $checkServicesScript = {
         }
     }
 
-    # â”€â”€ Build output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Build output ──────────────────────────────────────────────────────────
     $checkTime     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $csvRows       = [System.Collections.Generic.List[PSCustomObject]]::new()
     $overallStatus = "OK"
@@ -458,7 +459,7 @@ $checkServicesScript = {
     }
     $out.Add("========================================")
 
-    # â”€â”€ Tomcat â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Tomcat ────────────────────────────────────────────────────────────────
     $out.Add(""); $out.Add("Tomcat Service:")
     if ($tomcatSvc) {
         $tState        = if ($tomcatSvc.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
@@ -499,7 +500,7 @@ $checkServicesScript = {
         })
     } else { $out.Add("  NOT FOUND") }
 
-    # â”€â”€ Content Server(s) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Content Server(s) ─────────────────────────────────────────────────────
     $out.Add(""); $out.Add("Content Server Service(s):")
     if ($csSvcs) {
         foreach ($cs in $csSvcs) {
@@ -560,7 +561,7 @@ $checkServicesScript = {
         }
     } else { $out.Add("  NOT FOUND") }
 
-    # â”€â”€ Content Server Admin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Content Server Admin ──────────────────────────────────────────────────
     $out.Add(""); $out.Add("Content Server Admin Service:")
     if ($csAdmin) {
         $caState        = if ($csAdmin.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
@@ -594,7 +595,7 @@ $checkServicesScript = {
         })
     } else { $out.Add("  NOT FOUND") }
 
-    # â”€â”€ Recent event log entries â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Recent event log entries ──────────────────────────────────────────────
     if ($recentEvents) {
         $out.Add(""); $out.Add("Recent Application Log Events (last 24h, Tomcat/CS related):")
         foreach ($ev in $recentEvents) {
@@ -618,20 +619,37 @@ $checkServicesScript = {
 #endregion
 
 #region Main
+
+# ── Credential prompt (skipped in non-interactive / remote sessions) ──────────
 $Credential = $null
-Write-Host "Use alternate credentials? (y/n)  [auto-skipping in 10 seconds]" -ForegroundColor Cyan
-$useCreds = ""
-$deadline = (Get-Date).AddSeconds(10)
-while ((Get-Date) -lt $deadline) {
-    if ([System.Console]::KeyAvailable) {
-        $key = [System.Console]::ReadKey($true)
-        $useCreds = $key.KeyChar.ToString().ToLower()
-        Write-Host $useCreds
-        break
+$useCreds   = ""
+
+if (-not $SkipCredentialPrompt) {
+    # Probe for an interactive console before attempting KeyAvailable
+    $hasConsole = $true
+    try { [void][System.Console]::KeyAvailable } catch { $hasConsole = $false }
+
+    if ($hasConsole) {
+        Write-Host "Use alternate credentials? (y/n)  [auto-skipping in 10 seconds]" -ForegroundColor Cyan
+        $deadline = (Get-Date).AddSeconds(10)
+        while ((Get-Date) -lt $deadline) {
+            try {
+                if ([System.Console]::KeyAvailable) {
+                    $key      = [System.Console]::ReadKey($true)
+                    $useCreds = $key.KeyChar.ToString().ToLower()
+                    Write-Host $useCreds
+                    break
+                }
+            } catch { break }
+            Start-Sleep -Milliseconds 100
+        }
+        if ($useCreds -eq "y") { $Credential = Get-Credential -Message "Enter credentials for remote servers" }
+    } else {
+        Write-Host "Non-interactive mode detected - skipping credential prompt." -ForegroundColor Gray
     }
-    Start-Sleep -Milliseconds 100
+} else {
+    Write-Host "Credential prompt skipped (-SkipCredentialPrompt)." -ForegroundColor Gray
 }
-if ($useCreds -eq "y") { $Credential = Get-Credential -Message "Enter credentials for remote servers" }
 
 $startTime = Get-Date
 Write-Log "Remote Service Status Check" -Color Cyan
@@ -639,7 +657,7 @@ Write-Log "Started: $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Color Gray
 Write-Log "Log file: $logFile" -Color Gray
 Write-Log ""
 
-# â”€â”€ Start parallel jobs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Start parallel jobs ───────────────────────────────────────────────────────
 $jobs = [System.Collections.Generic.List[hashtable]]::new()
 foreach ($group in $serverGroups.Keys) {
     foreach ($server in $serverGroups[$group]) {
@@ -671,7 +689,7 @@ foreach ($entry in $jobs) {
     }
 }
 
-# â”€â”€ Delta / change detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Delta / change detection ──────────────────────────────────────────────────
 $prevData = @{}
 $prevCsvs = Get-ChildItem -Path $PSScriptRoot -Filter "ServiceCheck_*.csv" -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne (Split-Path $csvFile -Leaf) } |
@@ -685,7 +703,7 @@ if ($prevCsvs) {
     Write-Log "Comparing against previous run: $($prevCsvs[0].Name)" -Color Gray
 }
 
-# â”€â”€ Output grouped results â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Output grouped results ────────────────────────────────────────────────────
 $prevGroup   = $null
 $zoneSummary = [ordered]@{}
 $allVersions = @{}
@@ -744,7 +762,7 @@ foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
     if ($deltaTag) { Write-Log "  >> Delta detected on $($result.ComputerName)$deltaTag" -Color Yellow }
 }
 
-# â”€â”€ Zone-level rollup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Zone-level rollup ─────────────────────────────────────────────────────────
 Write-Log ""; Write-Log "======== Zone Rollup ========" -Color Cyan
 foreach ($grp in $zoneSummary.Keys) {
     $s   = $zoneSummary[$grp]
@@ -765,7 +783,7 @@ foreach ($grp in $zoneSummary.Keys) {
 }
 Write-Log "=============================" -Color Cyan
 
-# â”€â”€ CSV export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── CSV export ────────────────────────────────────────────────────────────────
 $allCsvRows = $results | ForEach-Object { $_.CsvRows } | Where-Object { $_ }
 if ($allCsvRows) {
     $allCsvRows | Sort-Object Zone, Server, ServiceType |
@@ -775,7 +793,7 @@ if ($allCsvRows) {
     Write-Log "No CSV data to export." -Color Yellow
 }
 
-# â”€â”€ HTML report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── HTML report ───────────────────────────────────────────────────────────────
 $htmlRows = $allCsvRows | Sort-Object Zone, Server, ServiceType
 
 $htmlBody = ""
@@ -914,7 +932,7 @@ function toggle(id){
 $html | Out-File -FilePath $htmlFile -Encoding UTF8
 Write-Log "HTML report    : $htmlFile" -Color Green
 
-# â”€â”€ Email on issues â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Email on issues ───────────────────────────────────────────────────────────
 $issueRows = $allCsvRows | Where-Object { $_.OverallStatus -in @("DOWN","CRITICAL") }
 if ($issueRows) {
     $bodyLines = @("Service Check Alert - $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))", "")
@@ -931,7 +949,7 @@ if ($issueRows) {
     }
 }
 
-# â”€â”€ Footer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Footer ────────────────────────────────────────────────────────────────────
 $endTime = Get-Date; $dur = $endTime - $startTime
 Write-Log ""
 Write-Log "========================================" -Color Cyan
