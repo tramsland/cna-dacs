@@ -476,7 +476,7 @@ $deployScriptBlock = {
                                         $entryInZip = $entry -replace "\\","/"
                                         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                                             $backupZip, $srcFile, $entryInZip,
-                                            [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+                                           [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($backupZip, $srcFile, $entryInZip) | Out-Null
                                         $patchResult.FilesBacked++
                                     }
                                 }
@@ -538,7 +538,7 @@ $deployScriptBlock = {
                                 $entryInZip = $entry -replace "\\","/"
                                 [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                                     $backupZip, $srcFile, $entryInZip,
-                                    [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+                                                  [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($backupZip, $srcFile, $entryInZip) | Out-Null
                                 $backedCount++
                             }
                         }
