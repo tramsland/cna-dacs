@@ -354,7 +354,7 @@ $deployScriptBlock = {
                     continue
                 }
             } else {
-                $result.Output.Add("  [WHATIF] Would copy $($patch.Name) to $ComputerName:$remoteTempDir")
+                $result.Output.Add("  [WHATIF] Would copy $($patch.Name) to $($ComputerName):$remoteTempDir")
             }
         }
 
