@@ -164,24 +164,37 @@ $checkServicesScript = {
     # Reads the ProductVersion from livelink.exe via UNC path (avoids nested Invoke-Command).
     # PathName is like:  "E:\customers\dacs\DACS_CS1\bin\livelink.exe" ...
     # We convert the drive letter to a UNC admin share: \\server\E$\path\livelink.exe
+    # Get-CsVersion: runs on the REMOTE machine via Invoke-Command so the local
+    # path in PathName (e.g. E:\customers\dacs\CS1\bin\livelink.exe) resolves correctly.
     function Get-CsVersion {
-        param([string]$ServiceImagePath, [string]$Computer)
-        $exePath = $null
-        if ($ServiceImagePath -match '^"?([^"]+livelink\.exe)"?') {
-            $exePath = $Matches[1]
-        } elseif ($ServiceImagePath -match '^"?([A-Za-z]:\\[^"]+\.exe)"?') {
-            $exePath = $Matches[1]
-        }
-        if (-not $exePath) { return "N/A" }
-        try {
-            # Convert local path to UNC admin share: E:\foo\bar.exe -> \\server\E$\foo\bar.exe
-            $uncPath = $exePath -replace '^([A-Za-z]):\\', "\\$Computer\`$1`$\"
-            if (Test-Path $uncPath -ErrorAction SilentlyContinue) {
-                $ver = (Get-Item $uncPath -ErrorAction Stop).VersionInfo.ProductVersion
-                return if ($ver) { $ver.Trim() } else { "N/A" }
+        param([string]$ServiceImagePath, [string]$Computer,
+              [System.Management.Automation.PSCredential]$Cred)
+        $icArgs = @{
+            ComputerName = $Computer
+            ErrorAction  = "Stop"
+            ArgumentList = $ServiceImagePath
+            ScriptBlock  = {
+                param([string]$ImagePath)
+                # Strip surrounding quotes if present
+                $exePath = $null
+                if ($ImagePath -match '^\s*"?([^"]+livelink\.exe)"?\s*$') {
+                    $exePath = $Matches[1].Trim()
+                } elseif ($ImagePath -match '^\s*"?([A-Za-z]:\\[^"]+\.exe)"?\s*$') {
+                    $exePath = $Matches[1].Trim()
+                }
+                if (-not $exePath -or -not (Test-Path $exePath -ErrorAction SilentlyContinue)) {
+                    return "N/A"
+                }
+                try {
+                    $vi = (Get-Item $exePath -ErrorAction Stop).VersionInfo
+                    # Prefer ProductVersion; fall back to FileVersion
+                    $ver = if ($vi.ProductVersion) { $vi.ProductVersion } else { $vi.FileVersion }
+                    return if ($ver) { $ver.Trim() } else { "N/A" }
+                } catch { return "N/A" }
             }
-            return "N/A"
-        } catch { return "N/A" }
+        }
+        if ($Cred) { $icArgs["Credential"] = $Cred }
+        try { return Invoke-Command @icArgs } catch { return "N/A" }
     }
 
     function Get-OrSet-RestartConfig {
@@ -748,7 +761,7 @@ $checkServicesScript = {
             if ($cs.State -ne "Running") { $overallStatus = "DOWN" }
 
             # ── CS version lookup ──────────────────────────────────────────────
-            $csVersion = Get-CsVersion -ServiceImagePath $cs.PathName -Computer $ComputerName
+            $csVersion = Get-CsVersion -ServiceImagePath $cs.PathName -Computer $ComputerName -Cred $Credential
 
             $out.Add(""); $out.Add("  Instance:           $($cs.Name)")
             $out.Add("  Status:             $csState")
@@ -1205,7 +1218,7 @@ foreach ($group in $serverGroups.Keys) {
         $tilesHtml += @"
 <div class='server-card $cardClass'>
   <div class='card-header'>
-    <div class='card-title'>$instancePrefix<a class='card-hostname rdp-link' href='#' onclick="launchRdp('$rdpHostname');return false;" title='RDP to $rdpHostname'>$sName</a>$statusBadge</div>
+    <div class='card-title'>$instancePrefix<a class='card-hostname rdp-link' href='#' data-rdp='$rdpHostname' onclick="launchRdp('$rdpHostname');return false;" title='Click to copy RDP command for $rdpHostname'>$sName</a>$statusBadge</div>
     $serverUptimeHtml
   </div>
   <div class='card-body'>
@@ -1262,6 +1275,36 @@ body{font-family:var(--font-ui);background:var(--bg);color:var(--text);min-heigh
 .a11y-bar{background:var(--bg2);border-bottom:1px solid var(--border);padding:6px 32px;display:flex;align-items:center;gap:12px}
 .a11y-bar label{font-size:11px;color:var(--text-dim);cursor:pointer;display:flex;align-items:center;gap:6px}
 .a11y-bar input[type=checkbox]{accent-color:#3b82f6;width:14px;height:14px;cursor:pointer}
+/* ── Monochromatic mode: strip all color, use brightness/pattern only ── */
+body.mono{filter:grayscale(1) contrast(1.1)}
+body.mono .zone-section,
+body.mono .server-card{border-color:#555!important;background:#111!important}
+body.mono .zone-header{background:#1a1a1a!important}
+body.mono .card-header{background:#1c1c1c!important}
+body.mono .hstat.s-ok .n,
+body.mono .hstat.s-warn .n,
+body.mono .hstat.s-crit .n,
+body.mono .hstat.s-down .n{color:#e0e0e0}
+body.mono .svc-ok,body.mono .zone-ok{color:#ddd!important}
+body.mono .svc-down,body.mono .svc-warn,
+body.mono .zone-down,body.mono .zone-warn{color:#888!important}
+body.mono .bar{background:#666!important}
+body.mono .bar-ok{background:#aaa!important}
+body.mono .bar-warn{background:#777!important;border:1px solid #999}
+body.mono .bar-crit{background:#444!important;border:2px dashed #bbb}
+body.mono .inf-ok{background:#2a2a2a!important;color:#ccc!important;border-color:#555!important}
+body.mono .inf-fail{background:#1a1a1a!important;color:#fff!important;border:2px solid #bbb!important;font-weight:700}
+body.mono .inf-warn{background:#222!important;color:#aaa!important;border-color:#666!important}
+body.mono .status-badge-ok{background:#2a2a2a!important;color:#ccc!important;border-color:#555!important}
+body.mono .status-badge-warn{background:#222!important;color:#bbb!important;border:1px dashed #777!important}
+body.mono .status-badge-crit,
+body.mono .status-badge-down{background:#111!important;color:#fff!important;border:2px solid #ddd!important;font-weight:700}
+body.mono .alert-crit{background:#1a1a1a!important;border-left:4px solid #fff!important;color:#fff!important}
+body.mono .alert-warn{background:#1a1a1a!important;border-left:4px solid #999!important;color:#ccc!important}
+body.mono .zone-pill-ok{background:#333!important;color:#bbb!important}
+body.mono .zone-pill-warn{background:#222!important;color:#aaa!important;border:1px dashed #777!important}
+body.mono .zone-pill-crit,
+body.mono .zone-pill-down{background:#111!important;color:#fff!important;border:1px solid #ddd!important;font-weight:700}
 .legend{display:flex;gap:14px;margin-left:auto;flex-wrap:wrap}
 .leg{display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text-dim)}
 .leg svg{width:10px;height:12px;flex-shrink:0}
@@ -1352,7 +1395,7 @@ a.inf-cell:hover{filter:brightness(1.3);border-color:rgba(255,255,255,.25)}
   </div>
 </header>
 <div class='a11y-bar'>
-  <label><input type='checkbox' id='a11yToggle' onchange="document.body.classList.toggle('a11y',this.checked)">Colorblind mode</label>
+  <label><input type='checkbox' id='a11yToggle' onchange="document.body.classList.toggle('mono',this.checked)">Monochromatic mode</label>
   <div class='legend'>
     <span class='leg'><svg viewBox='0 0 10 10' fill='currentColor'><rect x='1' y='1' width='8' height='8' rx='1.5'/></svg>OK</span>
     <span class='leg'><svg viewBox='0 0 10 10' fill='currentColor'><circle cx='5' cy='5' r='4'/></svg>Warning</span>
@@ -1361,19 +1404,77 @@ a.inf-cell:hover{filter:brightness(1.3);border-color:rgba(255,255,255,.25)}
 </div>
 $zonesHtml
 <script>
+// ── RDP launcher ──────────────────────────────────────────────────────────────
+// file:// pages cannot use navigator.clipboard (requires HTTPS/localhost).
+// Instead we show a small modal with the command pre-selected — user hits
+// Ctrl+C (auto-copies on most browsers even from file://) then Enter to close,
+// then Win+R, Ctrl+V, Enter to launch RDP.
 function launchRdp(hostname) {
-    // Build an .rdp file blob and trigger download — most Windows browsers will
-    // open it directly in mstsc.exe without any protocol-handler prompt.
-    var rdpContent = "full address:s:" + hostname + "\r\nprompt for credentials:i:1\r\n";
-    var blob = new Blob([rdpContent], { type: "application/x-rdp" });
-    var url  = URL.createObjectURL(blob);
-    var a    = document.createElement("a");
-    a.href     = url;
-    a.download = hostname + ".rdp";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(function(){ URL.revokeObjectURL(url); }, 5000);
+    var cmd = "mstsc /v:" + hostname;
+
+    // Remove any existing modal
+    var old = document.getElementById("rdp-modal");
+    if (old) old.parentNode.removeChild(old);
+
+    // Build modal overlay
+    var overlay = document.createElement("div");
+    overlay.id = "rdp-modal";
+    overlay.style.cssText = [
+        "position:fixed","top:0","left:0","width:100%","height:100%",
+        "background:rgba(0,0,0,.72)","display:flex","align-items:center",
+        "justify-content:center","z-index:9999","font-family:'IBM Plex Sans',sans-serif"
+    ].join(";");
+
+    overlay.innerHTML = [
+        "<div style='background:#1a2035;border:1px solid #2a3a5a;border-radius:12px;",
+        "padding:24px 28px;min-width:380px;max-width:90vw;box-shadow:0 8px 40px rgba(0,0,0,.6)'>",
+        "<div style='font-size:12px;color:#6b7a99;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px'>",
+        "RDP Command &mdash; " + hostname + "</div>",
+        "<div style='font-size:11px;color:#8a9abf;margin-bottom:12px'>",
+        "Press <kbd style='background:#0d1525;border:1px solid #2a3a5a;border-radius:4px;",
+        "padding:1px 6px;font-size:11px'>Ctrl+A</kbd> then ",
+        "<kbd style='background:#0d1525;border:1px solid #2a3a5a;border-radius:4px;",
+        "padding:1px 6px;font-size:11px'>Ctrl+C</kbd> to copy, ",
+        "then paste into <strong style='color:#c8d0e0'>Win+R</strong></div>",
+        "<input id='rdp-cmd-input' type='text' value='" + cmd + "'",
+        " readonly style='width:100%;background:#0d1525;border:1px solid #2a3a5a;",
+        "border-radius:6px;padding:10px 12px;color:#93c5fd;font-family:'Consolas',monospace;",
+        "font-size:14px;font-weight:600;letter-spacing:.02em;outline:none;cursor:text'>",
+        "<div style='display:flex;gap:10px;margin-top:16px;justify-content:flex-end'>",
+        "<button onclick='rdpSelectAll()' style='background:#1e3a6e;border:1px solid #2a5abf;",
+        "color:#93c5fd;border-radius:6px;padding:7px 16px;font-size:12px;cursor:pointer'>",
+        "Select All</button>",
+        "<button onclick='rdpClose()' style='background:#2a3350;border:1px solid #3a4560;",
+        "color:#c8d0e0;border-radius:6px;padding:7px 16px;font-size:12px;cursor:pointer'>",
+        "Close</button></div></div>"
+    ].join("");
+
+    document.body.appendChild(overlay);
+
+    // Auto-select the input so Ctrl+C works immediately
+    setTimeout(function() {
+        var inp = document.getElementById("rdp-cmd-input");
+        if (inp) { inp.focus(); inp.select(); }
+    }, 50);
+
+    // Close on overlay click (outside the box)
+    overlay.addEventListener("click", function(e) {
+        if (e.target === overlay) rdpClose();
+    });
+    // Close on Escape
+    document.addEventListener("keydown", rdpEscHandler);
+}
+function rdpSelectAll() {
+    var inp = document.getElementById("rdp-cmd-input");
+    if (inp) { inp.focus(); inp.select(); }
+}
+function rdpClose() {
+    var m = document.getElementById("rdp-modal");
+    if (m) m.parentNode.removeChild(m);
+    document.removeEventListener("keydown", rdpEscHandler);
+}
+function rdpEscHandler(e) {
+    if (e.key === "Escape") rdpClose();
 }
 </script>
 </body>
