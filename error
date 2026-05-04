@@ -38,6 +38,13 @@
 #   Run this one-liner to check syntax without executing the script:
 #   $e=$null; [System.Management.Automation.Language.Parser]::ParseFile(".\script.ps1",[ref]$null,[ref]$e); $e
 #   Any output means there are syntax errors. Fix all before running.
+#
+# RULE 7 â€” Always pass $isLocal to remoting functions when adding new calls:
+#   The $isLocal flag is set at runtime by comparing $ComputerName to $env:COMPUTERNAME.
+#   Any function that uses Invoke-Command, Get-WinEvent -ComputerName, or sc.exe \\host
+#   MUST accept an [bool]$IsLocal param and skip the remote target when $IsLocal is true.
+#   Failing to do this causes auth failures or incorrect data when the script runs on a
+#   server that is also in the servers.txt list.
 #endregion
 
 #region Parameters
@@ -198,18 +205,11 @@ $checkServicesScript = {
         return $null
     }
 
-    # FIX 1: Get-CsVersion
-    # - Changed 'return if (...)' to assign then return (invalid PowerShell syntax fix)
-    # - Broadened Version regex to also match 'ServerVersion'
-    # - Increased -TotalCount from 80 to 200 lines
     function Get-CsVersion {
         param([string]$ServiceImagePath, [string]$Computer,
-              [System.Management.Automation.PSCredential]$Cred)
-        $icArgs = @{
-            ComputerName = $Computer
-            ErrorAction  = "Stop"
-            ArgumentList = $ServiceImagePath
-            ScriptBlock  = {
+              [System.Management.Automation.PSCredential]$Cred,
+              [bool]$IsLocal = $false)
+        $sb = {
                 param([string]$ImagePath)
                 $versionMap = @{
                     116="23.4"; 115="23.3"; 114="23.2"; 113="23.1"
@@ -231,13 +231,11 @@ $checkServicesScript = {
                     return "opentext.ini not found"
                 }
                 $inGeneral = $false
-                # FIX: increased from 80 to 200 lines, broadened regex to catch ServerVersion
                 foreach ($ln in (Get-Content $iniPath -TotalCount 200 -ErrorAction SilentlyContinue)) {
                     if ($ln -match '^\s*\[General\]')         { $inGeneral = $true; continue }
                     if ($inGeneral -and $ln -match '^\s*\[')  { break }
                     if ($inGeneral -and $ln -match '^\s*(?:Server)?Version\s*=\s*(\d+)') {
                         $build = [int]$Matches[1]
-                        # FIX: assign result first, then return â€” 'return if' is invalid PowerShell
                         $friendly = if ($versionMap.ContainsKey($build)) {
                             "$($versionMap[$build]) (build $build)"
                         } else {
@@ -247,74 +245,82 @@ $checkServicesScript = {
                     }
                 }
                 return "Version key not found in opentext.ini"
-            }
         }
+        if ($IsLocal) {
+            try { return & $sb $ServiceImagePath } catch { return "N/A (local error: $_)" }
+        }
+        $icArgs = @{ ComputerName = $Computer; ErrorAction = "Stop"; ArgumentList = $ServiceImagePath; ScriptBlock = $sb }
         if ($Cred) { $icArgs["Credential"] = $Cred }
         try { return Invoke-Command @icArgs } catch { return "N/A (remote error: $_)" }
     }
 
     # Looks up the version of OpenText System Center Agent.
-    # First tries the service executable's FileVersionInfo, then falls back to
-    # Add/Remove Programs registry (both 64-bit and 32-bit Uninstall hives).
+    # Version lookup order:
+    #   1. FileVersion from the service exe (most reliable for OT products)
+    #   2. DisplayVersion from Add/Remove Programs registry (64-bit then 32-bit hive)
+    # NOTE: ProductVersion is intentionally skipped â€” OT executables often populate
+    # it with build metadata rather than the user-facing version string.
     function Get-OTSystemCenterVersion {
         param([string]$Computer, [string]$ServiceImagePath,
-              [System.Management.Automation.PSCredential]$Cred)
-        $icArgs = @{
-            ComputerName = $Computer
-            ErrorAction  = "Stop"
-            ArgumentList = $ServiceImagePath
-            ScriptBlock  = {
-                param([string]$ImagePath)
+              [System.Management.Automation.PSCredential]$Cred,
+              [bool]$IsLocal = $false)
+        $sb = {
+            param([string]$ImagePath)
 
-                # â”€â”€ Try exe FileVersionInfo first â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                if ($ImagePath) {
-                    $exePath = $ImagePath -replace '^\s*"([^"]+)"\s*.*$', '$1' `
-                                          -replace "^\s*'([^']+)'\s*.*$", '$1' `
-                                          -replace '^\s*(\S+)\s*.*$',     '$1'
-                    if ($exePath -and (Test-Path $exePath -ErrorAction SilentlyContinue)) {
-                        $fv = (Get-Item $exePath -ErrorAction SilentlyContinue).VersionInfo
-                        if ($fv -and $fv.ProductVersion) {
-                            return "v$($fv.ProductVersion.Trim()) (exe)"
-                        }
-                        if ($fv -and $fv.FileVersion) {
-                            return "v$($fv.FileVersion.Trim()) (exe)"
-                        }
+            # â”€â”€ 1. FileVersion from exe â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            if ($ImagePath) {
+                $exePath = $ImagePath -replace '^\s*"([^"]+)"\s*.*$', '$1' `
+                                      -replace "^\s*'([^']+)'\s*.*$", '$1' `
+                                      -replace '^\s*(\S+)\s*.*$',     '$1'
+                if ($exePath -and (Test-Path $exePath -ErrorAction SilentlyContinue)) {
+                    $fv = (Get-Item $exePath -ErrorAction SilentlyContinue).VersionInfo
+                    if ($fv -and $fv.FileVersion -and $fv.FileVersion.Trim() -ne "") {
+                        return "$($fv.FileVersion.Trim()) (exe)"
                     }
                 }
-
-                # â”€â”€ Fall back to Add/Remove Programs registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                $uninstallPaths = @(
-                    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-                    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-                )
-                foreach ($basePath in $uninstallPaths) {
-                    if (-not (Test-Path $basePath -ErrorAction SilentlyContinue)) { continue }
-                    foreach ($key in (Get-ChildItem $basePath -ErrorAction SilentlyContinue)) {
-                        $props = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
-                        if ($props.DisplayName -like "*System Center Agent*") {
-                            # FIX: assign first, then return â€” 'return if' is invalid PowerShell
-                            $ver = if ($props.DisplayVersion) { "v$($props.DisplayVersion) (registry)" } else { "Installed (version unknown)" }
-                            return $ver
-                        }
-                    }
-                }
-                return "Not found in registry"
             }
+
+            # â”€â”€ 2. Registry Add/Remove Programs fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            $uninstallPaths = @(
+                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+            )
+            foreach ($basePath in $uninstallPaths) {
+                if (-not (Test-Path $basePath -ErrorAction SilentlyContinue)) { continue }
+                foreach ($key in (Get-ChildItem $basePath -ErrorAction SilentlyContinue)) {
+                    $props = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+                    if ($props.DisplayName -like "*System Center Agent*") {
+                        $ver = if ($props.DisplayVersion -and $props.DisplayVersion.Trim() -ne "") {
+                            "$($props.DisplayVersion.Trim()) (registry)"
+                        } else {
+                            "Installed (version unknown)"
+                        }
+                        return $ver
+                    }
+                }
+            }
+            return "Not found in registry"
         }
+        if ($IsLocal) {
+            try { return & $sb $ServiceImagePath } catch { return "N/A (local error: $_)" }
+        }
+        $icArgs = @{ ComputerName = $Computer; ErrorAction = "Stop"; ArgumentList = $ServiceImagePath; ScriptBlock = $sb }
         if ($Cred) { $icArgs["Credential"] = $Cred }
         try { return Invoke-Command @icArgs } catch { return "N/A (remote error: $_)" }
     }
 
     function Get-OrSet-RestartConfig {
-        param([string]$ServiceName, [string]$ScHost)
-        $info  = sc.exe "\\$ScHost" qfailure $ServiceName 2>&1
+        param([string]$ServiceName, [string]$ScHost, [bool]$IsLocal = $false)
+        # Use '.' for local sc.exe calls to avoid name resolution issues
+        $scTarget = if ($IsLocal) { "." } else { $ScHost }
+        $info  = sc.exe "\\$scTarget" qfailure $ServiceName 2>&1
         $count = ($info | Select-String "RESTART" | Measure-Object).Count
         if ($count -ne 3) {
             $priorState = if ($count -eq 0) { "Not configured" } else { "$count restart action(s) configured" }
-            $fix        = sc.exe "\\$ScHost" failure $ServiceName reset= 86400 `
+            $fix        = sc.exe "\\$scTarget" failure $ServiceName reset= 86400 `
                               actions= restart/60000/restart/60000/restart/60000 2>&1
             if ($LASTEXITCODE -eq 0) {
-                $verify     = sc.exe "\\$ScHost" qfailure $ServiceName 2>&1
+                $verify     = sc.exe "\\$scTarget" qfailure $ServiceName 2>&1
                 $finalCount = ($verify | Select-String "RESTART" | Measure-Object).Count
                 return [PSCustomObject]@{
                     LogNote = "Restart config updated on $ServiceName - was: $priorState"
@@ -331,14 +337,14 @@ $checkServicesScript = {
     }
 
     function Get-ServiceRestartCount {
-        param([string]$ServiceName, [string]$Computer)
+        param([string]$ServiceName, [string]$Computer, [bool]$IsLocal = $false)
         try {
-            $evts = Get-WinEvent -ComputerName $Computer -FilterHashtable @{
-                LogName   = "System"
-                Id        = 7034
-                StartTime = (Get-Date).AddDays(-1)
-            } -ErrorAction SilentlyContinue | Where-Object { $_.Message -like "*$ServiceName*" }
-            # FIX: assign result first, then return â€” 'return if' is invalid PowerShell
+            $weArgs = @{
+                FilterHashtable = @{ LogName = "System"; Id = 7034; StartTime = (Get-Date).AddDays(-1) }
+                ErrorAction     = "SilentlyContinue"
+            }
+            if (-not $IsLocal) { $weArgs["ComputerName"] = $Computer }
+            $evts = Get-WinEvent @weArgs | Where-Object { $_.Message -like "*$ServiceName*" }
             $restartCount = if ($evts) { $evts.Count } else { 0 }
             return $restartCount
         } catch { return "N/A" }
@@ -432,7 +438,19 @@ $checkServicesScript = {
     $jobLog          = [System.Collections.Generic.List[string]]::new()
     $scHost          = $ComputerName -replace "\..*", ""
 
-    # â”€â”€ Ping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â”€â”€ Local detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # If the target server is this machine, skip all remoting (Invoke-Command,
+    # New-CimSession with ComputerName, ping) and run everything locally.
+    # Compares short name, FQDN, and localhost aliases so all common forms match.
+    $localNames = @(
+        $env:COMPUTERNAME.ToLower(),
+        "$($env:COMPUTERNAME).$($env:USERDNSDOMAIN)".ToLower().TrimEnd('.'),
+        "localhost", "127.0.0.1", "."
+    )
+    $isLocal = $localNames -contains $ComputerName.ToLower()
+
+    # â”€â”€ Ping (skipped for local machine) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if (-not $isLocal) {
     $pingOk = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
     if (-not $pingOk) {
         $out = [System.Collections.Generic.List[string]]::new()
@@ -451,10 +469,16 @@ $checkServicesScript = {
         })
         return $instanceResults
     }
+    } # end -not $isLocal ping block
 
     # â”€â”€ CIM session â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    $cimParams = @{ ComputerName = $ComputerName; ErrorAction = "Stop" }
-    if ($Credential) { $cimParams["Credential"] = $Credential }
+    # Local machine: omit ComputerName to avoid loopback auth failures
+    if ($isLocal) {
+        $cimParams = @{ ErrorAction = "Stop" }
+    } else {
+        $cimParams = @{ ComputerName = $ComputerName; ErrorAction = "Stop" }
+        if ($Credential) { $cimParams["Credential"] = $Credential }
+    }
     try { $session = New-CimSession @cimParams }
     catch {
         $out = [System.Collections.Generic.List[string]]::new()
@@ -517,11 +541,13 @@ $checkServicesScript = {
     # â”€â”€ Event log scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     $eventLines = [System.Collections.Generic.List[string]]::new()
     try {
-        $recentEvents = Get-WinEvent -ComputerName $ComputerName -FilterHashtable @{
-            LogName   = "Application"
-            Level     = @(1, 2, 3)
-            StartTime = (Get-Date).AddHours(-24)
-        } -MaxEvents 50 -ErrorAction SilentlyContinue |
+        $evtArgs = @{
+            FilterHashtable = @{ LogName = "Application"; Level = @(1,2,3); StartTime = (Get-Date).AddHours(-24) }
+            MaxEvents       = 50
+            ErrorAction     = "SilentlyContinue"
+        }
+        if (-not $isLocal) { $evtArgs["ComputerName"] = $ComputerName }
+        $recentEvents = Get-WinEvent @evtArgs |
         Where-Object { $_.Message -match "Tomcat|catalina|Content Server" } |
         Select-Object -First $EventLogCount
         foreach ($ev in $recentEvents) {
@@ -751,7 +777,12 @@ $checkServicesScript = {
         }
         if ($Credential) { $icParams["Credential"] = $Credential }
 
-        $tomcatInfo    = try { Invoke-Command @icParams } catch { $null }
+        # Local machine: invoke the scriptblock directly to avoid remoting overhead/auth
+        if ($isLocal) {
+            $tomcatInfo = try { & $icParams.ScriptBlock $tomcatSvc.Name $tomcatSvc.PathName $tomcatSvc.ProcessId } catch { $null }
+        } else {
+            $tomcatInfo = try { Invoke-Command @icParams } catch { $null }
+        }
         $tomcatVersion = if ($tomcatInfo) { $tomcatInfo.Version     } else { "Unable to retrieve" }
         $jrePath       = if ($tomcatInfo) { $tomcatInfo.JrePath     } else { "N/A" }
         $heapInitMB    = if ($tomcatInfo) { $tomcatInfo.HeapInitMB  } else { $null }
@@ -815,10 +846,10 @@ $checkServicesScript = {
 
         $tState         = if ($tomcatSvc.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
         $tUp            = Get-ServiceUptime -CimSession $session -ProcessId $tomcatSvc.ProcessId
-        $tRestartResult = Get-OrSet-RestartConfig -ServiceName $tomcatSvc.Name -ScHost $scHost
+        $tRestartResult = Get-OrSet-RestartConfig -ServiceName $tomcatSvc.Name -ScHost $scHost -IsLocal $isLocal
         if ($tRestartResult.LogNote) { $jobLog.Add("[LOG] $($tRestartResult.LogNote)") }
         $tRestart      = $tRestartResult.Display
-        $tRestartCount = Get-ServiceRestartCount -ServiceName $tomcatSvc.Name -Computer $ComputerName
+        $tRestartCount = Get-ServiceRestartCount -ServiceName $tomcatSvc.Name -Computer $ComputerName -IsLocal $isLocal
         if ($tomcatSvc.State -ne "Running") { $overallStatus = "DOWN" }
 
         $out.Add("  Name:               $($tomcatSvc.Name)")
@@ -871,13 +902,13 @@ $checkServicesScript = {
 
             $csState         = if ($cs.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
             $csUp            = Get-ServiceUptime -CimSession $session -ProcessId $cs.ProcessId
-            $csRestartResult = Get-OrSet-RestartConfig -ServiceName $cs.Name -ScHost $scHost
+            $csRestartResult = Get-OrSet-RestartConfig -ServiceName $cs.Name -ScHost $scHost -IsLocal $isLocal
             if ($csRestartResult.LogNote) { $jobLog.Add("[LOG] $($csRestartResult.LogNote)") }
             $csRestart      = $csRestartResult.Display
-            $csRestartCount = Get-ServiceRestartCount -ServiceName $cs.Name -Computer $ComputerName
+            $csRestartCount = Get-ServiceRestartCount -ServiceName $cs.Name -Computer $ComputerName -IsLocal $isLocal
             if ($cs.State -ne "Running") { $overallStatus = "DOWN" }
 
-            $csVersion = Get-CsVersion -ServiceImagePath $cs.PathName -Computer $ComputerName -Cred $Credential
+            $csVersion = Get-CsVersion -ServiceImagePath $cs.PathName -Computer $ComputerName -Cred $Credential -IsLocal $isLocal
 
             $out.Add(""); $out.Add("  Instance:           $($cs.Name)")
             $out.Add("  Status:             $csState")
@@ -964,10 +995,10 @@ $checkServicesScript = {
 
         $caState         = if ($csAdmin.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
         $caUp            = Get-ServiceUptime -CimSession $session -ProcessId $csAdmin.ProcessId
-        $caRestartResult = Get-OrSet-RestartConfig -ServiceName $csAdmin.Name -ScHost $scHost
+        $caRestartResult = Get-OrSet-RestartConfig -ServiceName $csAdmin.Name -ScHost $scHost -IsLocal $isLocal
         if ($caRestartResult.LogNote) { $jobLog.Add("[LOG] $($caRestartResult.LogNote)") }
         $caRestart      = $caRestartResult.Display
-        $caRestartCount = Get-ServiceRestartCount -ServiceName $csAdmin.Name -Computer $ComputerName
+        $caRestartCount = Get-ServiceRestartCount -ServiceName $csAdmin.Name -Computer $ComputerName -IsLocal $isLocal
         if ($csAdmin.State -ne "Running") { $overallStatus = "DOWN" }
 
         $out.Add("  Name:               $($csAdmin.Name)")
@@ -1012,11 +1043,11 @@ $checkServicesScript = {
 
         $scState         = if ($otScSvc.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
         $scUp            = Get-ServiceUptime -CimSession $session -ProcessId $otScSvc.ProcessId
-        $scRestartResult = Get-OrSet-RestartConfig -ServiceName $otScSvc.Name -ScHost $scHost
+        $scRestartResult = Get-OrSet-RestartConfig -ServiceName $otScSvc.Name -ScHost $scHost -IsLocal $isLocal
         if ($scRestartResult.LogNote) { $jobLog.Add("[LOG] $($scRestartResult.LogNote)") }
         $scRestart      = $scRestartResult.Display
-        $scRestartCount = Get-ServiceRestartCount -ServiceName $otScSvc.Name -Computer $ComputerName
-        $scVersion      = Get-OTSystemCenterVersion -Computer $ComputerName -ServiceImagePath $otScSvc.PathName -Cred $Credential
+        $scRestartCount = Get-ServiceRestartCount -ServiceName $otScSvc.Name -Computer $ComputerName -IsLocal $isLocal
+        $scVersion      = Get-OTSystemCenterVersion -Computer $ComputerName -ServiceImagePath $otScSvc.PathName -Cred $Credential -IsLocal $isLocal
         if ($otScSvc.State -ne "Running") { $overallStatus = "DOWN" }
 
         $out.Add("  Name:               $($otScSvc.Name)")
