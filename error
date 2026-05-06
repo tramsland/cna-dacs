@@ -1,1 +1,1 @@
-Test-NetConnection -ComputerName AZASVWSR046.public.dla.mil -Port 13200
+Get-Content "C:\inetpub\logs\LogFiles\W3SVC1\*.log" -Tail 20 | Where-Object { $_ -match "readydocs" }
