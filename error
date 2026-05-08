@@ -1,1 +1,15 @@
-Get-Content "C:\inetpub\logs\LogFiles\W3SVC1\*.log" -Tail 20 | Where-Object { $_ -match "readydocs" }
+<servlet>
+    <servlet-name>readydocs-proxy</servlet-name>
+    <servlet-class>org.mitre.dsmiley.httpproxy.ProxyServlet</servlet-class>
+    <init-param>
+        <param-name>targetUri</param-name>
+        <!-- Include the full base path on the target -->
+        <param-value>http://localhost:13200/demo/readydocs</param-value>
+    </init-param>
+</servlet>
+
+<servlet-mapping>
+    <servlet-name>readydocs-proxy</servlet-name>
+    <!-- The /* ensures all sub-paths are captured and forwarded -->
+    <url-pattern>/readydocs/*</url-pattern>
+</servlet-mapping>
