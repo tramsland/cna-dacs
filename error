@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="iso-8859-1"?>
-
 <web-app
 		xmlns = "https://jakarta.ee/xml/ns/jakartaee"
         xmlns:xsi = "http://www.w3.org/2001/XMLSchema-instance"
@@ -11,17 +10,13 @@
 	<description>
 		Content Server is the leading collaboration and content management software for global organizations.
 	</description>
-
 	<error-page>
 		<location>/error.jsp</location>
 	</error-page>
-
 	<session-config>
 		<session-timeout>10</session-timeout>
 	</session-config>
-
 	<!-- Remove the compressionFilter sections if you want to disable compression filter -->
-
 	<filter>
 		<filter-name>compressionFilter</filter-name>
 		<filter-class>com.opentext.servlet.filter.CompressionFilter</filter-class>
@@ -34,32 +29,26 @@
 			<param-value>E:\Customers\demo\dacs\contentserver\config\opentext.ini</param-value>
 		</init-param>
 	</filter>
-
 	<filter-mapping>
 		<filter-name>compressionFilter</filter-name>
 		<url-pattern>*.do</url-pattern>
 	</filter-mapping>
-
 	<filter-mapping>
 		<filter-name>compressionFilter</filter-name>
 		<url-pattern>/livelink/*</url-pattern>
 	</filter-mapping>
-
 	<filter-mapping>
 		<filter-name>compressionFilter</filter-name>
 		<url-pattern>/cs/*</url-pattern>
 	</filter-mapping>
-
 	<filter-mapping>
 		<filter-name>compressionFilter</filter-name>
 		<url-pattern>/livelink.exe/*</url-pattern>
 	</filter-mapping>
-
 	<filter-mapping>
 		<filter-name>compressionFilter</filter-name>
 		<url-pattern>/cs.exe/*</url-pattern>
 	</filter-mapping>
-
 	<servlet>
 		<servlet-name>LLServletClient</servlet-name>
 		<servlet-class>com.opentext.servlet.client.LLServletClient</servlet-class>
@@ -68,24 +57,42 @@
 			<param-value>E:\Customers\demo\dacs\contentserver\config\opentext.ini</param-value>
 		</init-param>
 	</servlet>
-
 	<servlet-mapping>
 		<servlet-name>LLServletClient</servlet-name>
 		<url-pattern>/livelink.exe/*</url-pattern>
 	</servlet-mapping>
-
 	<servlet-mapping>
 		<servlet-name>LLServletClient</servlet-name>
 		<url-pattern>/cs.exe/*</url-pattern>
 	</servlet-mapping>
-
 	<servlet-mapping>
 		<servlet-name>LLServletClient</servlet-name>
 		<url-pattern>/livelink/*</url-pattern>
 	</servlet-mapping>
-
 	<servlet-mapping>
 		<servlet-name>LLServletClient</servlet-name>
-		<url-pattern>/cs/*</url-pattern>
+		<url-pattern>/cs/*</url-parameter>
 	</servlet-mapping>
+
+	<!-- ==========================================  -->
+	<!-- Smiley Reverse Proxy for /demo/readydocs    -->
+	<!-- Proxies to app server on port 13200         -->
+	<!-- ==========================================  -->
+	<servlet>
+		<servlet-name>readydocs-proxy</servlet-name>
+		<servlet-class>org.mitre.dsmiley.httpproxy.ProxyServlet</servlet-class>
+		<init-param>
+			<param-name>targetUri</param-name>
+			<param-value>http://localhost:13200/demo/readydocs</param-value>
+		</init-param>
+		<init-param>
+			<param-name>log</param-name>
+			<param-value>true</param-value>
+		</init-param>
+	</servlet>
+	<servlet-mapping>
+		<servlet-name>readydocs-proxy</servlet-name>
+		<url-pattern>/readydocs/*</url-pattern>
+	</servlet-mapping>
+
 </web-app>
