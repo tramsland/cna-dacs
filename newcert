@@ -374,25 +374,25 @@ $configureScript = {
     $dname = "CN=$CertCN, OU=$CertOU, O=$CertO, L=$CertL, ST=$CertST, C=$CertC"
     Log "Generating self-signed cert: $dname"
 
-    $keytoolArgs = @(
-        "-genkeypair",
-        "-alias",     $CertAlias,
-        "-keyalg",    "RSA",
-        "-keysize",   "2048",
-        "-validity",  "$CertValidDays",
-        "-keystore",  $keystoreFile,
-        "-storepass", $KeystorePass,
-        "-keypass",   $KeystorePass,
-        "-dname",     $dname,
-        "-storetype", "JKS"
-    )
+    # Use the call operator (&) instead of Start-Process so PowerShell handles
+    # argument quoting correctly — Start-Process splits on spaces/commas inside
+    # the -dname value, breaking the distinguished name into separate tokens.
+    $keytoolErr = "$env:TEMP\keytool_err.txt"
+    & $keytool -genkeypair `
+        -alias     $CertAlias `
+        -keyalg    RSA `
+        -keysize   2048 `
+        -validity  $CertValidDays `
+        -keystore  $keystoreFile `
+        -storepass $KeystorePass `
+        -keypass   $KeystorePass `
+        -dname     $dname `
+        -storetype JKS 2> $keytoolErr
 
-    $proc = Start-Process -FilePath $keytool -ArgumentList $keytoolArgs `
-                -Wait -NoNewWindow -PassThru -RedirectStandardError "$env:TEMP\keytool_err.txt"
-
-    if ($proc.ExitCode -ne 0) {
-        $errText = Get-Content "$env:TEMP\keytool_err.txt" -Raw -ErrorAction SilentlyContinue
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="keytool failed (exit $($proc.ExitCode)): $errText" }
+    $keytoolExit = $LASTEXITCODE
+    if ($keytoolExit -ne 0) {
+        $errText = Get-Content $keytoolErr -Raw -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{ Success=$false; Log=$log; Error="keytool failed (exit $keytoolExit): $errText" }
     }
     if (-not (Test-Path $keystoreFile)) {
         return [PSCustomObject]@{ Success=$false; Log=$log; Error="Keystore file was not created." }
