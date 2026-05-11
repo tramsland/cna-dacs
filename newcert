@@ -96,27 +96,52 @@ $rollbackScript = {
 
     # ── Locate Tomcat home ───────────────────────────────────────────────────
     if (-not $TomcatHome) {
-        $regBases = @(
-            "HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0",
-            "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Procrun 2.0"
-        )
-        foreach ($base in $regBases) {
-            if (Test-Path $base) {
-                $svcKeys = Get-ChildItem $base -ErrorAction SilentlyContinue |
-                           Where-Object { $_.PSChildName -like "*Tomcat*" }
-                foreach ($key in $svcKeys) {
-                    $javaKey = Join-Path $key.PSPath "Parameters\Java"
-                    if (Test-Path $javaKey) {
-                        $cp = (Get-ItemProperty $javaKey -ErrorAction SilentlyContinue).Classpath
-                        if ($cp -match "^(.+?)\\lib\\") { $TomcatHome = $Matches[1]; break }
+
+        # Method 1: derive from the Tomcat service PathName (most reliable)
+        $tomcatWmiSvc = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like "*Tomcat*" -or $_.Name -like "*Tomcat*" } |
+                        Select-Object -First 1
+        if ($tomcatWmiSvc -and $tomcatWmiSvc.PathName) {
+            # PathName may be:  "C:\Tomcat\bin\Tomcat10.exe" //RS//ServiceName
+            # or quoted:        "C:\Program Files\...\bin\Tomcat10.exe"
+            $exePath = $tomcatWmiSvc.PathName -replace '^"?([^"]+\.exe).*$', '$1'
+            $exePath = $exePath.Trim('"')
+            $candidate = Split-Path $exePath -Parent   # \bin
+            $candidate = Split-Path $candidate -Parent # Tomcat root
+            if (Test-Path (Join-Path $candidate "conf\server.xml")) {
+                $TomcatHome = $candidate
+                Log "Tomcat home (from service PathName): $TomcatHome"
+            }
+        }
+
+        # Method 2: Procrun registry Classpath
+        if (-not $TomcatHome) {
+            $regBases = @(
+                "HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0",
+                "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Procrun 2.0"
+            )
+            foreach ($base in $regBases) {
+                if (Test-Path $base) {
+                    $svcKeys = Get-ChildItem $base -ErrorAction SilentlyContinue |
+                               Where-Object { $_.PSChildName -like "*Tomcat*" }
+                    foreach ($key in $svcKeys) {
+                        $javaKey = Join-Path $key.PSPath "Parameters\Java"
+                        if (Test-Path $javaKey) {
+                            $cp = (Get-ItemProperty $javaKey -ErrorAction SilentlyContinue).Classpath
+                            if ($cp -match "^(.+?)\\lib\\") { $TomcatHome = $Matches[1]; break }
+                        }
                     }
                 }
+                if ($TomcatHome) { break }
             }
-            if ($TomcatHome) { break }
+            if ($TomcatHome) { Log "Tomcat home (from registry): $TomcatHome" }
         }
-    }
-    if (-not $TomcatHome) {
-        $TomcatHome = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME", "Machine")
+
+        # Method 3: CATALINA_HOME environment variable
+        if (-not $TomcatHome) {
+            $TomcatHome = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME", "Machine")
+            if ($TomcatHome) { Log "Tomcat home (from CATALINA_HOME): $TomcatHome" }
+        }
     }
     if (-not $TomcatHome -or -not (Test-Path $TomcatHome)) {
         return [PSCustomObject]@{ Success=$false; Log=$log; Error="Could not locate Tomcat home. Use -TomcatHome." }
@@ -225,36 +250,66 @@ $configureScript = {
 
     # ── 1. Locate Tomcat home ────────────────────────────────────────────────
     if (-not $TomcatHome) {
-        $regBases = @(
-            "HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0",
-            "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Procrun 2.0"
-        )
-        foreach ($base in $regBases) {
-            if (Test-Path $base) {
-                $svcKeys = Get-ChildItem $base -ErrorAction SilentlyContinue |
-                           Where-Object { $_.PSChildName -like "*Tomcat*" }
-                foreach ($key in $svcKeys) {
-                    $javaKey = Join-Path $key.PSPath "Parameters\Java"
-                    if (Test-Path $javaKey) {
-                        $cp = (Get-ItemProperty $javaKey -ErrorAction SilentlyContinue).Classpath
-                        if ($cp -match "^(.+?)\\lib\\") { $TomcatHome = $Matches[1]; break }
+
+        # Method 1: derive from the Tomcat service PathName (most reliable)
+        $tomcatWmiSvc = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -like "*Tomcat*" -or $_.Name -like "*Tomcat*" } |
+                        Select-Object -First 1
+        if ($tomcatWmiSvc -and $tomcatWmiSvc.PathName) {
+            # PathName may be:  "C:\Tomcat\bin\Tomcat10.exe" //RS//ServiceName
+            # or quoted:        "C:\Program Files\...\bin\Tomcat10.exe"
+            $exePath = $tomcatWmiSvc.PathName -replace '^"?([^"]+\.exe).*$', '$1'
+            $exePath = $exePath.Trim('"')
+            $candidate = Split-Path $exePath -Parent   # \bin
+            $candidate = Split-Path $candidate -Parent # Tomcat root
+            if (Test-Path (Join-Path $candidate "conf\server.xml")) {
+                $TomcatHome = $candidate
+                Log "Tomcat home (from service PathName): $TomcatHome"
+            }
+        }
+
+        # Method 2: Procrun registry Classpath
+        if (-not $TomcatHome) {
+            $regBases = @(
+                "HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0",
+                "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Procrun 2.0"
+            )
+            foreach ($base in $regBases) {
+                if (Test-Path $base) {
+                    $svcKeys = Get-ChildItem $base -ErrorAction SilentlyContinue |
+                               Where-Object { $_.PSChildName -like "*Tomcat*" }
+                    foreach ($key in $svcKeys) {
+                        $javaKey = Join-Path $key.PSPath "Parameters\Java"
+                        if (Test-Path $javaKey) {
+                            $cp = (Get-ItemProperty $javaKey -ErrorAction SilentlyContinue).Classpath
+                            if ($cp -match "^(.+?)\\lib\\") { $TomcatHome = $Matches[1]; break }
+                        }
                     }
                 }
+                if ($TomcatHome) { break }
             }
-            if ($TomcatHome) { break }
+            if ($TomcatHome) { Log "Tomcat home (from registry): $TomcatHome" }
         }
-    }
-    if (-not $TomcatHome) {
-        $TomcatHome = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME", "Machine")
-    }
-    if (-not $TomcatHome) {
-        $candidates = @(
-            Get-ChildItem "C:\Program Files\Apache Software Foundation" `
-                -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "Tomcat*" } |
-            Sort-Object Name -Descending
-        )
-        if ($candidates.Count -gt 0) { $TomcatHome = $candidates[0].FullName }
+
+        # Method 3: CATALINA_HOME environment variable
+        if (-not $TomcatHome) {
+            $TomcatHome = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME", "Machine")
+            if ($TomcatHome) { Log "Tomcat home (from CATALINA_HOME): $TomcatHome" }
+        }
+
+        # Method 4: last-resort Program Files scan
+        if (-not $TomcatHome) {
+            $candidates = @(
+                Get-ChildItem "C:\Program Files\Apache Software Foundation" `
+                    -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "Tomcat*" } |
+                Sort-Object Name -Descending
+            )
+            if ($candidates.Count -gt 0) {
+                $TomcatHome = $candidates[0].FullName
+                Log "Tomcat home (from Program Files scan): $TomcatHome"
+            }
+        }
     }
     if (-not $TomcatHome -or -not (Test-Path $TomcatHome)) {
         return [PSCustomObject]@{ Success=$false; Log=$log; Error="Could not locate Tomcat home. Use -TomcatHome." }
