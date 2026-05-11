@@ -166,7 +166,7 @@ if ($Rollback) {
                 Log "Starting Tomcat service: $($tomcatSvc.Name) ..."
                 Start-Service -Name $tomcatSvc.Name -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 5
-                $tomcatSvc.Refresh()
+                $tomcatSvc = Get-Service -Name $tomcatSvc.Name -ErrorAction SilentlyContinue
                 $restartNote = "Service '$($tomcatSvc.Name)' status after rollback: $($tomcatSvc.Status)"
                 Log $restartNote
             } else {
@@ -193,7 +193,7 @@ if ($Rollback) {
     if ($rollbackResult.Success) {
         Write-Status "=== ROLLBACK COMPLETE ===" -Color Green
         Write-Status "Restored from : $($rollbackResult.RollbackDir)" -Color Cyan
-        Write-Status "Files restored: $($rollbackResult.Restored -join ', ')" -Color Cyan
+        Write-Status "Files restored: $(($rollbackResult.Restored | ForEach-Object { $_ }) -join ', ')" -Color Cyan
         if ($rollbackResult.RestartNote) { Write-Status $rollbackResult.RestartNote -Color Yellow }
         Write-Status ""
         Write-Status "If you did not use -RestartTomcat, start the Tomcat service manually." -Color Yellow
@@ -298,8 +298,8 @@ $result = Invoke-Command -Session $session -ArgumentList `
 
     # Try PATH
     if (-not $keytool) {
-        $kt = (Get-Command keytool.exe -ErrorAction SilentlyContinue)?.Source
-        if ($kt) { $keytool = $kt }
+        $ktCmd = Get-Command keytool.exe -ErrorAction SilentlyContinue
+        if ($ktCmd) { $keytool = $ktCmd.Source }
     }
 
     if (-not $keytool) {
@@ -442,7 +442,7 @@ $result = Invoke-Command -Session $session -ArgumentList `
             Log "Restarting Tomcat service: $($svc.Name) ..."
             Restart-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
-            $svc.Refresh()
+            $svc = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
             $restartNote = "Service '$($svc.Name)' status after restart: $($svc.Status)"
             Log $restartNote
         } else {
