@@ -98,8 +98,7 @@ $rollbackScript = {
     if (-not $TomcatHome) {
 
         # Method 1: derive from the Tomcat service PathName (most reliable)
-        $tomcatWmiSvc = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -like "*Tomcat*" -or $_.Name -like "*Tomcat*" } |
+        $tomcatWmiSvc = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
                         Select-Object -First 1
         if ($tomcatWmiSvc -and $tomcatWmiSvc.PathName) {
             # PathName may be:  "C:\Tomcat\bin\Tomcat10.exe" //RS//ServiceName
@@ -167,7 +166,9 @@ $rollbackScript = {
     Log "Rolling back from: $RollbackDir"
 
     # ── Stop Tomcat before restoring files ───────────────────────────────────
-    $tomcatSvc = Get-Service -Name "*Tomcat*" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $tomcatWmi = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+    $tomcatSvc = if ($tomcatWmi) { Get-Service -Name $tomcatWmi.Name -ErrorAction SilentlyContinue } else { $null }
     if ($tomcatSvc -and $tomcatSvc.Status -eq "Running") {
         Log "Stopping Tomcat service: $($tomcatSvc.Name) ..."
         Stop-Service -Name $tomcatSvc.Name -Force -ErrorAction SilentlyContinue
@@ -199,7 +200,9 @@ $rollbackScript = {
     # ── Start Tomcat if requested ─────────────────────────────────────────────
     $restartNote = ""
     if ($DoRestart) {
-        $tomcatSvc = Get-Service -Name "*Tomcat*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $tomcatWmi = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+        $tomcatSvc = if ($tomcatWmi) { Get-Service -Name $tomcatWmi.Name -ErrorAction SilentlyContinue } else { $null }
         if ($tomcatSvc) {
             Log "Starting Tomcat service: $($tomcatSvc.Name) ..."
             Start-Service -Name $tomcatSvc.Name -ErrorAction SilentlyContinue
@@ -252,8 +255,7 @@ $configureScript = {
     if (-not $TomcatHome) {
 
         # Method 1: derive from the Tomcat service PathName (most reliable)
-        $tomcatWmiSvc = Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -like "*Tomcat*" -or $_.Name -like "*Tomcat*" } |
+        $tomcatWmiSvc = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
                         Select-Object -First 1
         if ($tomcatWmiSvc -and $tomcatWmiSvc.PathName) {
             # PathName may be:  "C:\Tomcat\bin\Tomcat10.exe" //RS//ServiceName
@@ -461,7 +463,9 @@ $configureScript = {
     # ── 7. Optionally restart Tomcat ─────────────────────────────────────────
     $restartNote = ""
     if ($DoRestart) {
-        $svc = Get-Service -Name "*Tomcat*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $tomcatWmi = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+        $svc = if ($tomcatWmi) { Get-Service -Name $tomcatWmi.Name -ErrorAction SilentlyContinue } else { $null }
         if ($svc) {
             Log "Restarting Tomcat service: $($svc.Name) ..."
             Restart-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
