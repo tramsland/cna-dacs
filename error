@@ -1,33 +1,46 @@
-[19:26:35]   AZASVWSR046.public.dla.mil               [FAILED]  keytool failed (exit 1): Illegal option:  OU=IT,
-
-keytool -genkeypair [OPTION]...
-
-Generates a key pair
-
-Options:
-
- -alias <alias>          alias name of the entry to process
- -keyalg <alg>           key algorithm name
- -keysize <size>         key bit size
- -groupname <name>       Group name. For example, an Elliptic Curve name.
- -sigalg <alg>           signature algorithm name
- -dname <name>           distinguished name
- -startdate <date>       certificate validity start date/time
- -ext <value>            X.509 extension
- -validity <days>        validity number of days
- -keypass <arg>          key password
- -keystore <keystore>    keystore name
- -signer <alias>         signer alias
- -signerkeypass <arg>    signer key password
- -storepass <arg>        keystore password
- -storetype <type>       keystore type
- -providername <name>    provider name
- -addprovider <name>     add security provider by name (e.g. SunPKCS11)
-   [-providerarg <arg>]    configure argument for -addprovider
- -providerclass <class>  add security provider by fully-qualified class name
-   [-providerarg <arg>]    configure argument for -providerclass
- -providerpath <list>    provider classpath
- -v                      verbose output
- -protected              password through protected mechanism
-
-Use "keytool -?, -h, or --help" for this help message
+At C:\DLA-FAILSAFE\patching\newcert.ps1:300 char:47
++                   -Filter "Description LIKE '%Tomcat%' OR DisplayName ...
++                                               ~
+You must provide a value expression following the '%' operator.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:300 char:47
++ ... tion LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%To ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Unexpected token 'Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" `
+                  -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $svcObj -and $svcObj.PathName) {
+            $exe  = ($svcObj.PathName -replace '^"?([^"]+\.exe' in expression or statement.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:212 char:47
++                 foreach ($svc in $csServices) {
++                                               ~
+Missing closing '}' in statement block or type definition.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:193 char:29
++             $detectScript = {
++                             ~
+Missing closing '}' in statement block or type definition.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:176 char:35
++         if (-not $CSInstanceName) {
++                                   ~
+Missing closing '}' in statement block or type definition.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:175 char:21
++     if ($IsCluster) {
++                     ~
+Missing closing '}' in statement block or type definition.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:169 char:21
++ if (-not $Rollback) {
++                     ~
+Missing closing '}' in statement block or type definition.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:303 char:63
++ ...           $exe  = ($svcObj.PathName -replace '^"?([^"]+\.exe).*$','$1 ...
++                                                                 ~
+Unexpected token ')' in expression or statement.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:458 char:54
++             $exe  = ($svcObj.PathName -replace '^"?([^"]+\.exe).*$',' ...
++                                                      ~
+Missing type name after '['.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:781 char:81
++ ... ne's short name and FQDN. When matched, all operations run in-process
++                                                                          ~
+Missing closing ')' in expression.
+Not all parse errors were reported.  Correct the reported errors and try again.
+    + CategoryInfo          : ParserError: (:) [], ParseException
+    + FullyQualifiedErrorId : ExpectedValueExpression
