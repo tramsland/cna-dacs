@@ -577,8 +577,10 @@ $configureScript = {
     }
 
     # Apply extracted values, falling back to passed-in parameters
+    # NOTE: KeystorePass is intentionally NOT overridden from server.xml —
+    # the parameter value (default: itwaschanged) is always used so the
+    # password is consistently updated on every run.
     if ($xmlHttpsPort)    { $HttpsPort    = [int]$xmlHttpsPort }
-    if ($xmlKeystorePass) { $KeystorePass = $xmlKeystorePass   }
     if ($xmlCertAlias)    { $CertAlias    = $xmlCertAlias      }
 
     if ($xmlKeystoreFile) {
