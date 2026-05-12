@@ -21,6 +21,7 @@ param(
     [int]   $CertValidDays = 3650,        # 10 years
     [int]   $HttpsPort     = 443,
     [switch]$RestartTomcat,               # Restart Tomcat service after configuring
+    [switch]$Cluster,                     # Pause between servers for cluster-safe rollout
 
     # ── Rollback mode ────────────────────────────────────────────────────────
     [switch]$Rollback,                    # Restore files from a previous backup
@@ -494,10 +495,57 @@ $configureScript = {
 }
 #endregion Configure scriptblock
 
+# ── Cluster pause helper ──────────────────────────────────────────────────────
+# Returns: 'next' | 'quit' | 'rollback'
+function Invoke-ClusterPause {
+    param(
+        [string]$CompletedServer,
+        [string]$NextServer,
+        [int]   $CurrentIndex,
+        [int]   $TotalCount
+    )
+
+    $isLast = ($CurrentIndex -eq $TotalCount)
+
+    Write-Host ""
+    Write-Host ("  ┌─────────────────────────────────────────────────────┐") -ForegroundColor DarkCyan
+    Write-Host ("  │  CLUSTER PAUSE — server $CurrentIndex of $TotalCount complete" + (" " * [Math]::Max(0, 23 - "$CurrentIndex of $TotalCount".Length)) + "│") -ForegroundColor DarkCyan
+    Write-Host ("  │  Completed : $CompletedServer") -ForegroundColor DarkCyan
+    if (-not $isLast) {
+        Write-Host ("  │  Next      : $NextServer") -ForegroundColor DarkCyan
+    }
+    Write-Host ("  ├─────────────────────────────────────────────────────┤") -ForegroundColor DarkCyan
+    if ($isLast) {
+        Write-Host ("  │  [ENTER] Finish   [R] Rollback all   [Q] Quit      │") -ForegroundColor Yellow
+    } else {
+        Write-Host ("  │  [ENTER] Next     [R] Rollback all   [Q] Quit      │") -ForegroundColor Yellow
+    }
+    Write-Host ("  └─────────────────────────────────────────────────────┘") -ForegroundColor DarkCyan
+    Write-Host ""
+
+    while ($true) {
+        $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        switch ($key.Character.ToString().ToUpper()) {
+            ""  { return "next"     }  # Enter
+            "R" { return "rollback" }
+            "Q" { return "quit"     }
+            default {
+                # Also handle Enter (VirtualKeyCode 13)
+                if ($key.VirtualKeyCode -eq 13) { return "next" }
+            }
+        }
+    }
+}
+
+$serverIndex = 0
+
 # ============================================================================
 # MAIN LOOP — one iteration per server
 # ============================================================================
 foreach ($ComputerName in $servers) {
+
+    $serverIndex++
+    $nextServer = if ($serverIndex -lt $servers.Count) { $servers[$serverIndex] } else { $null }
 
     # ── Detect localhost ─────────────────────────────────────────────────────
     $localNames = @(
@@ -513,7 +561,7 @@ foreach ($ComputerName in $servers) {
 
     $localTag = if ($isLocal) { "  [LOCAL]" } else { "" }
     Write-Status "----------------------------------------" -Color DarkCyan
-    Write-Status "Server  : $ComputerName  (CN: $CertCN)$localTag" -Color Cyan
+    Write-Status "Server $serverIndex of $($servers.Count) : $ComputerName  (CN: $CertCN)$localTag" -Color Cyan
 
     # ── Open PSSession (remote only) ─────────────────────────────────────────
     $session = $null
@@ -554,6 +602,18 @@ foreach ($ComputerName in $servers) {
         Write-Status ""
         Write-Status "--- Remote log ---" -Color Gray
         foreach ($line in $rbResult.Log) { Write-Status "  $line" -Color Gray }
+
+        if ($Cluster) {
+            $choice = Invoke-ClusterPause -CompletedServer $ComputerName -NextServer $nextServer `
+                          -CurrentIndex $serverIndex -TotalCount $servers.Count
+            if ($choice -eq "quit") {
+                Write-Status "Quit requested. Stopping." -Color Yellow
+                break
+            } elseif ($choice -eq "rollback") {
+                Write-Status "Rollback-all requested — re-run with -Rollback to restore all servers." -Color Yellow
+                break
+            }
+        }
         continue
     }
 
@@ -589,6 +649,19 @@ foreach ($ComputerName in $servers) {
     Write-Status ""
     Write-Status "--- Remote log ---" -Color Gray
     foreach ($line in $result.Log) { Write-Status "  $line" -Color Gray }
+
+    if ($Cluster) {
+        $choice = Invoke-ClusterPause -CompletedServer $ComputerName -NextServer $nextServer `
+                      -CurrentIndex $serverIndex -TotalCount $servers.Count
+        if ($choice -eq "quit") {
+            Write-Status "Quit requested. Stopping after $serverIndex of $($servers.Count) servers." -Color Yellow
+            break
+        } elseif ($choice -eq "rollback") {
+            Write-Status "Rollback-all requested — re-run with -Rollback to restore all servers processed so far." -Color Yellow
+            break
+        }
+        # "next" falls through to next iteration
+    }
 
 } # end foreach server
 
