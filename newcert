@@ -1,30 +1,34 @@
 #Requires -Version 5.1
 # Configure-TomcatSSL.ps1
-# Generates a self-signed JKS certificate and configures Tomcat 10.1.x for HTTPS on port 443
+# Generates a self-signed PKCS12 certificate and configures Tomcat 10.1.x for HTTPS on port 443
 # Targets remote Windows servers via WinRM. Run as administrator.
-# Compatible with Windows PowerShell 5.1+
+# Compatible with Windows PowerShell 5.1
 
 #region Parameters
 param(
     # servers.txt in the same folder as this script is the default.
     # Each line: one server FQDN or hostname. Lines starting with # are comments.
-    [string]$ServerList    = (Join-Path $PSScriptRoot "servers.txt"),
+    [string]$ServerList      = (Join-Path $PSScriptRoot "servers.txt"),
 
-    [string]$TomcatHome    = "",          # Auto-detected if left blank
-    [string]$KeystorePass  = "changeit",  # Password for the JKS keystore
-    [string]$CertAlias     = "tomcat",    # Alias for the cert entry in the keystore
-    [string]$CertOU        = "IT",
-    [string]$CertO         = "MyOrg",
-    [string]$CertL         = "Atlanta",
-    [string]$CertST        = "GA",
-    [string]$CertC         = "US",
-    [int]   $CertValidDays = 3650,        # 10 years
-    [int]   $HttpsPort     = 443,
-    [switch]$RestartTomcat,               # Restart Tomcat service after configuring
+    [string]$TomcatHome      = "",             # Auto-detected if left blank
+    [string]$KeystorePass    = "itwaschanged", # Password for the PKCS12 keystore
+    [string]$CertAlias       = "tomcat",       # Alias for the cert entry in the keystore
+    [string]$CertOU          = "DACS",
+    [string]$CertO           = "DLA",
+    [string]$CertL           = "AZURE",
+    [string]$CertST          = "DOD",
+    [string]$CertC           = "MIL",
+    [int]   $CertValidDays   = 365,            # 1 year
+    [int]   $HttpsPort       = 443,
+    [switch]$RestartTomcat,                    # Restart Tomcat service after configuring
+
+    # ── Cluster mode ─────────────────────────────────────────────────────────
+    [switch]$Clustered,                        # All server FQDNs added to every cert's SAN
+    [string]$CSInstanceName  = "",             # Content Server instance name — used as CN in cluster mode
 
     # ── Rollback mode ────────────────────────────────────────────────────────
-    [switch]$Rollback,                    # Restore files from a previous backup
-    [string]$RollbackDir   = "",          # Path to _backup_<timestamp> folder; auto-selects latest if blank
+    [switch]$Rollback,                         # Restore files from a previous backup
+    [string]$RollbackDir     = "",             # Path to _backup_<timestamp> folder; auto-selects latest if blank
 
     [System.Management.Automation.PSCredential]$Credential
 )
@@ -37,22 +41,109 @@ function Write-Status {
     Write-Host ("[$ts] $Msg") -ForegroundColor $Color
 }
 
-function Exit-Error {
-    param([string]$Msg)
-    Write-Status ("ERROR: $Msg") -Color Red
-    exit 1
+function Test-SSLConnection {
+    # Attempts a TLS connection and returns cert details.
+    # Uses a permissive validation callback so self-signed certs are accepted.
+    # PS 5.1 compatible — no Invoke-WebRequest; uses raw SslStream.
+    param(
+        [string]$HostName,
+        [int]   $Port,
+        [int]   $TimeoutSeconds = 15
+    )
+
+    $result = [PSCustomObject]@{
+        Success   = $false
+        SubjectCN = ""
+        Expiry    = ""
+        Issuer    = ""
+        Protocol  = ""
+        Error     = ""
+    }
+
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $iar = $tcp.BeginConnect($HostName, $Port, $null, $null)
+        $connected = $iar.AsyncWaitHandle.WaitOne(($TimeoutSeconds * 1000), $false)
+        if (-not $connected) {
+            $tcp.Close()
+            $result.Error = "TCP connection timed out after $TimeoutSeconds seconds"
+            return $result
+        }
+        $tcp.EndConnect($iar)
+
+        # PS 5.1: inline scriptblock as validation callback — always returns $true
+        # so self-signed certs do not abort the handshake
+        $certCallback = [System.Net.Security.RemoteCertificateValidationCallback]{
+            param($s, $c, $ch, $e) return $true
+        }
+        $sslStream = New-Object System.Net.Security.SslStream(
+            $tcp.GetStream(), $false, $certCallback
+        )
+        $sslStream.AuthenticateAsClient($HostName)
+
+        $remoteCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $sslStream.RemoteCertificate
+        )
+
+        $result.Success   = $true
+        $result.SubjectCN = $remoteCert.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        $result.Expiry    = $remoteCert.NotAfter.ToString("yyyy-MM-dd")
+        $result.Issuer    = $remoteCert.Issuer
+        $result.Protocol  = $sslStream.SslProtocol.ToString()
+
+        $sslStream.Close()
+        $tcp.Close()
+    } catch {
+        $result.Error = $_.Exception.Message
+    }
+
+    return $result
+}
+
+function Invoke-NodeRollback {
+    # Executes the rollback scriptblock against a single node (local or remote).
+    param(
+        [string]     $ComputerName,
+        [string]     $TomcatHome,
+        [string]     $RollbackDir,
+        [bool]       $DoRestart,
+        [scriptblock]$RollbackScript,
+        [hashtable]  $SessionParams,
+        [bool]       $IsLocal
+    )
+    $session = $null
+    if (-not $IsLocal) {
+        try {
+            $session = New-PSSession -ComputerName $ComputerName @SessionParams
+        } catch {
+            return [PSCustomObject]@{
+                Success = $false
+                Error   = "Could not open PSSession: $($_.Exception.Message)"
+                Log     = @()
+            }
+        }
+    }
+    $rbArgs = @($TomcatHome, $RollbackDir, $DoRestart)
+    if ($IsLocal) {
+        $res = Invoke-Command -ScriptBlock $RollbackScript -ArgumentList $rbArgs
+    } else {
+        $res = Invoke-Command -Session $session -ScriptBlock $RollbackScript -ArgumentList $rbArgs
+        Remove-PSSession $session -ErrorAction SilentlyContinue
+    }
+    return $res
 }
 #endregion
 
 #region Load server list
 if (-not (Test-Path $ServerList)) {
     Write-Host "ERROR: Server list not found: $ServerList" -ForegroundColor Red
-    Write-Host "Create a servers.txt file in the same directory as this script," -ForegroundColor Yellow
-    Write-Host "with one server FQDN or hostname per line. Lines starting with # are comments." -ForegroundColor Yellow
+    Write-Host "Create a servers.txt in the same directory with one FQDN/hostname per line." -ForegroundColor Yellow
     exit 1
 }
 
-$servers = @(
+# PS 5.1: explicit [string[]] cast ensures array even for single-line files
+[string[]]$servers = @(
     Get-Content $ServerList |
     Where-Object { ($_ -notmatch '^\s*$') -and ($_ -notmatch '^\s*#') } |
     ForEach-Object { $_.Trim() }
@@ -64,24 +155,132 @@ if ($servers.Count -eq 0) {
 }
 
 $modeLabel = if ($Rollback) { 'ROLLBACK' } else { 'CONFIGURE' }
-Write-Status "=== Tomcat 10.1 SSL Configurator ===" -Color Cyan
-Write-Status "Mode        : $modeLabel" -Color Cyan
+Write-Status "=== Tomcat 10.1 SSL Configurator (PKCS12) ===" -Color Cyan
+Write-Status "Mode        : $modeLabel"                        -Color Cyan
 Write-Status "Server list : $ServerList ($($servers.Count) server(s))" -Color Cyan
-Write-Status "Port        : $HttpsPort" -Color Cyan
-Write-Status ""
+Write-Status "Port        : $HttpsPort"                        -Color Cyan
+Write-Host ""
+
+# ── Cluster prompt ────────────────────────────────────────────────────────────
+# PS 5.1: [switch] params are read-only once bound — use a separate [bool] for
+# runtime state so we can set it interactively without touching the param.
+[bool]$IsCluster = $Clustered.IsPresent
+
+if (-not $Rollback) {
+    if (-not $IsCluster) {
+        $clusterAnswer = Read-Host "Is this a clustered environment? (yes/no)"
+        if ($clusterAnswer -match '^y') { $IsCluster = $true }
+    }
+
+    if ($IsCluster) {
+        if (-not $CSInstanceName) {
+            # ── Auto-detect CS instance name from the Content Server service ──
+            # OpenText registers services named like:
+            #   "OpenText Content Server - <InstanceName>"
+            #   "LivelinkCS_<InstanceName>"
+            #   "otcs_<InstanceName>"
+            # Try the first server in the list — all nodes share the same instance name
+            $detectServer = $servers[0]
+            Write-Status "Auto-detecting CS instance name from service on: $detectServer ..." -Color Gray
+
+            $localNames2 = [string[]]@(
+                "localhost","127.0.0.1","::1",
+                $env:COMPUTERNAME,
+                ($env:COMPUTERNAME + "." + $env:USERDNSDOMAIN)
+            )
+            $detectIsLocal = $localNames2 -contains $detectServer
+
+            $detectScript = {
+                # Query all services matching known OpenText CS naming patterns
+                $csServices = @(Get-WmiObject Win32_Service -ErrorAction SilentlyContinue |
+                    Where-Object {
+                        $_.DisplayName -match 'Content Server' -or
+                        $_.Name        -match '^(LivelinkCS_|otcs_|OTCS)' -or
+                        $_.DisplayName -match 'OpenText.*Content' -or
+                        $_.PathName    -match 'ContentServer|livelink'
+                    })
+
+                if ($csServices.Count -eq 0) { return "" }
+
+                # Prefer display name pattern "... - InstanceName"
+                foreach ($svc in $csServices) {
+                    if ($svc.DisplayName -match '-\s*(.+)$') {
+                        return $Matches[1].Trim()
+                    }
+                }
+                # Fallback: strip known prefixes from service Name
+                foreach ($svc in $csServices) {
+                    $n = $svc.Name -replace '^(LivelinkCS_|otcs_|OTCS_?)','
+                    if ($n) { return $n.Trim() }
+                }
+                # Last resort: return the raw service Name
+                return $csServices[0].Name
+            }
+
+            $detectedName = ""
+            try {
+                if ($detectIsLocal) {
+                    $detectedName = Invoke-Command -ScriptBlock $detectScript
+                } else {
+                    $detectSession = New-PSSession -ComputerName $detectServer @sessionParams
+                    $detectedName  = Invoke-Command -Session $detectSession -ScriptBlock $detectScript
+                    Remove-PSSession $detectSession -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Write-Status "  WARNING: Could not query services on $detectServer — $($_.Exception.Message)" -Color Yellow
+            }
+
+            if ($detectedName) {
+                Write-Status "  Detected CS instance name: $detectedName" -Color Green
+                $CSInstanceName = $detectedName
+            } else {
+                Write-Status "  Could not auto-detect instance name from services." -Color Yellow
+                $CSInstanceName = Read-Host "  Enter the Content Server instance name manually (used as CN)"
+            }
+        }
+
+        if (-not $CSInstanceName) {
+            Write-Host "ERROR: Content Server instance name is required in cluster mode." -ForegroundColor Red
+            exit 1
+        }
+        Write-Status "Cluster mode  : YES"              -Color Yellow
+        Write-Status "CS Instance   : $CSInstanceName"  -Color Yellow
+    } else {
+        Write-Status "Cluster mode  : NO" -Color Gray
+    }
+}
+Write-Host ""
+
+# ── Pre-resolve all server FQDNs for cluster SAN list ────────────────────────
+# Resolved once here — every node gets the same complete SAN list.
+# PS 5.1: build into a List[string] then call .ToArray() for a clean [string[]]
+[string[]]$AllSANs = @()
+if ($IsCluster -and (-not $Rollback)) {
+    Write-Status "Resolving FQDNs for all cluster nodes..." -Color Gray
+    $sanList = New-Object System.Collections.Generic.List[string]
+    foreach ($srv in $servers) {
+        $fqdn = $srv
+        try { $fqdn = [System.Net.Dns]::GetHostEntry($srv).HostName } catch {}
+        $sanList.Add($fqdn)
+        Write-Status "  SAN entry: $fqdn" -Color Gray
+    }
+    $AllSANs = $sanList.ToArray()
+    Write-Status "SAN list built ($($AllSANs.Count) entries)." -Color Gray
+    Write-Host ""
+}
 #endregion
 
-#region Session params (credentials only; ComputerName added per-server)
+#region Session params
 $sessionParams = @{ ErrorAction = "Stop" }
-if ($Credential) { $sessionParams["Credential"] = $Credential }
+if ($null -ne $Credential) { $sessionParams["Credential"] = $Credential }
 #endregion
 
-# ── Per-server summary table ─────────────────────────────────────────────────
-$summary = New-Object 'System.Collections.Generic.List[System.Management.Automation.PSObject]'
+# ── Per-server summary table ──────────────────────────────────────────────────
+$summary = New-Object System.Collections.Generic.List[System.Management.Automation.PSObject]
 
-# ============================================================================
-# SCRIPTBLOCKS — defined once outside the loop, reused per server
-# ============================================================================
+# =============================================================================
+# SCRIPTBLOCKS — defined once, reused per server
+# =============================================================================
 
 #region Rollback scriptblock
 $rollbackScript = {
@@ -91,42 +290,36 @@ $rollbackScript = {
         [bool]  $DoRestart
     )
 
-    $log = New-Object 'System.Collections.Generic.List[string]'
-    function Log { param([string]$m) $log.Add($m); Write-Host $m }
+    $logList = New-Object System.Collections.Generic.List[string]
+    function Log { param([string]$m) $logList.Add($m); Write-Host $m }
 
-    # ── Locate Tomcat home ───────────────────────────────────────────────────
+    # ── Locate Tomcat home ────────────────────────────────────────────────────
     if (-not $TomcatHome) {
-
-        # Method 1: derive from the Tomcat service PathName (most reliable)
-        $tomcatWmiSvc = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
-                        Select-Object -First 1
-        if ($tomcatWmiSvc -and $tomcatWmiSvc.PathName) {
-            # PathName may be:  "C:\Tomcat\bin\Tomcat10.exe" //RS//ServiceName
-            # or quoted:        "C:\Program Files\...\bin\Tomcat10.exe"
-            $exePath = $tomcatWmiSvc.PathName -replace '^"?([^"]+\.exe).*$', '$1'
-            $exePath = $exePath.Trim('"')
-            $candidate = Split-Path $exePath -Parent   # \bin
-            $candidate = Split-Path $candidate -Parent # Tomcat root
-            if (Test-Path (Join-Path $candidate "conf\server.xml")) {
-                $TomcatHome = $candidate
-                Log "Tomcat home (from service PathName): $TomcatHome"
+        # Method 1: service PathName
+        $svcObj = Get-WmiObject Win32_Service `
+                  -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" `
+                  -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $svcObj -and $svcObj.PathName) {
+            $exe  = ($svcObj.PathName -replace '^"?([^"]+\.exe).*$','$1').Trim('"')
+            $cand = Split-Path (Split-Path $exe -Parent) -Parent
+            if (Test-Path (Join-Path $cand "conf\server.xml")) {
+                $TomcatHome = $cand
+                Log "Tomcat home (from service): $TomcatHome"
             }
         }
-
-        # Method 2: Procrun registry Classpath
+        # Method 2: Procrun registry
         if (-not $TomcatHome) {
-            $regBases = @(
+            foreach ($base in @(
                 "HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0",
                 "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Procrun 2.0"
-            )
-            foreach ($base in $regBases) {
+            )) {
                 if (Test-Path $base) {
-                    $svcKeys = Get-ChildItem $base -ErrorAction SilentlyContinue |
-                               Where-Object { $_.PSChildName -like "*Tomcat*" }
-                    foreach ($key in $svcKeys) {
-                        $javaKey = Join-Path $key.PSPath "Parameters\Java"
-                        if (Test-Path $javaKey) {
-                            $cp = (Get-ItemProperty $javaKey -ErrorAction SilentlyContinue).Classpath
+                    $keys = Get-ChildItem $base -ErrorAction SilentlyContinue |
+                            Where-Object { $_.PSChildName -like "*Tomcat*" }
+                    foreach ($k in $keys) {
+                        $jk = Join-Path $k.PSPath "Parameters\Java"
+                        if (Test-Path $jk) {
+                            $cp = (Get-ItemProperty $jk -ErrorAction SilentlyContinue).Classpath
                             if ($cp -match "^(.+?)\\lib\\") { $TomcatHome = $Matches[1]; break }
                         }
                     }
@@ -135,80 +328,81 @@ $rollbackScript = {
             }
             if ($TomcatHome) { Log "Tomcat home (from registry): $TomcatHome" }
         }
-
-        # Method 3: CATALINA_HOME environment variable
+        # Method 3: CATALINA_HOME
         if (-not $TomcatHome) {
-            $TomcatHome = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME", "Machine")
-            if ($TomcatHome) { Log "Tomcat home (from CATALINA_HOME): $TomcatHome" }
+            $ch = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME","Machine")
+            if ($ch -and (Test-Path $ch)) { $TomcatHome = $ch; Log "Tomcat home (CATALINA_HOME): $TomcatHome" }
         }
     }
     if (-not $TomcatHome -or -not (Test-Path $TomcatHome)) {
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="Could not locate Tomcat home. Use -TomcatHome." }
+        return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="Could not locate Tomcat home." }
     }
 
     $confDir = Join-Path $TomcatHome "conf"
 
-    # ── Find the backup folder ───────────────────────────────────────────────
+    # ── Find backup folder ────────────────────────────────────────────────────
     if (-not $RollbackDir) {
-        $backups = @(
-            Get-ChildItem -Path $confDir -Directory -Filter "_backup_*" -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending
-        )
+        $backups = @(Get-ChildItem -Path $confDir -Directory -Filter "_backup_*" `
+                     -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
         if ($backups.Count -eq 0) {
-            return [PSCustomObject]@{ Success=$false; Log=$log; Error="No backup folders found in $confDir. Run without -Rollback first." }
+            return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="No backup folders found in $confDir." }
         }
         $RollbackDir = $backups[0].FullName
     }
     if (-not (Test-Path $RollbackDir)) {
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="Rollback directory not found: $RollbackDir" }
+        return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="Rollback directory not found: $RollbackDir" }
     }
-
     Log "Rolling back from: $RollbackDir"
 
-    # ── Stop Tomcat before restoring files ───────────────────────────────────
-    $tomcatWmi = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
-                 Select-Object -First 1
-    $tomcatSvc = if ($tomcatWmi) { Get-Service -Name $tomcatWmi.Name -ErrorAction SilentlyContinue } else { $null }
-    if ($tomcatSvc -and $tomcatSvc.Status -eq "Running") {
-        Log "Stopping Tomcat service: $($tomcatSvc.Name) ..."
-        Stop-Service -Name $tomcatSvc.Name -Force -ErrorAction SilentlyContinue
+    # ── Stop Tomcat ───────────────────────────────────────────────────────────
+    $wmi = Get-WmiObject Win32_Service `
+           -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" `
+           -ErrorAction SilentlyContinue | Select-Object -First 1
+    $svc = $null
+    if ($null -ne $wmi) { $svc = Get-Service -Name $wmi.Name -ErrorAction SilentlyContinue }
+    if ($null -ne $svc -and $svc.Status -eq "Running") {
+        Log "Stopping Tomcat service: $($svc.Name) ..."
+        Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
     }
 
-    # ── Restore each file ────────────────────────────────────────────────────
-    $restored = New-Object 'System.Collections.Generic.List[string]'
-
+    # ── Restore files ─────────────────────────────────────────────────────────
+    $restoredList  = New-Object System.Collections.Generic.List[string]
     $backedUpFiles = @(Get-ChildItem -Path $RollbackDir -File -ErrorAction SilentlyContinue)
     if ($backedUpFiles.Count -eq 0) {
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="Backup folder is empty: $RollbackDir" }
+        return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="Backup folder is empty: $RollbackDir" }
     }
     foreach ($f in $backedUpFiles) {
         $dest = Join-Path $confDir $f.Name
         Copy-Item $f.FullName $dest -Force
         Log "  Restored: $dest"
-        $restored.Add($f.Name)
+        $restoredList.Add($f.Name)
     }
 
-    # ── Remove new keystore if none existed before ───────────────────────────
-    $newKeystore = Join-Path $confDir "keystore.jks"
-    $restoredArr = @($restored)
-    if ((Test-Path $newKeystore) -and ($restoredArr -notcontains "keystore.jks")) {
-        Remove-Item $newKeystore -Force
-        Log "  Removed new keystore.jks (no prior keystore existed)"
+    # ── Remove keystores not present in backup ────────────────────────────────
+    [string[]]$restoredArr = $restoredList.ToArray()
+    foreach ($ks in @("keystore.p12","keystore.jks")) {
+        $ksPath = Join-Path $confDir $ks
+        if ((Test-Path $ksPath) -and ($restoredArr -notcontains $ks)) {
+            Remove-Item $ksPath -Force
+            Log "  Removed $ks (was not in backup)"
+        }
     }
 
     # ── Start Tomcat if requested ─────────────────────────────────────────────
     $restartNote = ""
     if ($DoRestart) {
-        $tomcatWmi = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
-                     Select-Object -First 1
-        $tomcatSvc = if ($tomcatWmi) { Get-Service -Name $tomcatWmi.Name -ErrorAction SilentlyContinue } else { $null }
-        if ($tomcatSvc) {
-            Log "Starting Tomcat service: $($tomcatSvc.Name) ..."
-            Start-Service -Name $tomcatSvc.Name -ErrorAction SilentlyContinue
+        $wmi2 = Get-WmiObject Win32_Service `
+                -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" `
+                -ErrorAction SilentlyContinue | Select-Object -First 1
+        $svc2 = $null
+        if ($null -ne $wmi2) { $svc2 = Get-Service -Name $wmi2.Name -ErrorAction SilentlyContinue }
+        if ($null -ne $svc2) {
+            Log "Starting Tomcat service: $($svc2.Name) ..."
+            Start-Service -Name $svc2.Name -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
-            $tomcatSvc = Get-Service -Name $tomcatSvc.Name -ErrorAction SilentlyContinue
-            $restartNote = "Service '$($tomcatSvc.Name)' status after rollback: $($tomcatSvc.Status)"
+            $svc2 = Get-Service -Name $svc2.Name -ErrorAction SilentlyContinue
+            $restartNote = "Service '$($svc2.Name)' status after rollback: $($svc2.Status)"
             Log $restartNote
         } else {
             $restartNote = "WARNING: Could not find Tomcat service. Start manually."
@@ -218,14 +412,12 @@ $rollbackScript = {
         Log "Restart skipped. Start Tomcat manually for rollback to take effect."
     }
 
-    $restoredList = ($restoredArr | ForEach-Object { $_ }) -join ', '
-
     return [PSCustomObject]@{
         Success      = $true
-        Log          = $log
+        Log          = $logList.ToArray()
         Error        = $null
         RollbackDir  = $RollbackDir
-        RestoredList = $restoredList
+        RestoredList = ($restoredArr -join ', ')
         RestartNote  = $restartNote
     }
 }
@@ -245,45 +437,44 @@ $configureScript = {
         [string]$CertC,
         [int]   $CertValidDays,
         [int]   $HttpsPort,
-        [bool]  $DoRestart
+        [bool]  $DoRestart,
+        [string]$SanListJoined   # PS 5.1: passed as pipe-delimited string to survive
+                                 # Invoke-Command -ArgumentList array serialization
     )
 
-    $log = New-Object 'System.Collections.Generic.List[string]'
-    function Log { param([string]$m) $log.Add($m); Write-Host $m }
+    # Reconstitute SAN array from pipe-delimited string
+    [string[]]$SanList = @($SanListJoined -split '\|' | Where-Object { $_ -ne '' })
 
-    # ── 1. Locate Tomcat home ────────────────────────────────────────────────
+    $logList = New-Object System.Collections.Generic.List[string]
+    function Log { param([string]$m) $logList.Add($m); Write-Host $m }
+
+    # ── 1. Locate Tomcat home ─────────────────────────────────────────────────
     if (-not $TomcatHome) {
-
-        # Method 1: derive from the Tomcat service PathName (most reliable)
-        $tomcatWmiSvc = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
-                        Select-Object -First 1
-        if ($tomcatWmiSvc -and $tomcatWmiSvc.PathName) {
-            # PathName may be:  "C:\Tomcat\bin\Tomcat10.exe" //RS//ServiceName
-            # or quoted:        "C:\Program Files\...\bin\Tomcat10.exe"
-            $exePath = $tomcatWmiSvc.PathName -replace '^"?([^"]+\.exe).*$', '$1'
-            $exePath = $exePath.Trim('"')
-            $candidate = Split-Path $exePath -Parent   # \bin
-            $candidate = Split-Path $candidate -Parent # Tomcat root
-            if (Test-Path (Join-Path $candidate "conf\server.xml")) {
-                $TomcatHome = $candidate
+        # Method 1: service PathName
+        $svcObj = Get-WmiObject Win32_Service `
+                  -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" `
+                  -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $svcObj -and $svcObj.PathName) {
+            $exe  = ($svcObj.PathName -replace '^"?([^"]+\.exe).*$','$1').Trim('"')
+            $cand = Split-Path (Split-Path $exe -Parent) -Parent
+            if (Test-Path (Join-Path $cand "conf\server.xml")) {
+                $TomcatHome = $cand
                 Log "Tomcat home (from service PathName): $TomcatHome"
             }
         }
-
-        # Method 2: Procrun registry Classpath
+        # Method 2: Procrun registry
         if (-not $TomcatHome) {
-            $regBases = @(
+            foreach ($base in @(
                 "HKLM:\SOFTWARE\Apache Software Foundation\Procrun 2.0",
                 "HKLM:\SOFTWARE\WOW6432Node\Apache Software Foundation\Procrun 2.0"
-            )
-            foreach ($base in $regBases) {
+            )) {
                 if (Test-Path $base) {
-                    $svcKeys = Get-ChildItem $base -ErrorAction SilentlyContinue |
-                               Where-Object { $_.PSChildName -like "*Tomcat*" }
-                    foreach ($key in $svcKeys) {
-                        $javaKey = Join-Path $key.PSPath "Parameters\Java"
-                        if (Test-Path $javaKey) {
-                            $cp = (Get-ItemProperty $javaKey -ErrorAction SilentlyContinue).Classpath
+                    $keys = Get-ChildItem $base -ErrorAction SilentlyContinue |
+                            Where-Object { $_.PSChildName -like "*Tomcat*" }
+                    foreach ($k in $keys) {
+                        $jk = Join-Path $k.PSPath "Parameters\Java"
+                        if (Test-Path $jk) {
+                            $cp = (Get-ItemProperty $jk -ErrorAction SilentlyContinue).Classpath
                             if ($cp -match "^(.+?)\\lib\\") { $TomcatHome = $Matches[1]; break }
                         }
                     }
@@ -292,72 +483,132 @@ $configureScript = {
             }
             if ($TomcatHome) { Log "Tomcat home (from registry): $TomcatHome" }
         }
-
-        # Method 3: CATALINA_HOME environment variable
+        # Method 3: CATALINA_HOME
         if (-not $TomcatHome) {
-            $TomcatHome = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME", "Machine")
-            if ($TomcatHome) { Log "Tomcat home (from CATALINA_HOME): $TomcatHome" }
+            $ch = [System.Environment]::GetEnvironmentVariable("CATALINA_HOME","Machine")
+            if ($ch -and (Test-Path $ch)) { $TomcatHome = $ch; Log "Tomcat home (CATALINA_HOME): $TomcatHome" }
         }
-
-        # Method 4: last-resort Program Files scan
+        # Method 4: Program Files scan
         if (-not $TomcatHome) {
-            $candidates = @(
-                Get-ChildItem "C:\Program Files\Apache Software Foundation" `
-                    -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -like "Tomcat*" } |
-                Sort-Object Name -Descending
-            )
-            if ($candidates.Count -gt 0) {
-                $TomcatHome = $candidates[0].FullName
-                Log "Tomcat home (from Program Files scan): $TomcatHome"
-            }
+            $hit = Get-ChildItem "C:\Program Files\Apache Software Foundation" `
+                   -Directory -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -like "Tomcat*" } |
+                   Sort-Object Name -Descending | Select-Object -First 1
+            if ($null -ne $hit) { $TomcatHome = $hit.FullName; Log "Tomcat home (Program Files): $TomcatHome" }
         }
     }
     if (-not $TomcatHome -or -not (Test-Path $TomcatHome)) {
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="Could not locate Tomcat home. Use -TomcatHome." }
+        return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="Could not locate Tomcat home. Use -TomcatHome." }
     }
     Log "Tomcat home   : $TomcatHome"
 
-    # ── 2. Locate keytool.exe ────────────────────────────────────────────────
+    # ── 2. Locate keytool.exe ─────────────────────────────────────────────────
     $keytool = $null
-    $javaHome = [System.Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
+    $javaHome = [System.Environment]::GetEnvironmentVariable("JAVA_HOME","Machine")
     if ($javaHome) {
         $kt = Join-Path $javaHome "bin\keytool.exe"
         if (Test-Path $kt) { $keytool = $kt }
     }
     if (-not $keytool) {
-        foreach ($sub in @("jre\bin\keytool.exe", "bin\keytool.exe")) {
+        foreach ($sub in @("jre\bin\keytool.exe","bin\keytool.exe")) {
             $kt = Join-Path $TomcatHome $sub
             if (Test-Path $kt) { $keytool = $kt; break }
         }
     }
     if (-not $keytool) {
         $ktCmd = Get-Command keytool.exe -ErrorAction SilentlyContinue
-        if ($ktCmd) { $keytool = $ktCmd.Source }
+        if ($null -ne $ktCmd) { $keytool = $ktCmd.Source }
     }
     if (-not $keytool) {
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="keytool.exe not found. Ensure JDK/JRE is installed and JAVA_HOME is set." }
+        return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="keytool.exe not found. Ensure JDK/JRE is installed and JAVA_HOME is set." }
     }
     Log "keytool       : $keytool"
 
-    # ── 3. Define paths ──────────────────────────────────────────────────────
-    $confDir      = Join-Path $TomcatHome "conf"
-    $keystoreFile = Join-Path $confDir "keystore.jks"
-    Log "Keystore path : $keystoreFile"
+    # ── 3. Read existing SSL settings from server.xml ─────────────────────────
+    $confDir   = Join-Path $TomcatHome "conf"
+    $serverXml = Join-Path $confDir "server.xml"
 
-    # ── 4. Pre-flight backup ─────────────────────────────────────────────────
+    $xmlKeystoreFile = $null
+    $xmlKeystorePass = $null
+    $xmlKeystoreType = $null
+    $xmlCertAlias    = $null
+    $xmlHttpsPort    = $null
+
+    if (Test-Path $serverXml) {
+        try {
+            [xml]$xmlDoc = Get-Content $serverXml -Raw -Encoding UTF8
+
+            $sslConn = $xmlDoc.Server.Service.Connector |
+                       Where-Object { $_.SSLEnabled -eq "true" } |
+                       Select-Object -First 1
+
+            if ($null -ne $sslConn) {
+                $xmlHttpsPort = $sslConn.port
+
+                # Modern style: nested SSLHostConfig/Certificate
+                $certNode = $null
+                if ($null -ne $sslConn.SSLHostConfig) {
+                    $certNode = $sslConn.SSLHostConfig.Certificate | Select-Object -First 1
+                }
+                if ($null -ne $certNode) {
+                    $xmlKeystoreFile = $certNode.certificateKeystoreFile
+                    $xmlKeystorePass = $certNode.certificateKeystorePassword
+                    $xmlKeystoreType = $certNode.certificateKeystoreType
+                    $xmlCertAlias    = $certNode.certificateKeyAlias
+                }
+                # Legacy style: attributes directly on Connector element
+                if (-not $xmlKeystoreFile) { $xmlKeystoreFile = $sslConn.keystoreFile }
+                if (-not $xmlKeystorePass) { $xmlKeystorePass = $sslConn.keystorePass }
+                if (-not $xmlCertAlias)    { $xmlCertAlias    = $sslConn.keyAlias     }
+            }
+
+            Log "--- Extracted from existing server.xml ---"
+            Log ("  HTTPS Port    : " + $(if ($xmlHttpsPort)    { $xmlHttpsPort    } else { "(not found)" }))
+            Log ("  Keystore File : " + $(if ($xmlKeystoreFile) { $xmlKeystoreFile } else { "(not found)" }))
+            Log ("  Keystore Pass : " + $(if ($xmlKeystorePass) { "********"        } else { "(not found)" }))
+            Log ("  Keystore Type : " + $(if ($xmlKeystoreType) { $xmlKeystoreType } else { "(not found)" }))
+            Log ("  Cert Alias    : " + $(if ($xmlCertAlias)    { $xmlCertAlias    } else { "(not found)" }))
+            Log "------------------------------------------"
+        } catch {
+            Log "WARNING: Could not parse server.xml: $($_.Exception.Message)"
+        }
+    } else {
+        Log "No existing server.xml found — using parameter defaults."
+    }
+
+    # Apply extracted values, falling back to passed-in parameters
+    if ($xmlHttpsPort)    { $HttpsPort    = [int]$xmlHttpsPort }
+    if ($xmlKeystorePass) { $KeystorePass = $xmlKeystorePass   }
+    if ($xmlCertAlias)    { $CertAlias    = $xmlCertAlias      }
+
+    if ($xmlKeystoreFile) {
+        $resolvedPath = $xmlKeystoreFile `
+            -replace '\$\{catalina\.home\}', $TomcatHome `
+            -replace '\$\{catalina\.base\}', $TomcatHome
+        $keystoreFile = [System.IO.Path]::ChangeExtension($resolvedPath, ".p12")
+    } else {
+        $keystoreFile = Join-Path $confDir "keystore.p12"
+    }
+
+    Log "Effective settings (used for cert generation):"
+    Log "  HTTPS Port    : $HttpsPort"
+    Log "  Keystore File : $keystoreFile"
+    Log "  Keystore Pass : ********"
+    Log "  Cert Alias    : $CertAlias"
+
+    # ── 4. Pre-flight backup ──────────────────────────────────────────────────
     $backupStamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $backupDir   = Join-Path $TomcatHome ("conf\_backup_" + $backupStamp)
     New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
     Log "Backup directory: $backupDir"
 
-    $filesToBackup = @(
+    foreach ($f in @(
         (Join-Path $confDir "server.xml"),
         (Join-Path $confDir "web.xml"),
         (Join-Path $confDir "context.xml"),
+        (Join-Path $confDir "keystore.p12"),
         (Join-Path $confDir "keystore.jks")
-    )
-    foreach ($f in $filesToBackup) {
+    )) {
         if (Test-Path $f) {
             Copy-Item $f $backupDir -Force
             Log "  Backed up: $f"
@@ -365,53 +616,75 @@ $configureScript = {
     }
     Log "Backup complete."
 
-    # ── 5. Generate self-signed JKS certificate ──────────────────────────────
-    if (Test-Path $keystoreFile) {
-        Log "Existing keystore found — removing for fresh generation."
-        Remove-Item $keystoreFile -Force
+    # ── 5. Generate self-signed PKCS12 certificate ────────────────────────────
+    foreach ($old in @(
+        (Join-Path $confDir "keystore.p12"),
+        (Join-Path $confDir "keystore.jks")
+    )) {
+        if (Test-Path $old) {
+            Log "Removing existing keystore: $old"
+            Remove-Item $old -Force
+        }
     }
 
     $dname = "CN=$CertCN, OU=$CertOU, O=$CertO, L=$CertL, ST=$CertST, C=$CertC"
-    Log "Generating self-signed cert: $dname"
+    Log "Generating self-signed PKCS12 cert: $dname"
 
-    # Use the call operator (&) instead of Start-Process so PowerShell handles
-    # argument quoting correctly — Start-Process splits on spaces/commas inside
-    # the -dname value, breaking the distinguished name into separate tokens.
-    $keytoolErr = "$env:TEMP\keytool_err.txt"
-    & $keytool -genkeypair `
-        -alias     $CertAlias `
-        -keyalg    RSA `
-        -keysize   2048 `
-        -validity  $CertValidDays `
-        -keystore  $keystoreFile `
-        -storepass $KeystorePass `
-        -keypass   $KeystorePass `
-        -dname     $dname `
-        -storetype JKS 2> $keytoolErr
+    # Build SAN extension — deduplicate using a List, avoid pipeline edge cases in PS 5.1
+    $sanEntryList = New-Object System.Collections.Generic.List[string]
+    $seenSans     = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $SanList.Length; $i++) {
+        $entry = $SanList[$i].Trim()
+        if ($entry -ne '' -and (-not $seenSans.Contains($entry))) {
+            $sanEntryList.Add("dns:$entry")
+            $seenSans.Add($entry)
+        }
+    }
+    if ($sanEntryList.Count -eq 0) { $sanEntryList.Add("dns:$CertCN") }
+    $sanExt = "SAN=" + ($sanEntryList.ToArray() -join ",")
+    Log "SAN extension : $sanExt"
 
+    # PS 5.1: pass args as an array to & operator — avoids quoting issues with
+    # -dname value which contains commas and spaces
+    $keytoolErr  = Join-Path $env:TEMP "keytool_err.txt"
+    $keytoolArgs = @(
+        "-genkeypair",
+        "-alias",     $CertAlias,
+        "-keyalg",    "RSA",
+        "-keysize",   "2048",
+        "-validity",  "$CertValidDays",
+        "-keystore",  $keystoreFile,
+        "-storepass", $KeystorePass,
+        "-keypass",   $KeystorePass,
+        "-dname",     $dname,
+        "-storetype", "PKCS12",
+        "-ext",       $sanExt
+    )
+    & $keytool $keytoolArgs 2>$keytoolErr
     $keytoolExit = $LASTEXITCODE
+
     if ($keytoolExit -ne 0) {
-        $errText = Get-Content $keytoolErr -Raw -ErrorAction SilentlyContinue
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="keytool failed (exit $keytoolExit): $errText" }
+        $errText = ""
+        if (Test-Path $keytoolErr) { $errText = Get-Content $keytoolErr -Raw }
+        return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="keytool failed (exit $keytoolExit): $errText" }
     }
     if (-not (Test-Path $keystoreFile)) {
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="Keystore file was not created." }
+        return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="Keystore file was not created." }
     }
-    Log "Keystore created successfully."
+    Log "PKCS12 keystore created successfully."
 
-    # ── 6. Edit server.xml ───────────────────────────────────────────────────
-    $serverXml = Join-Path $confDir "server.xml"
+    # ── 6. Edit server.xml ────────────────────────────────────────────────────
     if (-not (Test-Path $serverXml)) {
-        return [PSCustomObject]@{ Success=$false; Log=$log; Error="server.xml not found at $serverXml" }
+        return [PSCustomObject]@{ Success=$false; Log=$logList.ToArray(); Error="server.xml not found at $serverXml" }
     }
 
-    [xml]$xml = Get-Content $serverXml -Raw
+    [xml]$xml = Get-Content $serverXml -Raw -Encoding UTF8
 
-    # 6a. Update redirectPort on the HTTP connector
+    # 6a. Update redirectPort on HTTP connector
     $httpConn = $xml.Server.Service.Connector |
                 Where-Object { ($_.port -eq "80" -or $_.port -eq "8080") -and $_.SSLEnabled -ne "true" } |
                 Select-Object -First 1
-    if ($httpConn) {
+    if ($null -ne $httpConn) {
         $httpConn.redirectPort = "$HttpsPort"
         Log "Updated redirectPort on HTTP connector (port $($httpConn.port)) to $HttpsPort"
     } else {
@@ -419,14 +692,14 @@ $configureScript = {
     }
 
     # 6b. Remove any existing connector on this HTTPS port
-    $xmlSvc = $xml.Server.Service
+    $xmlSvc        = $xml.Server.Service
     $existingHttps = @($xmlSvc.Connector | Where-Object { $_.port -eq "$HttpsPort" })
     foreach ($old in $existingHttps) {
         Log "Removing existing Connector on port $HttpsPort"
         $xmlSvc.RemoveChild($old) | Out-Null
     }
 
-    # 6c. Build new Tomcat 10.1 HTTPS Connector
+    # 6c. Build new HTTPS Connector (Tomcat 10.1 / PKCS12)
     $newConn = $xml.CreateElement("Connector")
     $newConn.SetAttribute("port",              "$HttpsPort")
     $newConn.SetAttribute("protocol",          "org.apache.coyote.http11.Http11NioProtocol")
@@ -440,16 +713,17 @@ $configureScript = {
     $certificate   = $xml.CreateElement("Certificate")
     $certificate.SetAttribute("certificateKeystoreFile",     $keystoreFile)
     $certificate.SetAttribute("certificateKeystorePassword", $KeystorePass)
+    $certificate.SetAttribute("certificateKeystoreType",     "PKCS12")
     $certificate.SetAttribute("certificateKeyAlias",         $CertAlias)
     $certificate.SetAttribute("type",                        "RSA")
 
     $sslHostConfig.AppendChild($certificate) | Out-Null
     $newConn.AppendChild($sslHostConfig)     | Out-Null
     $xmlSvc.AppendChild($newConn)            | Out-Null
-    Log "Added HTTPS Connector on port $HttpsPort to server.xml"
+    Log "Added HTTPS Connector (PKCS12) on port $HttpsPort to server.xml"
 
-    # 6d. Save server.xml
-    $xmlSettings = New-Object System.Xml.XmlWriterSettings
+    # 6d. Save server.xml with UTF-8 encoding preserved
+    $xmlSettings                    = New-Object System.Xml.XmlWriterSettings
     $xmlSettings.Indent             = $true
     $xmlSettings.IndentChars        = "  "
     $xmlSettings.Encoding           = [System.Text.Encoding]::UTF8
@@ -460,13 +734,15 @@ $configureScript = {
     $xmlWriter.Close()
     Log "server.xml saved."
 
-    # ── 7. Optionally restart Tomcat ─────────────────────────────────────────
+    # ── 7. Optionally restart Tomcat ──────────────────────────────────────────
     $restartNote = ""
     if ($DoRestart) {
-        $tomcatWmi = Get-WmiObject Win32_Service -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" -ErrorAction SilentlyContinue |
-                     Select-Object -First 1
-        $svc = if ($tomcatWmi) { Get-Service -Name $tomcatWmi.Name -ErrorAction SilentlyContinue } else { $null }
-        if ($svc) {
+        $wmi = Get-WmiObject Win32_Service `
+               -Filter "Description LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" `
+               -ErrorAction SilentlyContinue | Select-Object -First 1
+        $svc = $null
+        if ($null -ne $wmi) { $svc = Get-Service -Name $wmi.Name -ErrorAction SilentlyContinue }
+        if ($null -ne $svc) {
             Log "Restarting Tomcat service: $($svc.Name) ..."
             Restart-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
@@ -483,7 +759,7 @@ $configureScript = {
 
     return [PSCustomObject]@{
         Success      = $true
-        Log          = $log
+        Log          = $logList.ToArray()
         Error        = $null
         TomcatHome   = $TomcatHome
         KeystoreFile = $keystoreFile
@@ -494,42 +770,79 @@ $configureScript = {
 }
 #endregion Configure scriptblock
 
-# ============================================================================
+# =============================================================================
 # MAIN LOOP — one iteration per server
-# ============================================================================
+# =============================================================================
 foreach ($ComputerName in $servers) {
 
-    # ── Detect localhost ─────────────────────────────────────────────────────
-    $localNames = @(
-        "localhost", "127.0.0.1", "::1",
-        $env:COMPUTERNAME,
-        ($env:COMPUTERNAME + "." + $env:USERDNSDOMAIN)
+    # ── Detect if this server entry matches the machine running the script ───
+    # servers.txt contains real hostnames only — no localhost/127.0.0.1 entries.
+    # Detection works by comparing the listed server name against the current
+    # machine's short name and FQDN. When matched, all operations run in-process
+    # (no PSSession needed) and file/service operations execute directly.
+    $MachineFQDN = $env:COMPUTERNAME
+    try { $MachineFQDN = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName } catch {}
+
+    # Normalize to lowercase for case-insensitive comparison (PS 5.1 safe)
+    $ComputerNameLower = $ComputerName.ToLower()
+
+    [string[]]$localNames = @(
+        $env:COMPUTERNAME.ToLower(),
+        $MachineFQDN.ToLower()
     )
-    $isLocal = $localNames -contains $ComputerName
+    if ($env:USERDNSDOMAIN) {
+        $localNames += ($env:COMPUTERNAME + "." + $env:USERDNSDOMAIN).ToLower()
+    }
 
-    # ── Resolve FQDN for cert CN ─────────────────────────────────────────────
-    $CertCN = $ComputerName
-    try { $CertCN = [System.Net.Dns]::GetHostEntry($ComputerName).HostName } catch {}
+    $isLocal = $localNames -contains $ComputerNameLower
 
-    $localTag = if ($isLocal) { "  [LOCAL]" } else { "" }
-    Write-Status "----------------------------------------" -Color DarkCyan
-    Write-Status "Server  : $ComputerName  (CN: $CertCN)$localTag" -Color Cyan
-
-    # ── Open PSSession (remote only) ─────────────────────────────────────────
-    $session = $null
+    # ── Resolve FQDN for cert CN / SAN / SSL test ────────────────────────────
+    # Always resolve to the true FQDN regardless of how the server was listed.
+    # If running locally, use the already-resolved MachineFQDN directly.
     if ($isLocal) {
-        Write-Status "  Running locally (no PSSession needed)." -Color Gray
+        $ServerFQDN = $MachineFQDN
     } else {
+        $ServerFQDN = $ComputerName
+        try { $ServerFQDN = [System.Net.Dns]::GetHostEntry($ComputerName).HostName } catch {}
+    }
+
+    # Cluster mode : CN = CS instance name, SANs = all nodes from servers.txt
+    # Standalone   : CN = this server FQDN,  SAN  = this server only
+    if ($IsCluster) {
+        $CertCN     = $CSInstanceName
+        [string[]]$ServerSANs = $AllSANs
+    } else {
+        $CertCN     = $ServerFQDN
+        [string[]]$ServerSANs = @($ServerFQDN)
+    }
+
+    # PS 5.1: serialize SAN array as pipe-delimited string so it survives
+    # Invoke-Command -ArgumentList without being flattened or lost
+    $SanListJoined = $ServerSANs -join "|"
+
+    $localTag = if ($isLocal) { "  [RUNNING LOCALLY]" } else { "" }
+    Write-Status "----------------------------------------" -Color DarkCyan
+    Write-Status "Server  : $ComputerName  (FQDN: $ServerFQDN)$localTag" -Color Cyan
+    if ($isLocal) {
+        Write-Status "  Script is running on this server — no PSSession required." -Color Gray
+    }
+    if ($IsCluster) {
+        Write-Status "SANs    : $($ServerSANs -join ', ')" -Color DarkCyan
+    }
+
+    # ── Open PSSession (remote only) ──────────────────────────────────────────
+    $session = $null
+    if (-not $isLocal) {
         try {
             $session = New-PSSession -ComputerName $ComputerName @sessionParams
         } catch {
-            Write-Status "  ERROR: Could not open PSSession - $_" -Color Red
-            $summary.Add([PSCustomObject]@{ Server=$ComputerName; Status="SESSION FAILED"; Detail=$_.ToString() })
+            Write-Status "  ERROR: Could not open PSSession - $($_.Exception.Message)" -Color Red
+            $summary.Add([PSCustomObject]@{ Server=$ComputerName; Status="SESSION FAILED"; Detail=$_.Exception.Message })
             continue
         }
     }
 
-    # ── ROLLBACK ─────────────────────────────────────────────────────────────
+    # ── ROLLBACK ──────────────────────────────────────────────────────────────
     if ($Rollback) {
         $rbArgs = @($TomcatHome, $RollbackDir, $RestartTomcat.IsPresent)
         if ($isLocal) {
@@ -539,7 +852,7 @@ foreach ($ComputerName in $servers) {
             Remove-PSSession $session -ErrorAction SilentlyContinue
         }
 
-        Write-Status ""
+        Write-Host ""
         if ($rbResult.Success) {
             Write-Status "=== ROLLBACK COMPLETE : $ComputerName ===" -Color Green
             Write-Status "Restored from : $($rbResult.RollbackDir)"  -Color Cyan
@@ -551,18 +864,20 @@ foreach ($ComputerName in $servers) {
             Write-Status $rbResult.Error -Color Red
             $summary.Add([PSCustomObject]@{ Server=$ComputerName; Status="ROLLBACK FAILED"; Detail=$rbResult.Error })
         }
-        Write-Status ""
-        Write-Status "--- Remote log ---" -Color Gray
+        Write-Host ""
+        Write-Status "--- Execution log ---" -Color Gray
         foreach ($line in $rbResult.Log) { Write-Status "  $line" -Color Gray }
         continue
     }
 
-    # ── CONFIGURE ────────────────────────────────────────────────────────────
+    # ── CONFIGURE ─────────────────────────────────────────────────────────────
     $cfgArgs = @(
         $TomcatHome, $KeystorePass, $CertAlias, $CertCN,
         $CertOU, $CertO, $CertL, $CertST, $CertC,
-        $CertValidDays, $HttpsPort, $RestartTomcat.IsPresent
+        $CertValidDays, $HttpsPort, $RestartTomcat.IsPresent,
+        $SanListJoined   # pipe-delimited string — safe across PS 5.1 remoting
     )
+
     if ($isLocal) {
         $result = Invoke-Command -ScriptBlock $configureScript -ArgumentList $cfgArgs
     } else {
@@ -570,41 +885,153 @@ foreach ($ComputerName in $servers) {
         Remove-PSSession $session -ErrorAction SilentlyContinue
     }
 
-    Write-Status ""
+    Write-Host ""
     if ($result.Success) {
         Write-Status "=== SUCCESS : $ComputerName ===" -Color Green
-        Write-Status "Tomcat Home   : $($result.TomcatHome)"   -Color Cyan
+        Write-Status "Tomcat Home   : $($result.TomcatHome)"    -Color Cyan
         Write-Status "Keystore      : $($result.KeystoreFile)"  -Color Cyan
-        Write-Status "HTTPS Port    : $($result.HttpsPort)"     -Color Cyan
-        Write-Status "Backup Dir    : $($result.BackupDir)"     -Color Cyan
+        Write-Status "Keystore Type : PKCS12"                    -Color Cyan
+        Write-Status "CN            : $CertCN"                   -Color Cyan
+        Write-Status "SANs          : $($ServerSANs -join ', ')" -Color Cyan
+        Write-Status "HTTPS Port    : $($result.HttpsPort)"      -Color Cyan
+        Write-Status "Backup Dir    : $($result.BackupDir)"      -Color Cyan
         Write-Status "  Rollback cmd: .\Configure-TomcatSSL.ps1 -Rollback [-RollbackDir '<path>'] [-RestartTomcat]" -Color DarkCyan
         if ($result.RestartNote) { Write-Status $result.RestartNote -Color Yellow }
-        $summary.Add([PSCustomObject]@{ Server=$ComputerName; Status="OK"; Detail=$result.BackupDir })
+
+        # ── Cluster: verify SSL then prompt before next node ──────────────────
+        if ($IsCluster) {
+            $testPort = if ($result.HttpsPort) { [int]$result.HttpsPort } else { $HttpsPort }
+
+            # When running locally, connect via 127.0.0.1 — avoids any DNS
+            # round-trip and is the most reliable loopback path in PS 5.1
+            $testHost = if ($isLocal) { "127.0.0.1" } else { $ServerFQDN }
+
+            Write-Host ""
+            Write-Status "Verifying SSL on $testHost : $testPort ..." -Color Gray
+
+            # Give Tomcat up to 20s to finish starting if it was just restarted
+            if ($RestartTomcat.IsPresent) { Start-Sleep -Seconds 10 }
+
+            $sslTest = Test-SSLConnection -HostName $testHost -Port $testPort -TimeoutSeconds 20
+
+            if ($sslTest.Success) {
+                Write-Status "  SSL OK  : Connected successfully"           -Color Green
+                Write-Status "  Subject : $($sslTest.SubjectCN)"           -Color Green
+                Write-Status "  Expires : $($sslTest.Expiry)"              -Color Green
+                Write-Status "  Protocol: $($sslTest.Protocol)"            -Color Green
+                $summary.Add([PSCustomObject]@{ Server=$ComputerName; Status="OK"; Detail=$result.BackupDir })
+            } else {
+                Write-Status "  SSL WARN: Could not verify — $($sslTest.Error)" -Color Yellow
+                Write-Status "  This may be normal if Tomcat restart is pending or port is firewalled." -Color Yellow
+                $summary.Add([PSCustomObject]@{ Server=$ComputerName; Status="OK (SSL unverified)"; Detail=$result.BackupDir })
+            }
+
+            # Prompt for next action — only if more servers remain
+            $remainingServers = @($servers | Where-Object { $_ -ne $ComputerName })
+            if ($remainingServers.Count -gt 0) {
+                Write-Host ""
+                Write-Status "Next server: $($remainingServers[0])" -Color Cyan
+                Write-Host ""
+
+                [string]$clusterAction = ""
+                while ($clusterAction -notmatch '^[CcRrAa]$') {
+                    Write-Host "  [C] Continue to next server" -ForegroundColor White
+                    Write-Host "  [R] Rollback this server and stop" -ForegroundColor Yellow
+                    Write-Host "  [A] Abort — stop without touching remaining servers" -ForegroundColor Red
+                    Write-Host ""
+                    $clusterAction = Read-Host "Action"
+                }
+
+                if ($clusterAction -match '^[Rr]$') {
+                    # ── Rollback this node ────────────────────────────────────
+                    Write-Host ""
+                    Write-Status "Rolling back $ComputerName ..." -Color Yellow
+                    $rbRes = Invoke-NodeRollback `
+                        -ComputerName  $ComputerName `
+                        -TomcatHome    $TomcatHome `
+                        -RollbackDir   $result.BackupDir `
+                        -DoRestart     $RestartTomcat.IsPresent `
+                        -RollbackScript $rollbackScript `
+                        -SessionParams $sessionParams `
+                        -IsLocal       $isLocal
+
+                    if ($rbRes.Success) {
+                        Write-Status "Rollback complete: $ComputerName" -Color Green
+                        # Update summary entry
+                        $existingEntry = $summary | Where-Object { $_.Server -eq $ComputerName }
+                        if ($null -ne $existingEntry) { $existingEntry.Status = "ROLLED BACK" }
+                    } else {
+                        Write-Status "Rollback failed: $($rbRes.Error)" -Color Red
+                        $existingEntry = $summary | Where-Object { $_.Server -eq $ComputerName }
+                        if ($null -ne $existingEntry) { $existingEntry.Status = "ROLLBACK FAILED" }
+                    }
+                    Write-Status "Stopping cluster update." -Color Yellow
+                    break   # exit the foreach loop
+
+                } elseif ($clusterAction -match '^[Aa]$') {
+                    # ── Abort — leave this node as-is, skip remaining ─────────
+                    Write-Host ""
+                    Write-Status "Aborted. Remaining servers not updated: $($remainingServers -join ', ')" -Color Yellow
+                    foreach ($skip in $remainingServers) {
+                        $summary.Add([PSCustomObject]@{ Server=$skip; Status="SKIPPED (aborted)"; Detail="" })
+                    }
+                    break   # exit the foreach loop
+                }
+                # else [C] — fall through to next iteration
+            } else {
+                # Last server — no prompt needed
+                Write-Host ""
+                Write-Status "All cluster nodes processed." -Color Green
+            }
+
+        } else {
+            # Standalone mode — just record success, no prompt
+            $summary.Add([PSCustomObject]@{ Server=$ComputerName; Status="OK"; Detail=$result.BackupDir })
+        }
+
     } else {
         Write-Status "=== FAILED : $ComputerName ===" -Color Red
         Write-Status $result.Error -Color Red
         $summary.Add([PSCustomObject]@{ Server=$ComputerName; Status="FAILED"; Detail=$result.Error })
+
+        # In cluster mode a failed node should prompt to abort or continue
+        if ($IsCluster) {
+            $remainingServers = @($servers | Where-Object { $_ -ne $ComputerName })
+            if ($remainingServers.Count -gt 0) {
+                Write-Host ""
+                [string]$failAction = ""
+                while ($failAction -notmatch '^[CcAa]$') {
+                    Write-Host "  [C] Continue to next server anyway" -ForegroundColor Yellow
+                    Write-Host "  [A] Abort — stop without touching remaining servers" -ForegroundColor Red
+                    $failAction = Read-Host "Action"
+                }
+                if ($failAction -match '^[Aa]$') {
+                    foreach ($skip in $remainingServers) {
+                        $summary.Add([PSCustomObject]@{ Server=$skip; Status="SKIPPED (aborted)"; Detail="" })
+                    }
+                    break
+                }
+            }
+        }
     }
 
-    Write-Status ""
-    Write-Status "--- Remote log ---" -Color Gray
+    $logLabel = if ($isLocal) { "--- Local execution log ---" } else { "--- Remote execution log ---" }
+    Write-Host ""
+    Write-Status $logLabel -Color Gray
     foreach ($line in $result.Log) { Write-Status "  $line" -Color Gray }
 
 } # end foreach server
 
 # ── Final summary ─────────────────────────────────────────────────────────────
-Write-Status ""
+Write-Host ""
 Write-Status "=======================================" -Color Cyan
 Write-Status "  SUMMARY  ($($servers.Count) server(s) processed)" -Color Cyan
 Write-Status "=======================================" -Color Cyan
 foreach ($row in $summary) {
     $color = "Yellow"
-    if ($row.Status -eq "OK" -or $row.Status -eq "ROLLED BACK") {
-        $color = "Green"
-    }
-    if ($row.Status -eq "FAILED" -or $row.Status -eq "ROLLBACK FAILED" -or $row.Status -eq "SESSION FAILED") {
-        $color = "Red"
-    }
+    if ($row.Status -eq "OK"     -or $row.Status -eq "ROLLED BACK")      { $color = "Green" }
+    if ($row.Status -eq "FAILED" -or $row.Status -eq "ROLLBACK FAILED" `
+        -or $row.Status -eq "SESSION FAILED")                             { $color = "Red"   }
     Write-Status ("  {0,-40} [{1}]  {2}" -f $row.Server, $row.Status, $row.Detail) -Color $color
 }
 Write-Status "=======================================" -Color Cyan
