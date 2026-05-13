@@ -1,46 +1,34 @@
-At C:\DLA-FAILSAFE\patching\newcert.ps1:300 char:47
-+                   -Filter "Description LIKE '%Tomcat%' OR DisplayName ...
-+                                               ~
-You must provide a value expression following the '%' operator.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:300 char:47
-+ ... tion LIKE '%Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%To ...
-+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Unexpected token 'Tomcat%' OR DisplayName LIKE '%Tomcat%' OR Name LIKE '%Tomcat%'" `
-                  -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $svcObj -and $svcObj.PathName) {
-            $exe  = ($svcObj.PathName -replace '^"?([^"]+\.exe' in expression or statement.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:212 char:47
-+                 foreach ($svc in $csServices) {
-+                                               ~
-Missing closing '}' in statement block or type definition.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:193 char:29
-+             $detectScript = {
-+                             ~
-Missing closing '}' in statement block or type definition.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:176 char:35
-+         if (-not $CSInstanceName) {
-+                                   ~
-Missing closing '}' in statement block or type definition.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:175 char:21
-+     if ($IsCluster) {
-+                     ~
-Missing closing '}' in statement block or type definition.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:169 char:21
-+ if (-not $Rollback) {
-+                     ~
-Missing closing '}' in statement block or type definition.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:303 char:63
-+ ...           $exe  = ($svcObj.PathName -replace '^"?([^"]+\.exe).*$','$1 ...
-+                                                                 ~
-Unexpected token ')' in expression or statement.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:458 char:54
-+             $exe  = ($svcObj.PathName -replace '^"?([^"]+\.exe).*$',' ...
-+                                                      ~
-Missing type name after '['.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:781 char:81
-+ ... ne's short name and FQDN. When matched, all operations run in-process
-+                                                                          ~
-Missing closing ')' in expression.
-Not all parse errors were reported.  Correct the reported errors and try again.
-    + CategoryInfo          : ParserError: (:) [], ParseException
-    + FullyQualifiedErrorId : ExpectedValueExpression
+ │  CLUSTER PAUSE — server 1 of 4 complete                 │
+  │  Completed : AZASVWPP049.dir.ad.dla.mil
+  │  Next      : AZASVWPP048.dir.ad.dla.mil
+  ├─────────────────────────────────────────────────────┤
+  │  [ENTER] Next     [R] Rollback all   [Q] Quit      │
+  └─────────────────────────────────────────────────────┘
+
+Exception calling "ReadKey" with "1" argument(s): "The method or operation is not implemented."
+At C:\DLA-FAILSAFE\patching\newcert.ps1:527 char:9
++         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [], MethodInvocationException
+    + FullyQualifiedErrorId : NotImplementedException
+ 
+You cannot call a method on a null-valued expression.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:527 char:9
++         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
+    + FullyQualifiedErrorId : InvokeMethodOnNull
+ 
+Exception calling "ReadKey" with "1" argument(s): "The method or operation is not implemented."
+At C:\DLA-FAILSAFE\patching\newcert.ps1:527 char:9
++         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [], MethodInvocationException
+    + FullyQualifiedErrorId : NotImplementedException
+ 
+You cannot call a method on a null-valued expression.
+At C:\DLA-FAILSAFE\patching\newcert.ps1:527 char:9
++         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
+    + FullyQualifiedErrorId : InvokeMethodOnNull
