@@ -1,0 +1,797 @@
+# ============================================================
+# Tomcat Remote Deployment Script
+# ============================================================
+# Prerequisites:
+#   - WinRM enabled on target servers (Enable-PSRemoting)
+#   - Script must be run as Administrator
+#   - $NewVersionPath pointing to the new Tomcat install source
+#   - servers.txt in same directory as script (one server per line)
+# ============================================================
+
+param(
+    [string]$NewVersionPath = "$PSScriptRoot\NewVersion",
+    [string]$ServersFile    = "$PSScriptRoot\servers.txt",
+    [int]$ThrottleLimit     = 5
+)
+
+# Verify the script is running as Administrator
+$currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "[ERROR] This script must be run as Administrator." -ForegroundColor Red
+    exit 1
+}
+
+# ---------- Service to Install Dir Fallback Candidates ----------
+$ServiceMapCandidates = @(
+    "E:\Customers\dacs\shared\tomcat10",
+    "E:\Customers\dacs\shared\tomcat9",
+    "E:\Customers\dacs\shared\tomcat85",
+    "E:\Customers\dacs\shared\tomcat"
+)
+
+# ---------- Logging ----------
+$LogFile = "$PSScriptRoot\TomcatDeploy_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
+$LogLock = [System.Threading.Mutex]::new($false, "TomcatDeployLog")
+
+function Write-Log {
+    param([string]$Msg, [string]$Level = "INFO", [string]$Server = "")
+    $ts     = Get-Date -f "yyyy-MM-dd HH:mm:ss"
+    $prefix = if ($Server) { "[$Server] " } else { "" }
+    $line   = "[$ts] [$Level] $prefix$Msg"
+    $color  = switch ($Level) {
+        "ERROR" { "Red"    }
+        "WARN"  { "Yellow" }
+        "OK"    { "Green"  }
+        default { "Cyan"   }
+    }
+    $null = $LogLock.WaitOne()
+    try {
+        Write-Host $line -ForegroundColor $color
+        Add-Content -Path $LogFile -Value $line
+    } finally {
+        $LogLock.ReleaseMutex()
+    }
+}
+
+# ---------- Validate inputs ----------
+if (-not (Test-Path $ServersFile)) {
+    Write-Log "Servers file not found: $ServersFile" "ERROR"; exit 1
+}
+if (-not (Test-Path $NewVersionPath)) {
+    Write-Log "New version path not found: $NewVersionPath" "ERROR"; exit 1
+}
+
+$servers = Get-Content $ServersFile | Where-Object { $_.Trim() -ne "" -and $_ -notmatch "^#" }
+Write-Log "Loaded $($servers.Count) server(s) from $ServersFile"
+Write-Log "Running with throttle limit of $ThrottleLimit parallel server(s)"
+
+# ============================================================
+# Deduplication: keyed "HOSTNAME::InstallDir" (lowercase)
+# ============================================================
+$deployedKeys = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+
+# ============================================================
+# Pre-flight checks
+# ============================================================
+Write-Log "========== Pre-flight checks =========="
+
+$localNames = @(
+    "localhost", "127.0.0.1", "::1",
+    $env:COMPUTERNAME,
+    (($env:COMPUTERNAME + "." + $env:USERDNSDOMAIN).TrimEnd('.'))
+)
+
+$preflight   = @{ Pass = 0; Warn = 0; Fail = 0 }
+$skipServers = [System.Collections.Generic.List[string]]::new()
+
+# ---- 1. Detect new version from NewVersion folder ----
+Write-Log "Detecting Tomcat version in NewVersion folder..."
+$newVersion = $null
+
+$releaseNotes = @("RELEASE-NOTES", "CHANGELOG.md", "CHANGELOG") |
+    ForEach-Object { Join-Path $NewVersionPath $_ } |
+    Where-Object   { Test-Path $_ } |
+    Select-Object  -First 1
+
+if ($releaseNotes) {
+    $versionLine = Get-Content $releaseNotes -TotalCount 20 |
+        Select-String -Pattern "(\d+\.\d+\.\d+)" |
+        Select-Object -First 1
+    if ($versionLine) {
+        $newVersion = $versionLine.Matches[0].Value
+        Write-Log "Detected new version $newVersion from $(Split-Path $releaseNotes -Leaf)." "OK"
+    }
+}
+
+if (-not $newVersion) {
+    $catalinaJar = Join-Path $NewVersionPath "lib\catalina.jar"
+    if (Test-Path $catalinaJar) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        try {
+            $zip      = [System.IO.Compression.ZipFile]::OpenRead($catalinaJar)
+            $manifest = $zip.Entries | Where-Object { $_.FullName -eq "META-INF/MANIFEST.MF" }
+            if ($manifest) {
+                $reader  = [System.IO.StreamReader]::new($manifest.Open())
+                $content = $reader.ReadToEnd()
+                $reader.Close()
+                $match = [regex]::Match($content, "Implementation-Version:\s*(\d+\.\d+\.\d+)")
+                if ($match.Success) {
+                    $newVersion = $match.Groups[1].Value
+                    Write-Log "Detected new version $newVersion from catalina.jar manifest." "OK"
+                }
+            }
+            $zip.Dispose()
+        } catch {
+            Write-Log "Could not read catalina.jar manifest: $_" "WARN"
+        }
+    }
+}
+
+if (-not $newVersion) {
+    Write-Log "Could not determine new Tomcat version. Version comparison will be skipped." "WARN"
+    $preflight.Warn++
+} else {
+    Write-Log "New deployment version: $newVersion"
+}
+
+# ---- 2. Protected config file check in NewVersion\conf ----
+Write-Log "Checking NewVersion\conf for protected config files..."
+$protectedFiles = @("web.xml", "server.xml", "tomcat-users.xml", "tomcat-users.xsd")
+$confPath = Join-Path $NewVersionPath "conf"
+
+if (-not (Test-Path $confPath)) {
+    Write-Log "NewVersion\conf directory not found - skipping config file check." "WARN"
+    $preflight.Warn++
+} else {
+    $renamed = 0
+    foreach ($file in $protectedFiles) {
+        $filePath = Join-Path $confPath $file
+        if (Test-Path $filePath) {
+            try {
+                Rename-Item -Path $filePath -NewName ($file + ".new") -ErrorAction Stop
+                Write-Log "Renamed '$file' to '$file.new' in NewVersion\conf." "WARN"
+                $preflight.Warn++
+                $renamed++
+            } catch {
+                Write-Log "Failed to rename '$file' in NewVersion\conf: $_" "ERROR"
+                $preflight.Fail++
+            }
+        }
+    }
+    if ($renamed -eq 0) {
+        Write-Log "NewVersion\conf - no protected config files found." "OK"
+        $preflight.Pass++
+    }
+}
+
+# ---- Helper: canonical service description ----
+function Get-CanonicalDescription {
+    param([string]$version)
+    $short = ($version -split "\.")[0..1] -join "."
+    return "Apache Tomcat $short Server - https://tomcat.apache.org/"
+}
+
+# ---- Scriptblock: update service description via registry ----
+$updateDescBlock = {
+    param($svcName, $newDesc)
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName"
+    Set-ItemProperty -Path $regPath -Name "Description" -Value $newDesc -ErrorAction Stop
+}
+
+# ---- Scriptblock: enumerate all Tomcat services and install dirs ----
+$enumSvcsBlock = {
+    param($candidates)
+
+    $svcs = @(Get-Service -Name "*Tomcat*" -ErrorAction SilentlyContinue)
+    if ($svcs.Count -eq 0) {
+        $svcs = @(Get-Service -DisplayName "*Apache Tomcat*" -ErrorAction SilentlyContinue)
+    }
+
+    $results  = @()
+    $seenDirs = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+
+    foreach ($svc in $svcs) {
+        $installDir  = $null
+        $regPath     = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
+        $props       = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+        $imagePath   = $props.ImagePath
+        $description = $props.Description
+
+        if ($imagePath) {
+            $exePath    = $imagePath.Trim('"').Split(" ")[0]
+            $tomcatRoot = Split-Path (Split-Path $exePath -Parent) -Parent
+            if ((Test-Path "$tomcatRoot\bin") -and (Test-Path "$tomcatRoot\lib")) {
+                $installDir = $tomcatRoot
+            }
+        }
+
+        if (-not $installDir) {
+            foreach ($c in $candidates) {
+                if ((Test-Path "$c\bin") -and (Test-Path "$c\lib")) {
+                    $installDir = $c; break
+                }
+            }
+        }
+
+        if (-not $installDir) { continue }
+
+        $normalizedDir = $installDir.TrimEnd("\").ToLower()
+        if ($seenDirs.Contains($normalizedDir)) { continue }
+        $null = $seenDirs.Add($normalizedDir)
+
+        $installedVersion = $null
+        $jarPath = Join-Path $installDir "lib\catalina.jar"
+        if (Test-Path $jarPath) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            try {
+                $zip      = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
+                $manifest = $zip.Entries | Where-Object { $_.FullName -eq "META-INF/MANIFEST.MF" }
+                if ($manifest) {
+                    $reader  = [System.IO.StreamReader]::new($manifest.Open())
+                    $content = $reader.ReadToEnd()
+                    $reader.Close()
+                    $m = [regex]::Match($content, "Implementation-Version:\s*(\d+\.\d+\.\d+)")
+                    if ($m.Success) { $installedVersion = $m.Groups[1].Value }
+                }
+                $zip.Dispose()
+            } catch { }
+        }
+
+        $descVersion = $null
+        if ($description) {
+            $dm = [regex]::Match($description, "(\d+\.\d+\.\d+)")
+            if ($dm.Success) { $descVersion = $dm.Groups[1].Value }
+        }
+
+        $results += [PSCustomObject]@{
+            Name             = $svc.Name
+            DisplayName      = $svc.DisplayName
+            Description      = $description
+            DescVersion      = $descVersion
+            Status           = $svc.Status
+            InstallDir       = $installDir
+            NormalizedDir    = $normalizedDir
+            InstalledVersion = $installedVersion
+        }
+    }
+    return $results
+}
+
+# ---- 3. Per-server checks ----
+foreach ($s in ($servers | ForEach-Object { $_.Trim() })) {
+    $isLocalServer = $localNames -contains $s
+
+    if ($isLocalServer) {
+        Write-Log "$s - local machine, skipping ping check." "OK"
+    } elseif (Test-Connection -ComputerName $s -Count 1 -Quiet) {
+        Write-Log "$s - reachable." "OK"
+        $preflight.Pass++
+    } else {
+        Write-Log "$s - UNREACHABLE. Will be skipped at deployment time." "WARN"
+        $preflight.Warn++
+        continue
+    }
+
+    if (-not $isLocalServer) {
+        try {
+            $testSession = New-PSSession -ComputerName $s -ErrorAction Stop
+            Remove-PSSession $testSession
+            Write-Log "$s - WinRM session OK." "OK"
+            $preflight.Pass++
+        } catch {
+            Write-Log "$s - WinRM FAILED: $_" "ERROR"
+            $preflight.Fail++
+        }
+    }
+
+    $svcList = $null
+    if ($isLocalServer) {
+        $svcList = & $enumSvcsBlock $ServiceMapCandidates
+    } else {
+        try {
+            $svcList = Invoke-Command -ComputerName $s `
+                -ScriptBlock $enumSvcsBlock `
+                -ArgumentList (,$ServiceMapCandidates) -ErrorAction Stop
+        } catch {
+            Write-Log "$s - could not query services: $_" "WARN"
+            $preflight.Warn++
+            continue
+        }
+    }
+
+    if (-not $svcList -or $svcList.Count -eq 0) {
+        Write-Log "$s - WARNING: No Tomcat services detected. Will skip at deployment." "WARN"
+        $preflight.Warn++
+        continue
+    }
+
+    Write-Log "$s - Found $($svcList.Count) Tomcat service(s)."
+
+    foreach ($svcEntry in $svcList) {
+        $deployKey = ($s + "::" + $svcEntry.NormalizedDir).ToLower()
+
+        Write-Log "$s - Service: $($svcEntry.Name)  InstallDir: $($svcEntry.InstallDir)"
+
+        if ($deployedKeys.Contains($deployKey)) {
+            Write-Log "$s - $($svcEntry.InstallDir) already registered. Skipping duplicate." "WARN"
+            $preflight.Warn++
+            continue
+        }
+
+        if ($svcEntry.Status -ne "Running" -and [int]$svcEntry.Status -ne 4) {
+            Write-Log "$s - $($svcEntry.Name) is NOT running (Status: $($svcEntry.Status))." "WARN"
+            $preflight.Warn++
+        } else {
+            Write-Log "$s - $($svcEntry.Name) is Running." "OK"
+            $preflight.Pass++
+        }
+
+        if ($newVersion) {
+            $canonicalDesc = Get-CanonicalDescription $newVersion
+            if ($svcEntry.Description -ne $canonicalDesc) {
+                Write-Log "$s - $($svcEntry.Name) description needs update: [$($svcEntry.Description)] -> [$canonicalDesc]" "WARN"
+                try {
+                    if ($isLocalServer) {
+                        & $updateDescBlock $svcEntry.Name $canonicalDesc
+                    } else {
+                        Invoke-Command -ComputerName $s -ScriptBlock $updateDescBlock `
+                            -ArgumentList $svcEntry.Name, $canonicalDesc -ErrorAction Stop
+                    }
+                    Write-Log "$s - $($svcEntry.Name) description updated." "OK"
+                    $preflight.Pass++
+                } catch {
+                    Write-Log "$s - Failed to update description for $($svcEntry.Name): $_" "ERROR"
+                    $preflight.Fail++
+                }
+            } else {
+                Write-Log "$s - $($svcEntry.Name) description already canonical." "OK"
+                $preflight.Pass++
+            }
+        }
+
+        if ($newVersion -and $svcEntry.InstalledVersion) {
+            if ($svcEntry.InstalledVersion -eq $newVersion) {
+                Write-Log "$s - $($svcEntry.InstallDir) already on version $newVersion. Skipping." "WARN"
+                $preflight.Warn++
+                $skipServers.Add($deployKey)
+            } else {
+                Write-Log "$s - $($svcEntry.InstallDir) installed: $($svcEntry.InstalledVersion) -> new: $newVersion" "OK"
+                $preflight.Pass++
+                $null = $deployedKeys.Add($deployKey)
+            }
+        } elseif ($newVersion -and -not $svcEntry.InstalledVersion) {
+            Write-Log "$s - $($svcEntry.InstallDir) could not detect installed version. Including in deployment." "WARN"
+            $preflight.Warn++
+            $null = $deployedKeys.Add($deployKey)
+        } else {
+            $null = $deployedKeys.Add($deployKey)
+        }
+    }
+}
+
+Write-Log "Pre-flight complete - Pass: $($preflight.Pass)  Warn: $($preflight.Warn)  Fail: $($preflight.Fail)"
+
+if ($preflight.Fail -gt 0 -or $preflight.Warn -gt 0) {
+    $issueLines = Get-Content $LogFile | Where-Object { $_ -match "\[(ERROR|WARN)\]" }
+
+    Write-Host ""
+    Write-Host "  ============================================================" -ForegroundColor Yellow
+    Write-Host "  Pre-flight issues detected:" -ForegroundColor Yellow
+    Write-Host "  ============================================================" -ForegroundColor Yellow
+    foreach ($line in $issueLines) {
+        $color = if ($line -match "\[ERROR\]") { "Red" } else { "Yellow" }
+        Write-Host "  $line" -ForegroundColor $color
+    }
+    Write-Host "  ============================================================" -ForegroundColor Yellow
+    Write-Host ""
+
+    if ($preflight.Fail -gt 0) {
+        Write-Host "  $($preflight.Fail) ERROR(s) and $($preflight.Warn) WARNING(s) found." -ForegroundColor Red
+        Write-Host "  Errors may cause deployment failures or data loss." -ForegroundColor Red
+        Write-Host ""
+        $ans = Read-Host "  Continue deployment despite errors? (y/N)"
+        if ($ans.Trim() -notmatch "^[Yy]$") {
+            Write-Log "Deployment aborted by operator." "WARN"; exit 1
+        }
+        Write-Log "Operator chose to continue despite $($preflight.Fail) error(s)." "WARN"
+    } else {
+        Write-Host "  $($preflight.Warn) WARNING(s) found." -ForegroundColor Yellow
+        Write-Host ""
+        $ans = Read-Host "  Continue deployment? (y/N)"
+        if ($ans.Trim() -notmatch "^[Yy]$") {
+            Write-Log "Deployment aborted by operator." "WARN"; exit 1
+        }
+        Write-Log "Operator chose to continue with $($preflight.Warn) warning(s)." "WARN"
+    }
+} else {
+    Write-Log "All pre-flight checks passed." "OK"
+}
+
+Write-Log "========== Pre-flight checks complete =========="
+
+# ============================================================
+# Deploy scriptblock - runs inside each parallel job
+# ============================================================
+$DeployBlock = {
+    param($server, $installDir, $svcName, $NewVersionPath, $ServiceMapCandidates, $LogFile, $newVersion)
+
+    $LogLock = [System.Threading.Mutex]::new($false, "TomcatDeployLog")
+    function Write-Log {
+        param([string]$Msg, [string]$Level = "INFO")
+        $ts    = Get-Date -f "yyyy-MM-dd HH:mm:ss"
+        $label = $server + " " + $svcName
+        $line  = "[$ts] [$Level] [$label] $Msg"
+        $color = switch ($Level) {
+            "ERROR" { "Red"    }
+            "WARN"  { "Yellow" }
+            "OK"    { "Green"  }
+            default { "Cyan"   }
+        }
+        $null = $LogLock.WaitOne()
+        try {
+            Write-Host $line -ForegroundColor $color
+            Add-Content -Path $LogFile -Value $line
+        } finally {
+            $LogLock.ReleaseMutex()
+        }
+    }
+
+    $result = [PSCustomObject]@{
+        Server        = $server
+        SvcName       = $svcName
+        InstallDir    = $installDir
+        Success       = $false
+        NeedsRollback = $false
+        BackupPath    = $null
+        Error         = $null
+        IsLocal       = $false
+    }
+
+    $localNames = @(
+        "localhost", "127.0.0.1", "::1",
+        $env:COMPUTERNAME,
+        (($env:COMPUTERNAME + "." + $env:USERDNSDOMAIN).TrimEnd("."))
+    )
+    $isLocal        = $localNames -contains $server
+    $result.IsLocal = $isLocal
+
+    if ($isLocal) {
+        Write-Log "Target matches local machine - running without remote session." "WARN"
+        $session = $null
+    } else {
+        if (-not (Test-Connection -ComputerName $server -Count 1 -Quiet)) {
+            Write-Log "Unreachable. Skipping." "ERROR"
+            $result.Error = "Server unreachable"
+            return $result
+        }
+        try {
+            $session = New-PSSession -ComputerName $server -ErrorAction Stop
+            Write-Log "Session established." "OK"
+        } catch {
+            Write-Log "Failed to create session: $_" "ERROR"
+            $result.Error = $_
+            return $result
+        }
+    }
+
+    function Invoke-Step {
+        param([scriptblock]$ScriptBlock, [object[]]$ArgumentList = @())
+        if ($isLocal) {
+            & $ScriptBlock @ArgumentList
+        } else {
+            Invoke-Command -Session $session -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+        }
+    }
+
+    try {
+        Write-Log "Deploying to $svcName at $installDir..."
+
+        # ---- Stop ----
+        Write-Log "Stopping $svcName..."
+        Invoke-Step -ScriptBlock {
+            param($svc)
+            Stop-Service -Name $svc -Force -ErrorAction Stop
+            $timeout = 60; $elapsed = 0
+            while ((Get-Service -Name $svc).Status -ne "Stopped" -and [int](Get-Service -Name $svc).Status -ne 1 -and $elapsed -lt $timeout) {
+                Start-Sleep 2; $elapsed += 2
+            }
+            $stopStatus = (Get-Service -Name $svc).Status
+            if ($stopStatus -ne "Stopped" -and [int]$stopStatus -ne 1) {
+                throw "Service did not stop within $timeout seconds."
+            }
+        } -ArgumentList $svcName
+        Write-Log "$svcName stopped." "OK"
+
+        # ---- Backup ----
+        $timestamp         = Get-Date -f "yyyyMMdd_HHmmss"
+        $backupPath        = $installDir + "_backup_" + $timestamp + ".zip"
+        $result.BackupPath = $backupPath
+
+        Write-Log "Compressing $installDir to $backupPath..."
+        Invoke-Step -ScriptBlock {
+            param($src, $dest)
+            if (-not (Test-Path $src)) { throw "Install directory not found: $src" }
+            Compress-Archive -Path "$src\*" -DestinationPath $dest -Force
+        } -ArgumentList $installDir, $backupPath
+        Write-Log "Backup created: $backupPath" "OK"
+
+        # ---- Stage new version ----
+        $remoteTmp = "C:\Windows\Temp\TomcatNewVersion_" + $timestamp
+        Write-Log "Staging new version to $remoteTmp..."
+
+        Invoke-Step -ScriptBlock {
+            param($tmp)
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+            New-Item -ItemType Directory -Path $tmp | Out-Null
+        } -ArgumentList $remoteTmp
+
+        if ($isLocal) {
+            Copy-Item -Path "$NewVersionPath\*" -Destination $remoteTmp -Recurse -Force
+        } else {
+            Copy-Item -Path "$NewVersionPath\*" -Destination $remoteTmp -ToSession $session -Recurse -Force
+        }
+        Write-Log "Files staged." "OK"
+
+        # ---- Merge ----
+        Write-Log "Merging into install directory..."
+        Invoke-Step -ScriptBlock {
+            param($dir, $tmp)
+            Copy-Item -Path "$tmp\*" -Destination $dir -Recurse -Force
+            Remove-Item $tmp -Recurse -Force
+        } -ArgumentList $installDir, $remoteTmp
+        Write-Log "Install directory updated." "OK"
+
+        # ---- Start ----
+        Write-Log "Starting $svcName..."
+        $startStatus = Invoke-Step -ScriptBlock {
+            param($svc)
+            Start-Service -Name $svc -ErrorAction Stop
+            $timeout = 60; $elapsed = 0
+            while ((Get-Service -Name $svc).Status -ne "Running" -and [int](Get-Service -Name $svc).Status -ne 4 -and $elapsed -lt $timeout) {
+                Start-Sleep 2; $elapsed += 2
+            }
+            $status = (Get-Service -Name $svc).Status
+            if ($status -ne "Running" -and [int]$status -ne 4) {
+                throw "Service did not reach Running state within $timeout seconds. Status: $status"
+            }
+            return $status
+        } -ArgumentList $svcName
+
+        # ---- Post-deployment: verify version and update description ----
+        if ($newVersion) {
+            $postCheck = Invoke-Step -ScriptBlock {
+                param($svcName, $dir)
+                $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName"
+                $desc    = (Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue).Description
+
+                $jarVersion = $null
+                $jarPath    = Join-Path $dir "lib\catalina.jar"
+                if (Test-Path $jarPath) {
+                    Add-Type -AssemblyName System.IO.Compression.FileSystem
+                    try {
+                        $zip      = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
+                        $manifest = $zip.Entries | Where-Object { $_.FullName -eq "META-INF/MANIFEST.MF" }
+                        if ($manifest) {
+                            $reader  = [System.IO.StreamReader]::new($manifest.Open())
+                            $content = $reader.ReadToEnd()
+                            $reader.Close()
+                            $m = [regex]::Match($content, "Implementation-Version:\s*(\d+\.\d+\.\d+)")
+                            if ($m.Success) { $jarVersion = $m.Groups[1].Value }
+                        }
+                        $zip.Dispose()
+                    } catch { }
+                }
+                [PSCustomObject]@{ Description = $desc; JarVersion = $jarVersion }
+            } -ArgumentList $svcName, $installDir
+
+            if ($postCheck.JarVersion -and $postCheck.JarVersion -ne $newVersion) {
+                Write-Log "WARNING: Deployed jar version $($postCheck.JarVersion) does not match expected $newVersion. Manual review required." "WARN"
+            } elseif ($postCheck.JarVersion -eq $newVersion) {
+                Write-Log "Deployed jar version confirmed: $newVersion" "OK"
+            }
+
+            $shortVer      = ($newVersion -split "\.")[0..1] -join "."
+            $canonicalDesc = "Apache Tomcat $shortVer Server - https://tomcat.apache.org/"
+            if ($postCheck.Description -ne $canonicalDesc) {
+                Write-Log "Updating service description to: $canonicalDesc..."
+                try {
+                    Invoke-Step -ScriptBlock {
+                        param($svcName, $desc)
+                        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName"
+                        Set-ItemProperty -Path $regPath -Name "Description" -Value $desc -ErrorAction Stop
+                    } -ArgumentList $svcName, $canonicalDesc
+                    Write-Log "Service description updated." "OK"
+                } catch {
+                    Write-Log "Failed to update service description: $_" "WARN"
+                }
+            } else {
+                Write-Log "Service description already canonical." "OK"
+            }
+        }
+
+        if ($startStatus -eq "Running" -or [int]$startStatus -eq 4) {
+            Write-Log "$svcName is RUNNING - deployment successful!" "OK"
+            $result.Success = $true
+        } else {
+            throw "Unexpected status $startStatus after start attempt."
+        }
+
+    } catch {
+        Write-Log "Deployment error: $_" "ERROR"
+        $result.Error         = $_
+        $result.NeedsRollback = $true
+    } finally {
+        if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+        Write-Log "Session closed."
+    }
+
+    return $result
+}
+
+# ============================================================
+# Run deployments in parallel
+# ============================================================
+Write-Log "========== Starting parallel deployment =========="
+
+$deployTargets = $deployedKeys | Where-Object { $skipServers -notcontains $_ } | ForEach-Object {
+    $parts = $_ -split "::", 2
+    [PSCustomObject]@{ Server = $parts[0]; NormalizedDir = $parts[1] }
+}
+
+if ($deployTargets.Count -eq 0) {
+    Write-Log "All servers are already on version $newVersion. Nothing to deploy." "OK"
+    exit 0
+}
+
+Write-Log "Deploying to $($deployTargets.Count) unique server+instance(s)."
+
+$resolveBlock = {
+    param($dir)
+    $svcs = @(Get-Service -Name "*Tomcat*" -ErrorAction SilentlyContinue)
+    if ($svcs.Count -eq 0) {
+        $svcs = @(Get-Service -DisplayName "*Apache Tomcat*" -ErrorAction SilentlyContinue)
+    }
+    foreach ($svc in $svcs) {
+        $regPath   = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
+        $imagePath = (Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue).ImagePath
+        if ($imagePath) {
+            $exePath    = $imagePath.Trim('"').Split(" ")[0]
+            $tomcatRoot = Split-Path (Split-Path $exePath -Parent) -Parent
+            if ($tomcatRoot.TrimEnd("\").ToLower() -eq $dir) { return $svc.Name }
+        }
+    }
+    return $null
+}
+
+$jobs = @()
+foreach ($target in $deployTargets) {
+    $srv           = $target.Server
+    $dir           = $target.NormalizedDir
+    $isLocalTarget = $localNames -contains $srv
+
+    $resolvedSvcName = if ($isLocalTarget) {
+        & $resolveBlock $dir
+    } else {
+        try {
+            Invoke-Command -ComputerName $srv -ScriptBlock $resolveBlock -ArgumentList $dir -ErrorAction Stop
+        } catch { $null }
+    }
+
+    if (-not $resolvedSvcName) {
+        Write-Log "Could not resolve service name for $srv at $dir. Skipping." "ERROR"
+        continue
+    }
+
+    Write-Log "Queuing $srv - $resolvedSvcName at $dir..."
+    $jobs += Start-Job -ScriptBlock $DeployBlock `
+        -ArgumentList $srv, $dir, $resolvedSvcName, $NewVersionPath, $ServiceMapCandidates, $LogFile, $newVersion
+
+    while (@(Get-Job -State Running).Count -ge $ThrottleLimit) {
+        Start-Sleep 1
+    }
+}
+
+Write-Log "All jobs queued. Waiting for completion..."
+$results = $jobs | Wait-Job | Receive-Job
+$jobs | Remove-Job
+
+# ============================================================
+# Rollback prompts
+# ============================================================
+$script:RollbackAll = $false
+$failed = $results | Where-Object { $_.NeedsRollback }
+
+if ($failed) {
+    Write-Log "========== $($failed.Count) instance(s) need rollback =========="
+
+    foreach ($r in $failed) {
+        $server     = $r.Server
+        $svcName    = $r.SvcName
+        $installDir = $r.InstallDir
+        $backupPath = $r.BackupPath
+        $doRollback = $false
+
+        if ($script:RollbackAll) {
+            $doRollback = $true
+        } else {
+            $relevantErrors = Get-Content $LogFile |
+                Where-Object { $_ -match "\[ERROR\]" -and $_ -match [regex]::Escape($server) }
+
+            Write-Host ""
+            Write-Host "  ============================================================" -ForegroundColor Red
+            Write-Host "  Deployment failed: $server - $svcName" -ForegroundColor Red
+            Write-Host "  Install dir: $installDir" -ForegroundColor Red
+            if ($relevantErrors) {
+                Write-Host "  Errors:" -ForegroundColor Red
+                foreach ($e in $relevantErrors) {
+                    Write-Host "    $e" -ForegroundColor Red
+                }
+            }
+            Write-Host "  ============================================================" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "  [1] Roll back this instance only"
+            Write-Host "  [2] Roll back this instance AND all remaining failed instances automatically"
+            Write-Host "  [3] Skip rollback for this instance (leave as-is)"
+            Write-Host ""
+            $choice = Read-Host "  Enter choice (1/2/3)"
+            switch ($choice.Trim()) {
+                "1" { $doRollback = $true }
+                "2" { $doRollback = $true; $script:RollbackAll = $true }
+                default { Write-Log "Rollback skipped for $server $svcName by operator choice." "WARN" }
+            }
+        }
+
+        if ($doRollback) {
+            Write-Log "Attempting rollback on $server $svcName..." "WARN"
+            try {
+                $rbSession = New-PSSession -ComputerName $server -ErrorAction Stop
+
+                Invoke-Command -Session $rbSession -ScriptBlock {
+                    param($svc, $dir, $backup)
+
+                    $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
+                    if ($svcObj -and $svcObj.Status -ne "Stopped" -and [int]$svcObj.Status -ne 1) {
+                        Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                        $timeout = 60; $elapsed = 0
+                        while ((Get-Service -Name $svc).Status -ne "Stopped" -and [int](Get-Service -Name $svc).Status -ne 1 -and $elapsed -lt $timeout) {
+                            Start-Sleep 2; $elapsed += 2
+                        }
+                    }
+
+                    if (-not $backup -or -not (Test-Path $backup)) {
+                        throw "Backup archive not found at $backup - manual restore required."
+                    }
+
+                    if (Test-Path $dir) {
+                        Remove-Item "$dir\*" -Recurse -Force -ErrorAction Stop
+                    }
+                    Expand-Archive -Path $backup -DestinationPath $dir -Force
+
+                    Start-Service -Name $svc -ErrorAction Stop
+                    $timeout = 60; $elapsed = 0
+                    while ((Get-Service -Name $svc).Status -ne "Running" -and [int](Get-Service -Name $svc).Status -ne 4 -and $elapsed -lt $timeout) {
+                        Start-Sleep 2; $elapsed += 2
+                    }
+                    $status = (Get-Service -Name $svc).Status
+                    if ($status -ne "Running" -and [int]$status -ne 4) {
+                        throw "Rollback succeeded but service failed to start. Status: $status"
+                    }
+                } -ArgumentList $svcName, $installDir, $backupPath
+
+                Write-Log "Rollback successful - $svcName restored and running on $server" "OK"
+            } catch {
+                Write-Log "ROLLBACK FAILED on $server $svcName : $_ - MANUAL INTERVENTION REQUIRED" "ERROR"
+            } finally {
+                if ($rbSession) { Remove-PSSession $rbSession -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+} else {
+    Write-Log "All instances deployed successfully - no rollbacks needed." "OK"
+}
+
+Write-Log "========== Deployment complete. Log: $LogFile =========="
