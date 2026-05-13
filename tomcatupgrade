@@ -18,19 +18,15 @@
         - Skips servers already on the target version
         - Prompts operator to continue if warnings or errors are found
 
-    Phase 2 - Deployment (serial with optional -Cluster pause):
-        - Stops the Tomcat service
-        - Compresses the existing install directory to a .zip backup
-        - Stages new version files to a temp directory
-        - Merges staged files into the install directory
-        - Starts the service and verifies the deployed version
-        - With -Cluster: pauses between each server with Continue/Rollback/Quit
-
-    Phase 3 - Rollback (interactive):
-        - For each failed deployment, offers:
-            [1] Roll back this server only
-            [2] Roll back this and all remaining failures automatically
-            [3] Skip rollback for this server
+    Phase 2 - Deployment (one-by-one with pause after each server):
+        - Displays a version table before deploying: all servers needing update
+          are listed with current vs target version
+        - For each server: stops service, backs up, stages, merges, restarts
+        - After each server a pause banner shows with four options:
+            [ENTER] Continue to next server
+            [R]     Roll back this server then continue
+            [S]     Skip next server (move on without rolling back current)
+            [Q]     Quit immediately (no further updates or rollbacks)
 
     servers.txt format:
         - One FQDN or hostname per line
@@ -46,10 +42,6 @@
     Path to a text file listing target servers, one per line.
     Defaults to servers.txt in the same directory as this script.
 
-.PARAMETER Cluster
-    Switch. When present, inserts an interactive pause after each server is
-    updated. Operator can press ENTER to continue, R to roll back all
-    completed servers and exit, or Q to quit without rollback.
 
 .PARAMETER Credential
     PSCredential used for WinRM connections to remote servers.
@@ -57,10 +49,6 @@
 .EXAMPLE
     # Deploy to all servers in servers.txt
     .\Invoke-TomcatUpgrade.ps1
-
-.EXAMPLE
-    # Deploy with a per-server pause between each node
-    .\Invoke-TomcatUpgrade.ps1 -Cluster
 
 .EXAMPLE
     # Deploy with explicit credentials
@@ -72,7 +60,6 @@
 param(
     [string]$NewVersionPath = (Join-Path $PSScriptRoot "NewVersion"),
     [string]$ServersFile    = (Join-Path $PSScriptRoot "servers.txt"),
-    [switch]$Cluster,
     [System.Management.Automation.PSCredential]$Credential
 )
 #endregion Parameters
@@ -134,29 +121,49 @@ function Read-OperatorChoice {
     return $rawInput.Substring(0, 1)
 }
 
-# Show a per-server pause banner when -Cluster is specified.
-# Returns: "C" (continue), "R" (rollback all), or "Q" (quit)
-function Invoke-ServerPause {
+# Show a per-server pause banner after each deployment.
+# CompletedServer : server just finished
+# CompletedSvc    : service name on that server
+# CompletedVer    : version deployed (or empty)
+# NextServer      : next server coming up (empty if last)
+# ServerNum       : 1-based index of completed server
+# TotalServers    : total servers in deploy list
+# BackupPath      : backup archive path (shown for reference)
+#
+# Returns: "C" (continue), "R" (rollback this server), "S" (skip next), "Q" (quit)
+function Invoke-UpdatePause {
     param(
         [string]$CompletedServer,
+        [string]$CompletedSvc,
+        [string]$CompletedVer,
         [string]$NextServer,
         [int]   $ServerNum,
-        [int]   $TotalServers
+        [int]   $TotalServers,
+        [string]$BackupPath
     )
 
-    $nextLabel = if ($NextServer) { $NextServer } else { "(last server)" }
+    $nextLabel  = if ($NextServer) { $NextServer } else { "(none -- last server)" }
+    $verDisplay = if ($CompletedVer) { " -> v$CompletedVer" } else { "" }
+    $bkDisplay  = if ($BackupPath)  { $BackupPath } else { "N/A" }
 
     Write-Host ""
     Write-Host "+-----------------------------------------------------+" -ForegroundColor Yellow
-    Write-Host ("| CLUSTER PAUSE -- server $ServerNum of $TotalServers complete").PadRight(53) + "|" -ForegroundColor Yellow
-    Write-Host ("| Done : $CompletedServer").PadRight(53) + "|" -ForegroundColor Yellow
-    Write-Host ("| Next : $nextLabel").PadRight(53) + "|" -ForegroundColor Yellow
+    Write-Host ("| UPDATE PAUSE -- $ServerNum of $TotalServers complete").PadRight(53) + "|" -ForegroundColor Yellow
+    Write-Host ("| Done   : $CompletedServer ($CompletedSvc)$verDisplay").PadRight(53) + "|" -ForegroundColor Yellow
+    Write-Host ("| Backup : $bkDisplay").PadRight(53) + "|" -ForegroundColor Yellow
+    Write-Host ("| Next   : $nextLabel").PadRight(53) + "|" -ForegroundColor Yellow
     Write-Host "+-----------------------------------------------------+" -ForegroundColor Yellow
-    Write-Host "|  [ENTER] Continue   [R] Rollback all   [Q] Quit    |" -ForegroundColor Yellow
+    Write-Host "|  [ENTER] Continue next                              |" -ForegroundColor Yellow
+    Write-Host "|  [R]     Rollback this server then continue         |" -ForegroundColor Yellow
+    Write-Host "|  [S]     Skip next server                           |" -ForegroundColor Yellow
+    Write-Host "|  [Q]     Quit (no further updates)                  |" -ForegroundColor Yellow
     Write-Host "+-----------------------------------------------------+" -ForegroundColor Yellow
     Write-Host ""
 
-    return Read-OperatorChoice
+    $ch = Read-OperatorChoice
+    # Normalise Enter/C/N -> "C"
+    if ($ch -ne "R" -and $ch -ne "S" -and $ch -ne "Q") { $ch = "C" }
+    return $ch
 }
 
 # Open a PSSession for the given computer.
@@ -456,6 +463,8 @@ $pfFail = 0
 
 # deployTargets: list of PSCustomObject { Server; SvcName; InstallDir; NormalizedDir; InstalledVersion }
 $deployTargets = New-Object 'System.Collections.Generic.List[System.Management.Automation.PSObject]'
+# allVersionRows: every server/service found, used for the version comparison table
+$script:allVersionRows = New-Object 'System.Collections.Generic.List[System.Management.Automation.PSObject]'
 # Track unique server::dir keys to avoid duplicates
 $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]' (
     [System.StringComparer]::OrdinalIgnoreCase
@@ -470,6 +479,12 @@ foreach ($ComputerName in $servers) {
     if (-not $opened) {
         Write-Log "Cannot open session to $ComputerName -- skipping." "ERROR" $ComputerName
         $pfFail++
+        $script:allVersionRows.Add([PSCustomObject]@{
+            Server           = $ComputerName
+            SvcName          = "N/A"
+            InstalledVersion = $null
+            NeedsUpdate      = "UNREACHABLE"
+        })
         continue
     }
 
@@ -515,12 +530,21 @@ foreach ($ComputerName in $servers) {
             $pfPass++
         }
 
-        # Version comparison -- skip if already on target
+        # Version comparison -- record for table, skip deploy if already on target
         if ($newVersion -and $entry.InstalledVersion -and ($entry.InstalledVersion -eq $newVersion)) {
             Write-Log "Already on version $newVersion at $($entry.InstallDir) -- skipping." "WARN" $ComputerName
             $pfWarn++
+            $script:allVersionRows.Add([PSCustomObject]@{
+                Server           = $ComputerName
+                SvcName          = $entry.Name
+                InstalledVersion = $entry.InstalledVersion
+                NeedsUpdate      = "UP TO DATE"
+            })
             continue
         }
+
+        # Determine update status label for the table
+        $updateStatus = if ($entry.InstalledVersion) { "NEEDS UPDATE" } else { "NEEDS UPDATE" }
 
         if ($newVersion -and $entry.InstalledVersion) {
             Write-Log "Will upgrade $($entry.InstallDir) : $($entry.InstalledVersion) -> $newVersion" "OK" $ComputerName
@@ -529,6 +553,13 @@ foreach ($ComputerName in $servers) {
             Write-Log "Could not detect installed version at $($entry.InstallDir) -- will deploy anyway." "WARN" $ComputerName
             $pfWarn++
         }
+
+        $script:allVersionRows.Add([PSCustomObject]@{
+            Server           = $ComputerName
+            SvcName          = $entry.Name
+            InstalledVersion = $entry.InstalledVersion
+            NeedsUpdate      = $updateStatus
+        })
 
         $null = $seenKeys.Add($key)
         $deployTargets.Add([PSCustomObject]@{
@@ -544,22 +575,38 @@ foreach ($ComputerName in $servers) {
 
 Write-Log "Pre-flight complete -- Pass: $pfPass  Warn: $pfWarn  Fail: $pfFail" "INFO"
 
-# ---- Operator prompt if issues detected -------------------------------------
-if ($pfFail -gt 0 -or $pfWarn -gt 0) {
-    $issueLines = @(Get-Content $script:LogFile |
-        Where-Object { $_ -match "\[(ERROR|WARN)\]" })
+# =============================================================================
+# VERSION COMPARISON TABLE
+# Show ALL servers: current version vs target, highlight those needing update.
+# Servers not needing update are shown for visibility but excluded from deploy.
+# =============================================================================
 
-    Write-Host ""
-    Write-Host "  +============================================================+" -ForegroundColor Yellow
-    Write-Host "  | Pre-flight issues:                                         |" -ForegroundColor Yellow
-    Write-Host "  +============================================================+" -ForegroundColor Yellow
-    foreach ($line in $issueLines) {
-        $c = if ($line -match "\[ERROR\]") { "Red" } else { "Yellow" }
-        Write-Host "  $line" -ForegroundColor $c
+Write-Host ""
+Write-Host "  +------------------------------------------------------------------+" -ForegroundColor Cyan
+Write-Host "  | VERSION COMPARISON REPORT                                        |" -ForegroundColor Cyan
+Write-Host "  | Target version : $newVersion$((" " * [Math]::Max(0, 50 - $newVersion.Length)))|" -ForegroundColor Cyan
+Write-Host "  +------------------------------------------------------------------+" -ForegroundColor Cyan
+Write-Host ("  | {0,-36} {1,-12} {2,-10} |" -f "Server / Service", "Current", "Status") -ForegroundColor Cyan
+Write-Host "  +------------------------------------------------------------------+" -ForegroundColor Cyan
+
+foreach ($row in $script:allVersionRows) {
+    $curVer  = if ($row.InstalledVersion) { $row.InstalledVersion } else { "unknown" }
+    $statusStr = $row.NeedsUpdate
+    $color = switch ($statusStr) {
+        "NEEDS UPDATE" { "Yellow" }
+        "UP TO DATE"   { "Green"  }
+        "UNREACHABLE"  { "Red"    }
+        default        { "Gray"   }
     }
-    Write-Host "  +============================================================+" -ForegroundColor Yellow
-    Write-Host ""
+    $label = "$($row.Server) / $($row.SvcName)"
+    Write-Host ("  | {0,-36} {1,-12} {2,-10} |" -f $label, $curVer, $statusStr) -ForegroundColor $color
+}
 
+Write-Host "  +------------------------------------------------------------------+" -ForegroundColor Cyan
+Write-Host ""
+
+# ---- Errors / warnings summary and continue prompt ----------------------
+if ($pfFail -gt 0 -or $pfWarn -gt 0) {
     if ($pfFail -gt 0) {
         Write-Host "  $pfFail ERROR(s) and $pfWarn WARNING(s) found." -ForegroundColor Red
         Write-Host "  Errors may cause deployment failures or data loss." -ForegroundColor Red
@@ -587,7 +634,7 @@ else {
 }
 
 if ($deployTargets.Count -eq 0) {
-    Write-Log "No servers require deployment. Exiting." "OK"
+    Write-Log "No servers require deployment. All servers are up to date." "OK"
     exit 0
 }
 
@@ -851,10 +898,18 @@ $deployResults = New-Object 'System.Collections.Generic.List[System.Management.A
 
 $script:quitRequested    = $false
 $script:rollbackAllReq   = $false
+$script:skipNext         = $false
 
 for ($di = 0; $di -lt $deployTargets.Count; $di++) {
 
     if ($script:quitRequested) { break }
+
+    # Skip this server if operator chose [S] at the previous pause
+    if ($script:skipNext) {
+        $script:skipNext = $false
+        Write-Log "Skipping $($deployTargets[$di].Server) as requested." "WARN"
+        continue
+    }
 
     $target       = $deployTargets[$di]
     $ComputerName = $target.Server
@@ -958,25 +1013,68 @@ for ($di = 0; $di -lt $deployTargets.Count; $di++) {
 
     $deployResults.Add($deployRecord)
 
-    # ---- Cluster pause ------------------------------------------------------
-    if ($Cluster -and -not $script:quitRequested -and -not $script:rollbackAllReq) {
-        $isLast      = ($di -eq ($deployTargets.Count - 1))
-        $nextSrv     = if (-not $isLast) { $deployTargets[$di + 1].Server } else { "" }
-        $pauseChoice = Invoke-ServerPause `
+    # ---- Per-server pause (always on) -----------------------------------
+    if (-not $script:quitRequested) {
+        $isLast     = ($di -eq ($deployTargets.Count - 1))
+        $nextSrv    = if (-not $isLast) { $deployTargets[$di + 1].Server } else { "" }
+        $deployedV  = if ($result.DeployedVersion) { $result.DeployedVersion } else { "" }
+        $bkPath     = if ($deployRecord.BackupPath) { $deployRecord.BackupPath } else { "" }
+
+        $pauseChoice = Invoke-UpdatePause `
             -CompletedServer $ComputerName `
+            -CompletedSvc    $svcName `
+            -CompletedVer    $deployedV `
             -NextServer      $nextSrv `
             -ServerNum       ($di + 1) `
-            -TotalServers    $deployTargets.Count
+            -TotalServers    $deployTargets.Count `
+            -BackupPath      $bkPath
 
-        if ($pauseChoice -eq "Q") {
-            Write-Log "Quit requested at cluster pause." "WARN"
-            $script:quitRequested = $true
+        switch ($pauseChoice) {
+            "R" {
+                # Rollback this server inline, then continue to next
+                Write-Log "Rollback requested for $ComputerName -- $svcName" "WARN"
+                if ($deployRecord.BackupPath) {
+                    $rbOpened = Open-TargetSession -ComputerName $ComputerName
+                    if ($rbOpened) {
+                        $rbResult = Invoke-Targeted -ScriptBlock $rollbackScript -ArgumentList @(
+                            $svcName,
+                            $installDir,
+                            $deployRecord.BackupPath
+                        )
+                        Close-TargetSession
+                        if ($rbResult.Success) {
+                            Write-Log "Rollback successful -- $svcName restored." "OK" $ComputerName
+                            $deployRecord.NeedsRollback = $false
+                            $deployRecord.Error = "ROLLED BACK AT PAUSE"
+                        }
+                        else {
+                            Write-Log "Rollback FAILED: $($rbResult.Error)" "ERROR" $ComputerName
+                        }
+                        Write-Log "--- Rollback log ---" "INFO"
+                        foreach ($line in $rbResult.Log) { Write-Log "  $line" "INFO" $ComputerName }
+                    }
+                    else {
+                        Write-Log "Cannot open session for rollback -- MANUAL INTERVENTION REQUIRED." "ERROR" $ComputerName
+                    }
+                }
+                else {
+                    Write-Log "No backup path available -- rollback skipped." "WARN" $ComputerName
+                }
+                # Continue to next server
+            }
+            "S" {
+                # Skip the NEXT server
+                Write-Log "Skip requested -- next server will be skipped." "WARN"
+                $script:skipNext = $true
+            }
+            "Q" {
+                Write-Log "Quit requested at update pause." "WARN"
+                $script:quitRequested = $true
+            }
+            default {
+                # C / ENTER -- continue
+            }
         }
-        elseif ($pauseChoice -eq "R") {
-            Write-Log "Rollback-all requested at cluster pause." "WARN"
-            $script:rollbackAllReq = $true
-        }
-        # C / ENTER / anything else -- continue
     }
 
 } # end deployment loop
@@ -987,6 +1085,7 @@ Write-Log "========== Phase 2 complete ==========" "OK"
 # PHASE 3 -- ROLLBACK
 # =============================================================================
 
+# Phase 3 catches any remaining failures not already rolled back at the pause
 $failedDeployments = @($deployResults | Where-Object { $_.NeedsRollback -eq $true })
 $rollbackAll       = $script:rollbackAllReq
 
