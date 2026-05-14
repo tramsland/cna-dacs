@@ -2,15 +2,28 @@
 # Configure-TomcatSSL.ps1
 # Generates a self-signed JKS certificate with SAN entries for all cluster nodes,
 # distributes the keystore to every node, exports a per-node .cer file (named by FQDN),
-# and configures Tomcat 10.1.x for HTTPS on port 443.
+# configures Tomcat 10.1.x for HTTPS on port 443, and remotely imports each cert
+# into the Trusted Root store of every IIS server.
 # Each Tomcat instance gets its own timestamped backup and can be rolled back independently.
 # Targets remote Windows servers via WinRM. Run as administrator.
 # Compatible with Windows PowerShell 5.1+
+#
+# servers.txt format (shared multiuse file):
+# ─────────────────────────────────────────────
+#   # Lines starting with # are comments
+#   [Production]               <- zone/section markers are ignored by this script
+#   [DMZ]                      <- any bracket line not matching [IIS Server:...] is skipped
+#
+#   tomcat-node1.domain.com    <- plain lines are Tomcat cluster nodes
+#   tomcat-node2.domain.com
+#
+#   [IIS Server: iis1.domain.com]  <- this specific tag is recognised for IIS cert import
+#   [IIS Server: iis2.domain.com]
+# ─────────────────────────────────────────────
 
 #region Parameters
 param(
     # servers.txt in the same folder as this script is the default.
-    # Each line: one server FQDN or hostname. Lines starting with # are comments.
     [string]$ServerList    = (Join-Path $PSScriptRoot "servers.txt"),
 
     [string]$TomcatHome    = "",                    # Auto-detected if left blank
@@ -50,30 +63,54 @@ function Exit-Error {
 }
 #endregion
 
-#region Load server list
+#region Parse server list
+# servers.txt is a shared multi-purpose file.
+# This script recognises two line types and ignores everything else:
+#
+#   Plain lines (no brackets)    -> Tomcat cluster nodes
+#   [IIS Server: <hostname>]     -> IIS servers to receive the trusted cert
+#
+# All other bracketed lines (zone markers like [Production], [DMZ] etc.)
+# are silently ignored — exactly as other scripts that share this file do.
 if (-not (Test-Path $ServerList)) {
     Write-Host "ERROR: Server list not found: $ServerList" -ForegroundColor Red
-    Write-Host "Create a servers.txt file in the same directory as this script," -ForegroundColor Yellow
-    Write-Host "with one server FQDN or hostname per line. Lines starting with # are comments." -ForegroundColor Yellow
+    Write-Host "Plain lines = Tomcat nodes. Add [IIS Server: fqdn] lines for IIS trust import." -ForegroundColor Yellow
     exit 1
 }
 
-$servers = @(
-    Get-Content $ServerList |
-    Where-Object { ($_ -notmatch '^\s*$') -and ($_ -notmatch '^\s*#') } |
-    ForEach-Object { $_.Trim() }
-)
+$servers    = [System.Collections.Generic.List[string]]::new()
+$iisServers = [System.Collections.Generic.List[string]]::new()
+
+foreach ($rawLine in (Get-Content $ServerList)) {
+    $line = $rawLine.Trim()
+
+    # Skip blank lines and comment lines
+    if ($line -eq '' -or $line -match '^\s*#') { continue }
+
+    if ($line -match '^\[IIS Server:\s*(.+?)\s*\]$') {
+        # IIS server tag — extract hostname and add to IIS list
+        $iisServers.Add($Matches[1])
+    } elseif ($line -match '^\[') {
+        # Any other bracketed line (zone marker, section header, etc.) — ignore
+        continue
+    } else {
+        # Plain line — treat as a Tomcat cluster node
+        $servers.Add($line)
+    }
+}
 
 if ($servers.Count -eq 0) {
-    Write-Host "ERROR: No servers found in $ServerList" -ForegroundColor Red
+    Write-Host "ERROR: No Tomcat servers found in $ServerList" -ForegroundColor Red
     exit 1
 }
 
 $modeLabel = if ($Rollback) { 'ROLLBACK' } else { 'CONFIGURE' }
 Write-Status "=== Tomcat 10.1 SSL Configurator ===" -Color Cyan
-Write-Status "Mode        : $modeLabel"              -Color Cyan
-Write-Status "Server list : $ServerList ($($servers.Count) server(s))" -Color Cyan
-Write-Status "Port        : $HttpsPort"              -Color Cyan
+Write-Status "Mode         : $modeLabel"             -Color Cyan
+Write-Status "Server list  : $ServerList"            -Color Cyan
+Write-Status "Tomcat nodes : $($servers.Count)"      -Color Cyan
+Write-Status "IIS servers  : $($iisServers.Count)$(if ($iisServers.Count -gt 0) { ' (' + ($iisServers -join ', ') + ')' })" -Color Cyan
+Write-Status "Port         : $HttpsPort"             -Color Cyan
 Write-Status ""
 #endregion
 
@@ -571,6 +608,11 @@ $configureInstanceBlock = {
 $clusterKeystoreBytes = $null
 $isFirstNode          = $true
 
+# Collect exported cert file paths + bytes as we configure each node,
+# so we can push them to IIS servers after the main loop completes.
+# Each entry: { NodeFqdn, CertFile, CertBytes }
+$exportedCerts = New-Object 'System.Collections.Generic.List[PSObject]'
+
 foreach ($node in $nodeInfo) {
 
     $ComputerName = $node.InputName
@@ -714,6 +756,34 @@ foreach ($node in $nodeInfo) {
                 Write-Status "  Keystore captured ($($clusterKeystoreBytes.Length) bytes) — will be distributed to remaining nodes." -Color Yellow
                 $isFirstNode = $false
             }
+
+            # Collect the exported .cer for IIS distribution
+            if ($result.CertFile) {
+                try {
+                    # Read cert bytes from the remote server back to the orchestrator
+                    $cerBytes = $null
+                    if ($isLocal) {
+                        $cerBytes = [System.IO.File]::ReadAllBytes($result.CertFile)
+                    } else {
+                        # Re-open a short-lived session just to pull the file bytes
+                        $pullSession = New-PSSession -ComputerName $ComputerName @sessionParams
+                        $cerBytes    = Invoke-Command -Session $pullSession -ScriptBlock {
+                            param($p) [System.IO.File]::ReadAllBytes($p)
+                        } -ArgumentList $result.CertFile
+                        Remove-PSSession $pullSession -ErrorAction SilentlyContinue
+                    }
+                    if ($cerBytes) {
+                        $exportedCerts.Add([PSCustomObject]@{
+                            NodeFqdn  = $NodeFqdn
+                            CertFile  = $result.CertFile
+                            CertBytes = $cerBytes
+                        })
+                        Write-Status "  Cert bytes captured ($($cerBytes.Length) bytes) for IIS distribution." -Color Gray
+                    }
+                } catch {
+                    Write-Status "  WARNING: Could not read cert bytes for IIS distribution: $_" -Color Yellow
+                }
+            }
         } else {
             Write-Status "  FAILED: $($inst.TomcatHome)" -Color Red
             Write-Status "    $($result.Error)" -Color Red
@@ -729,6 +799,155 @@ foreach ($node in $nodeInfo) {
 
 } # end foreach server
 
+# ============================================================================
+# IIS TRUSTED ROOT IMPORT — push each .cer to every IIS server remotely
+# Skipped in rollback mode or if iisservers.txt does not exist / is empty.
+# ============================================================================
+if (-not $Rollback -and $exportedCerts.Count -gt 0 -and $iisServers.Count -gt 0) {
+        Write-Status ""
+        Write-Status "========================================" -Color DarkCyan
+        Write-Status "=== IIS Trusted Root Import ===" -Color Cyan
+        Write-Status "  $($exportedCerts.Count) cert(s) -> $($iisServers.Count) IIS server(s)" -Color Cyan
+        Write-Status "========================================" -Color DarkCyan
+
+        $importBlock = {
+            param(
+                [string]$CertTmpPath,
+                [byte[]]$CertBytes,
+                [string]$NodeFqdn
+            )
+
+            $log = New-Object 'System.Collections.Generic.List[string]'
+            function Log { param([string]$m) $log.Add($m); Write-Host $m }
+
+            # Write cert bytes to a temp file on this IIS server
+            try {
+                [System.IO.File]::WriteAllBytes($CertTmpPath, $CertBytes)
+                Log "Cert written to: $CertTmpPath"
+            } catch {
+                return [PSCustomObject]@{ Success=$false; Log=$log
+                    Error="Failed to write cert to temp path '$CertTmpPath': $_" }
+            }
+
+            # Import into Local Machine Trusted Root
+            try {
+                $imported = Import-Certificate -FilePath $CertTmpPath `
+                    -CertStoreLocation "Cert:\LocalMachine\Root" -ErrorAction Stop
+                Log "Imported cert: Subject=$($imported.Subject)  Thumbprint=$($imported.Thumbprint)"
+            } catch {
+                return [PSCustomObject]@{ Success=$false; Log=$log
+                    Error="Import-Certificate failed: $_" }
+            } finally {
+                Remove-Item $CertTmpPath -Force -ErrorAction SilentlyContinue
+                Log "Temp cert file removed."
+            }
+
+            # Verify it landed in the store
+            $found = Get-ChildItem "Cert:\LocalMachine\Root" |
+                     Where-Object { $_.Thumbprint -eq $imported.Thumbprint } |
+                     Select-Object -First 1
+
+            if ($found) {
+                Log "Verification OK — cert present in Cert:\LocalMachine\Root."
+                Log "  Subject    : $($found.Subject)"
+                Log "  Thumbprint : $($found.Thumbprint)"
+                Log "  Expiry     : $($found.NotAfter)"
+            } else {
+                return [PSCustomObject]@{ Success=$false; Log=$log
+                    Error="Cert was imported but not found in store during verification (Thumbprint: $($imported.Thumbprint))." }
+            }
+
+            return [PSCustomObject]@{
+                Success    = $true
+                Log        = $log
+                Error      = $null
+                Thumbprint = $imported.Thumbprint
+                Subject    = $imported.Subject
+                Expiry     = $imported.NotAfter
+            }
+        }
+
+        foreach ($iisSrv in $iisServers) {
+
+            $iisIsLocal = $localNames -contains $iisSrv
+            $iisTag     = if ($iisIsLocal) { "  [LOCAL]" } else { "" }
+            Write-Status "----------------------------------------" -Color DarkCyan
+            Write-Status "IIS Server: $iisSrv$iisTag" -Color Cyan
+
+            # Open session to IIS server
+            $iisSession = $null
+            if (-not $iisIsLocal) {
+                try {
+                    $iisSession = New-PSSession -ComputerName $iisSrv @sessionParams
+                } catch {
+                    Write-Status "  ERROR: PSSession to IIS server failed - $_" -Color Red
+                    $summary.Add([PSCustomObject]@{
+                        Server   = $iisSrv
+                        Instance = "IIS Trusted Root"
+                        Status   = "IIS SESSION FAILED"
+                        Detail   = $_.ToString()
+                    })
+                    continue
+                }
+            }
+
+            foreach ($certEntry in $exportedCerts) {
+
+                Write-Status "  Importing: $($certEntry.NodeFqdn).cer" -Color Gray
+
+                # Use a unique temp path on the IIS server so parallel runs don't collide
+                $tmpStamp   = Get-Date -Format "yyyyMMdd_HHmmss"
+                $certTmpPath = "C:\Windows\Temp\tomcat_trust_$($certEntry.NodeFqdn)_$tmpStamp.cer"
+
+                $impArgs = @($certTmpPath, $certEntry.CertBytes, $certEntry.NodeFqdn)
+                $impResult = $null
+                try {
+                    if ($iisIsLocal) {
+                        $impResult = Invoke-Command -ScriptBlock $importBlock -ArgumentList $impArgs
+                    } else {
+                        $impResult = Invoke-Command -Session $iisSession -ScriptBlock $importBlock -ArgumentList $impArgs
+                    }
+                } catch {
+                    $impResult = [PSCustomObject]@{ Success=$false; Log=@(); Error=$_.ToString() }
+                }
+
+                if ($impResult.Success) {
+                    Write-Status "  OK  : $($certEntry.NodeFqdn)" -Color Green
+                    Write-Status "    Thumbprint : $($impResult.Thumbprint)" -Color Cyan
+                    Write-Status "    Subject    : $($impResult.Subject)"    -Color Cyan
+                    Write-Status "    Expiry     : $($impResult.Expiry)"     -Color Cyan
+                    $summary.Add([PSCustomObject]@{
+                        Server   = $iisSrv
+                        Instance = "IIS Trusted Root <- $($certEntry.NodeFqdn)"
+                        Status   = "CERT IMPORTED"
+                        Detail   = "Thumbprint: $($impResult.Thumbprint)"
+                    })
+                } else {
+                    Write-Status "  FAILED: $($certEntry.NodeFqdn) -> $iisSrv" -Color Red
+                    Write-Status "    $($impResult.Error)" -Color Red
+                    $summary.Add([PSCustomObject]@{
+                        Server   = $iisSrv
+                        Instance = "IIS Trusted Root <- $($certEntry.NodeFqdn)"
+                        Status   = "CERT IMPORT FAILED"
+                        Detail   = $impResult.Error
+                    })
+                }
+
+                Write-Status "  --- Log ---" -Color Gray
+                foreach ($line in $impResult.Log) { Write-Status "    $line" -Color Gray }
+            }
+
+            if ($iisSession) { Remove-PSSession $iisSession -ErrorAction SilentlyContinue }
+
+        } # end foreach IIS server
+
+} elseif (-not $Rollback -and $exportedCerts.Count -gt 0 -and $iisServers.Count -eq 0) {
+    Write-Status ""
+    Write-Status "No [IIS Server: ...] entries found in $ServerList — skipping IIS trust import." -Color Yellow
+    Write-Status "  Add lines like:  [IIS Server: iis1.domain.com]  to servers.txt to enable." -Color DarkCyan
+}
+
+
 # ── Final summary ─────────────────────────────────────────────────────────────
 Write-Status ""
 Write-Status "=======================================" -Color Cyan
@@ -736,13 +955,16 @@ Write-Status "  SUMMARY" -Color Cyan
 Write-Status "=======================================" -Color Cyan
 foreach ($row in $summary) {
     $color = switch -Wildcard ($row.Status) {
-        "OK"              { "Green"  }
-        "ROLLED BACK"     { "Green"  }
-        "FAILED"          { "Red"    }
-        "ROLLBACK FAILED" { "Red"    }
-        "SESSION FAILED"  { "Red"    }
-        "ENUM FAILED"     { "Red"    }
-        default           { "Yellow" }
+        "OK"                { "Green"  }
+        "ROLLED BACK"       { "Green"  }
+        "CERT IMPORTED"     { "Green"  }
+        "FAILED"            { "Red"    }
+        "ROLLBACK FAILED"   { "Red"    }
+        "SESSION FAILED"    { "Red"    }
+        "IIS SESSION FAILED"{ "Red"    }
+        "CERT IMPORT FAILED"{ "Red"    }
+        "ENUM FAILED"       { "Red"    }
+        default             { "Yellow" }
     }
     Write-Status ("  {0,-35} [{1}]  {2}" -f $row.Server, $row.Status, $row.Detail) -Color $color
     if ($row.Instance) { Write-Status ("    Instance: $($row.Instance)") -Color DarkGray }
@@ -752,7 +974,10 @@ Write-Status "  Rollback commands:" -Color Cyan
 Write-Status "    Latest backup  : .\Configure-TomcatSSL.ps1 -Rollback [-RestartTomcat]" -Color DarkCyan
 Write-Status "    Specific stamp : .\Configure-TomcatSSL.ps1 -Rollback -RollbackTimestamp 'yyyyMMdd_HHmmss' [-RestartTomcat]" -Color DarkCyan
 Write-Status ""
-Write-Status "  IIS trust commands (run on each IIS server):" -Color Cyan
+Write-Status "  IIS trust import — add to servers.txt to automate:" -Color Cyan
+Write-Status "    [IIS Server: iis1.domain.com]" -Color DarkCyan
+Write-Status "    [IIS Server: iis2.domain.com]" -Color DarkCyan
+Write-Status "  Or import manually on each IIS server:" -Color Cyan
 Write-Status "    Import-Certificate -FilePath '<fqdn>.cer' -CertStoreLocation Cert:\LocalMachine\Root" -Color DarkCyan
 Write-Status "    certutil -addstore Root '<fqdn>.cer'" -Color DarkCyan
 Write-Status "=======================================" -Color Cyan
