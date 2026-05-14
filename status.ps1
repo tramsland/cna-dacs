@@ -1297,6 +1297,430 @@ if ($allLog4j) {
     Write-Log "Log4j CSV      : $log4jCsvFile" -Color Green
 }
 
+# ── HTML ──────────────────────────────────────────────────────────────────────
+$htmlRows = $allCsvRows | Sort-Object Zone, Server, ServiceType
+$htmlBody = ""
+
+$htmlRows | Group-Object Zone | ForEach-Object {
+    $zoneName   = $_.Name
+    $zoneRows   = $_.Group
+    $zoneStatus = if   ($zoneRows | Where-Object { $_.OverallStatus -in @("DOWN","CRITICAL") }) { "down" }
+                  elseif ($zoneRows | Where-Object { $_.OverallStatus -eq "WARN" }) { "warn" }
+                  else { "ok" }
+    $zoneId   = $zoneName -replace '[^a-zA-Z0-9]', '_'
+    $zoneOK   = ($zoneRows | Where-Object { $_.OverallStatus -eq "OK"       }).Count
+    $zoneWarn = ($zoneRows | Where-Object { $_.OverallStatus -eq "WARN"     }).Count
+    $zoneCrit = ($zoneRows | Where-Object { $_.OverallStatus -eq "CRITICAL" }).Count
+    $zoneDown = ($zoneRows | Where-Object { $_.OverallStatus -eq "DOWN"     }).Count
+    $serverHtml = ""
+
+    $zoneRows | Group-Object Server | ForEach-Object {
+        $serverName   = $_.Name
+        $serverRows   = $_.Group
+        $serverStatus = if   ($serverRows | Where-Object { $_.OverallStatus -in @("DOWN","CRITICAL") }) { "down" }
+                        elseif ($serverRows | Where-Object { $_.OverallStatus -eq "WARN" }) { "warn" }
+                        else { "ok" }
+        $serverId     = $zoneId + "_" + ($serverName -replace '[^a-zA-Z0-9]', '_')
+        $serverResult = $results | Where-Object { $_.ComputerName -eq $serverName } | Select-Object -First 1
+
+        $csInstanceNames = ($serverRows |
+                            Where-Object { $_.ServiceType -eq "ContentServer" } |
+                            ForEach-Object { HtmlEncode $_.ServiceName }) -join ", "
+        $instSpan = if ($csInstanceNames) {
+            "<span class='srv-inst'>$csInstanceNames</span><span class='srv-sep'>/</span>"
+        } else { "" }
+        $serverHeaderLabel =
+            "<span class='srv-zone'>$(HtmlEncode $zoneName)</span>" +
+            "<span class='srv-sep'>/</span>" +
+            $instSpan +
+            "<span class='srv-name'>$(HtmlEncode $serverName)</span>"
+
+        $instanceHtml = ""
+        $csRows     = $serverRows | Where-Object { $_.ServiceType -eq "ContentServer" }
+        $tomcatRow  = $serverRows | Where-Object { $_.ServiceType -eq "Tomcat" }             | Select-Object -First 1
+        $csAdminRow = $serverRows | Where-Object { $_.ServiceType -eq "ContentServerAdmin" } | Select-Object -First 1
+
+        # Log4j findings for this server
+        $serverLog4j = @()
+        if ($serverResult -and $serverResult.Log4jFindings) {
+            $serverLog4j = @($serverResult.Log4jFindings)
+        }
+        $log4jHtml = ""
+        if ($serverLog4j.Count -gt 0) {
+            $log4jCells = ""
+            foreach ($lf in $serverLog4j) {
+                $lfClass = switch ($lf.Status) {
+                    "VULNERABLE"          { "error-cell" }
+                    "UNKNOWN_VERSION"     { "warn-cell"  }
+                    "SCAN_ROOT_NOT_FOUND" { "warn-cell"  }
+                    "SCAN_ERROR"          { "error-cell" }
+                    default               { ""           }
+                }
+                $lfLabel = switch ($lf.Status) {
+                    "OK"                  { "OK"          }
+                    "VULNERABLE"          { "VULNERABLE"  }
+                    "NOT_FOUND"           { "Not found"   }
+                    "SCAN_ROOT_NOT_FOUND" { "Path missing" }
+                    "UNKNOWN_VERSION"     { "Unknown ver" }
+                    "SCAN_ERROR"          { "Scan error"  }
+                    default               { $lf.Status    }
+                }
+                $lfChipClass = switch ($lf.Status) {
+                    "OK"      { "ok"      }
+                    "VULNERABLE" { "critical" }
+                    default   { "warn"    }
+                }
+                $lfDetail = if ($lf.FileName) {
+                    "$(HtmlEncode $lf.FileName)  v$(HtmlEncode $lf.Version)  <span class='text-muted'>($(HtmlEncode $lf.VersionSrc))</span><br><span class='text-muted' style='font-size:10px'>$(HtmlEncode $lf.Path)</span>"
+                } elseif ($lf.ScanRoot) {
+                    "<span class='text-muted'>$(HtmlEncode $lf.ScanRoot)</span>"
+                } else { "" }
+                $log4jCells += "<div class='detail-cell $lfClass full-width'>" +
+                    "<div class='d-label'>Log4j <span class='chip $lfChipClass' style='font-size:9px;padding:1px 6px'>$lfLabel</span></div>" +
+                    "<div class='d-value'>$lfDetail</div></div>"
+            }
+            $log4jHtml = $log4jCells
+        }
+
+        $csRows | ForEach-Object {
+            $primary  = $_
+            $instName = $primary.ServiceName
+            $sc = switch ($primary.OverallStatus) {
+                "OK"{"ok"} "WARN"{"warn"} "CRITICAL"{"critical"} "DOWN"{"down"} default {""}
+            }
+            $instId = $serverId + "_" + ($instName -replace '[^a-zA-Z0-9]', '_')
+            $detId  = $instId + "_det"
+            $infId  = $instId + "_inf"
+
+            function fmtChip { param($t,$c) "<span class='chip $c'>$t</span>" }
+
+            $statusChip  = if ($primary.Status -eq "Running") { fmtChip "RUNNING" "running" }
+                           else { fmtChip "STOPPED" "stopped" }
+            $overallChip = switch ($primary.OverallStatus) {
+                "OK"       { fmtChip "OK"       "ok"       }
+                "WARN"     { fmtChip "WARN"      "warn"     }
+                "CRITICAL" { fmtChip "CRITICAL"  "critical" }
+                "DOWN"     { fmtChip "DOWN"       "down"    }
+                default    { fmtChip (HtmlEncode $primary.OverallStatus) "na" }
+            }
+            $versionVal = if ($tomcatRow -and $tomcatRow.Version)     { HtmlEncode $tomcatRow.Version }      else { "N/A" }
+            $wsVal      = if ($tomcatRow -and $tomcatRow.WorkingSetMB) { HtmlEncode $tomcatRow.WorkingSetMB } else { "N/A" }
+            $heapVal    = if ($tomcatRow -and $tomcatRow.HeapInitMB) {
+                              "Xms: $(HtmlEncode $tomcatRow.HeapInitMB) MB / Xmx: $(HtmlEncode $tomcatRow.HeapMaxMB) MB"
+                          } else { "N/A" }
+            $cpuChipClass = if ([double]$primary.CpuPct -ge 90) {"critical"} elseif ([double]$primary.CpuPct -ge 75) {"warn"} else {"ok"}
+            $memChipClass = if ([double]$primary.MemPct -ge 90) {"critical"} elseif ([double]$primary.MemPct -ge 75) {"warn"} else {"ok"}
+
+            # Detail grid
+            $detCells = ""
+            if ($serverResult) {
+                $detCells += "<div class='detail-cell'><div class='d-label'>Server Uptime</div><div class='d-value'>$(HtmlEncode $serverResult.Uptime)</div></div>"
+                $detCells += "<div class='detail-cell'><div class='d-label'>Memory</div><div class='d-value'>$($serverResult.MemUsedGB) GB / $($serverResult.MemTotalGB) GB ($($serverResult.MemPct)%)</div></div>"
+                $detCells += "<div class='detail-cell'><div class='d-label'>CPU (avg)</div><div class='d-value'>$($serverResult.CpuAvg)%</div></div>"
+                $detCells += "<div class='detail-cell full-width'><div class='d-label'>Drives</div><div class='d-value'>$(HtmlEncode $serverResult.DrivesSummary)</div></div>"
+                foreach ($de in $serverResult.DriveErrors) {
+                    $detCells += "<div class='detail-cell error-cell full-width'><div class='d-label'>Drive Critical</div><div class='d-value'>$(HtmlEncode $de)</div></div>"
+                }
+                foreach ($dw in $serverResult.DriveWarnings) {
+                    $detCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>Drive Warning</div><div class='d-value'>$(HtmlEncode $dw)</div></div>"
+                }
+            }
+            $detCells += "<div class='detail-cell'><div class='d-label'>Run As</div><div class='d-value'>$(HtmlEncode $primary.RunAs)</div></div>"
+            $detCells += "<div class='detail-cell'><div class='d-label'>Service Uptime</div><div class='d-value'>$(HtmlEncode $primary.ServiceUptime)</div></div>"
+            $detCells += "<div class='detail-cell'><div class='d-label'>Restart Config</div><div class='d-value'>$(HtmlEncode $primary.RestartConfig)</div></div>"
+            $detCells += "<div class='detail-cell'><div class='d-label'>Auto-Restarts (24h)</div><div class='d-value'>$(HtmlEncode "$($primary.AutoRestarts)")</div></div>"
+
+            if ($tomcatRow) {
+                $detCells += "<div class='detail-cell'><div class='d-label'>Tomcat Service</div><div class='d-value'>$(HtmlEncode $tomcatRow.ServiceName)</div></div>"
+                $detCells += "<div class='detail-cell'><div class='d-label'>Tomcat Version</div><div class='d-value'>$(HtmlEncode $tomcatRow.Version)</div></div>"
+                $detCells += "<div class='detail-cell full-width'><div class='d-label'>JRE Path</div><div class='d-value'>$(HtmlEncode $tomcatRow.JrePath)</div></div>"
+                $detCells += "<div class='detail-cell'><div class='d-label'>Heap Xms</div><div class='d-value'>$(if($tomcatRow.HeapInitMB){"$($tomcatRow.HeapInitMB) MB"}else{"N/A"})</div></div>"
+                $detCells += "<div class='detail-cell'><div class='d-label'>Heap Xmx</div><div class='d-value'>$(if($tomcatRow.HeapMaxMB){"$($tomcatRow.HeapMaxMB) MB"}else{"N/A"})</div></div>"
+                $detCells += "<div class='detail-cell'><div class='d-label'>Working Set</div><div class='d-value'>$(HtmlEncode $tomcatRow.WorkingSetMB)</div></div>"
+                $gcCls = if ($serverResult -and $serverResult.GcWarnings -and $serverResult.GcWarnings.Count -gt 0) { "warn-cell" } else { "" }
+                $detCells += "<div class='detail-cell $gcCls'><div class='d-label'>GC Collector</div><div class='d-value'>$(HtmlEncode $tomcatRow.GcCollector)</div></div>"
+                if ($serverResult -and $serverResult.GcWarnings) {
+                    foreach ($gw in $serverResult.GcWarnings) {
+                        $detCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>GC Warning</div><div class='d-value'>$(HtmlEncode $gw)</div></div>"
+                    }
+                }
+                if ($serverResult -and $serverResult.GcRecommend -and $serverResult.GcRecommend.Count -gt 0) {
+                    $recHtml = "<ol style='margin:4px 0 0 16px;padding:0'>"
+                    foreach ($gr in $serverResult.GcRecommend) { $recHtml += "<li style='margin-bottom:4px'>$(HtmlEncode $gr)</li>" }
+                    $recHtml += "</ol>"
+                    $detCells += "<div class='detail-cell full-width' style='background:#0d1320;border-left:3px solid #1f6feb'>" +
+                                 "<div class='d-label' style='color:#79c0ff'>GC Recommendations</div>" +
+                                 "<div class='d-value' style='color:#c9d1d9;font-family:inherit'>$recHtml</div></div>"
+                }
+            }
+            if ($csAdminRow) {
+                $detCells += "<div class='detail-cell'><div class='d-label'>CS Admin</div><div class='d-value'>$(HtmlEncode $csAdminRow.ServiceName) [$(HtmlEncode $csAdminRow.Status)]</div></div>"
+            }
+            if ($serverResult -and $serverResult.EventLines -and $serverResult.EventLines.Count -gt 0) {
+                $evText = ($serverResult.EventLines | ForEach-Object { HtmlEncode $_ }) -join "<br>"
+                $detCells += "<div class='detail-cell warn-cell full-width'><div class='d-label'>Event Log (24h)</div><div class='d-value'>$evText</div></div>"
+            }
+            foreach ($row in $serverRows) {
+                $key  = "$($row.Server)|$($row.ServiceName)"; $prev = $prevData[$key]
+                if ($prev -and ($prev.Status -ne $row.Status -or ($prev.Version -and $prev.Version -ne $row.Version))) {
+                    $chg  = if ($prev.Status  -ne $row.Status)  { "Status: $(HtmlEncode $prev.Status) &rarr; $(HtmlEncode $row.Status)" } else { "" }
+                    $chgV = if ($prev.Version -and $prev.Version -ne $row.Version) { " Version: $(HtmlEncode $prev.Version) &rarr; $(HtmlEncode $row.Version)" } else { "" }
+                    $detCells += "<div class='detail-cell changed-cell full-width'><div class='d-label'>Changed</div><div class='d-value'>$(HtmlEncode $row.ServiceName): $chg$chgV</div></div>"
+                }
+            }
+            # Append log4j findings to detail panel
+            $detCells += $log4jHtml
+
+            # Informant grid
+            $infCells = ""; $infHasIssues = $false; $infOkCount = 0; $infToggleHtml = ""
+            if ($serverResult -and $serverResult.InformantResults -and
+                $serverResult.InformantResults.Contains($instName)) {
+                foreach ($comp in $serverResult.InformantResults[$instName].Keys) {
+                    $ir      = $serverResult.InformantResults[$instName][$comp]
+                    $slowBit = if ($ir.Slow) { " <span class='chip slow'>SLOW</span>" } else { "" }
+                    $chipCls = switch ($ir.Status) {
+                        "SUCCESS"{"ok"} "FAILURE"{"failure"} "ERROR"{"error"} default{"other"}
+                    }
+                    if ($ir.Status -ne "SUCCESS") { $infHasIssues = $true } else { $infOkCount++ }
+                    $detail = if ($ir.Status -notin @("SUCCESS","FAILURE")) {
+                                  "<span class='text-muted' style='font-size:10px'>$(HtmlEncode $ir.Detail)</span>"
+                              } else { "" }
+                    $infCells += "<div class='inf-cell'>" +
+                                 "<span class='inf-comp'>$(HtmlEncode $comp)</span>" +
+                                 "<span class='chip $chipCls'>$(HtmlEncode $ir.Status)</span>$slowBit$detail" +
+                                 "<span class='inf-ms'>$($ir.Ms)ms</span></div>"
+                }
+                $infLabel = if ($infHasIssues) { "Informant  Issues detected" } else { "Informant  $infOkCount OK" }
+                $infToggleHtml = "<tr><td colspan='10'>" +
+                    "<div class='inf-toggle collapsed' onclick='toggleRow(this,&quot;$infId&quot;)' data-target='$infId'>" +
+                    "<span class='arrow'>v</span> $infLabel</div>" +
+                    "<div id='$infId' class='hidden-panel'><div class='inf-grid'>$infCells</div></div>" +
+                    "</td></tr>"
+            }
+
+            $instanceHtml += "
+            <tr class='instance-header $sc' onclick='toggleRow(this, &quot;$detId&quot;)'>
+              <td style='padding:8px 12px'><span class='arrow'>v</span></td>
+              <td><span class='inst-label'><span class='inst-name-text'>$(HtmlEncode $instName)</span></span></td>
+              <td>$statusChip</td>
+              <td class='monospace' style='padding:8px 12px;font-size:12px'>$versionVal</td>
+              <td class='monospace' style='padding:8px 12px;font-size:12px'>$wsVal</td>
+              <td class='monospace' style='padding:8px 12px;font-size:12px'>$heapVal</td>
+              <td>$(fmtChip "$($primary.CpuPct)%" $cpuChipClass)</td>
+              <td>$(fmtChip "$($primary.MemPct)%" $memChipClass)</td>
+              <td style='padding:8px 12px;font-size:12px'>$(HtmlEncode "$($primary.AutoRestarts)")</td>
+              <td>$overallChip</td>
+            </tr>
+            <tr id='$detId' style='display:none'><td colspan='10' style='padding:0'>
+              <div class='detail-panel'><div class='detail-grid'>$detCells</div></div>
+            </td></tr>
+            $infToggleHtml"
+        }
+
+        $serverHtml += "
+        <tr class='server-header $serverStatus' onclick='toggleRow(this, &quot;$serverId&quot;)'>
+          <td colspan='10'><div class='server-label'><span class='arrow'>v</span>$serverHeaderLabel</div></td>
+        </tr>
+        <tbody id='$serverId' class='collapsible'>
+          <tr><td colspan='10' style='padding:0'>
+            <table class='inner-table'>
+              <thead><tr>
+                <th style='width:32px'></th>
+                <th>Instance</th><th>Status</th><th>Version</th>
+                <th>Working Set</th><th>Heap Xms/Xmx</th>
+                <th>CPU%</th><th>Mem%</th><th>Restarts</th><th>Overall</th>
+              </tr></thead>
+              <tbody>$instanceHtml</tbody>
+            </table>
+          </td></tr>
+        </tbody>"
+    }
+
+    $htmlBody += "
+    <tr class='zone-header $zoneStatus' onclick='toggleRow(this, &quot;$zoneId&quot;)'>
+      <td colspan='10'>
+        <div class='zone-label'>
+          <span class='arrow'>v</span>
+          <span class='z-name'>$(HtmlEncode $zoneName)</span>
+          <span class='z-counts'>$zoneOK OK / $zoneWarn WARN / $zoneCrit CRIT / $zoneDown DOWN</span>
+        </div>
+      </td>
+    </tr>
+    <tbody id='$zoneId' class='collapsible'>$serverHtml</tbody>"
+}
+
+$zoneRollupHtml = foreach ($grp in $zoneSummary.Keys) {
+    $s   = $zoneSummary[$grp]
+    $cls = if ($s.DOWN -gt 0 -or $s.CRITICAL -gt 0) { "crit" } elseif ($s.WARN -gt 0) { "warn" } else { "ok" }
+    "<div class='zone-pill $cls'>" +
+    "<span class='pill-name'>$(HtmlEncode $grp)</span>" +
+    "<span class='pill-counts'>$($s.OK) OK / $($s.WARN) W / $($s.CRITICAL) C / $($s.DOWN) D</span>" +
+    "</div>"
+}
+
+# Log4j summary panel for HTML
+$log4jSummaryHtml = ""
+if ($allLog4j -and @($allLog4j).Count -gt 0) {
+    $vulnCount    = @($allLog4j | Where-Object { $_.IsVulnerable }).Count
+    $panelClass   = if ($vulnCount -gt 0) { "error-cell" } else { "detail-cell" }
+    $scanSummary  = "<div class='$panelClass' style='padding:12px 16px;margin-bottom:16px;border-radius:8px;border:1px solid #21262d'>"
+    $scanSummary += "<div class='d-label' style='font-size:12px;margin-bottom:8px'>Log4j Scan Summary"
+    $scanSummary += "  <span class='chip $(if($vulnCount -gt 0){"critical"}else{"ok"})'>$(if($vulnCount -gt 0){"$vulnCount VULNERABLE"}else{"Clean"})</span>"
+    $scanSummary += "  <span class='text-muted' style='font-size:10px;font-weight:400'>min safe: $Log4jMinSafeVersion</span></div>"
+    if ($vulnCount -gt 0) {
+        $scanSummary += "<div class='d-value'>"
+        foreach ($vf in ($allLog4j | Where-Object { $_.IsVulnerable })) {
+            $scanSummary += "$(HtmlEncode $vf.FileName)  v$(HtmlEncode $vf.Version)  &mdash;  $(HtmlEncode $vf.Path)<br>"
+        }
+        $scanSummary += "</div>"
+    }
+    $scanSummary += "</div>"
+    $log4jSummaryHtml = $scanSummary
+}
+
+$htmlContent = @"
+<!DOCTYPE html>
+<html lang='en'><head><meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Service Check Report - $timestamp</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #c9d1d9; min-height: 100vh; padding: 24px; }
+  .page-header { display: flex; align-items: center; gap: 16px; margin-bottom: 28px; padding-bottom: 20px; border-bottom: 1px solid #21262d; }
+  .page-header .logo { width: 42px; height: 42px; background: linear-gradient(135deg, #238636, #2ea043); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0; }
+  .page-header h1 { font-size: 22px; font-weight: 700; color: #e6edf3; letter-spacing: -0.3px; }
+  .page-header .subtitle { font-size: 13px; color: #8b949e; margin-top: 2px; }
+  .header-right { margin-left: auto; text-align: right; }
+  .run-time { font-size: 12px; color: #8b949e; }
+  .run-time strong { color: #c9d1d9; }
+  .stat-bar { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+  .stat-card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 14px 22px; min-width: 110px; text-align: center; }
+  .stat-card .stat-num { font-size: 28px; font-weight: 700; line-height: 1; margin-bottom: 4px; }
+  .stat-card .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: #8b949e; }
+  .stat-card.ok .stat-num { color: #3fb950; } .stat-card.warn .stat-num { color: #d29922; }
+  .stat-card.crit .stat-num { color: #f85149; } .stat-card.down .stat-num { color: #f85149; }
+  .stat-card.total .stat-num { color: #79c0ff; }
+  .section-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em; color: #8b949e; margin-bottom: 12px; }
+  .zone-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 28px; }
+  .zone-pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; border: 1px solid transparent; }
+  .zone-pill .pill-name { color: #e6edf3; } .zone-pill .pill-counts { font-size: 11px; opacity: 0.8; }
+  .zone-pill.ok { background: #0d1f12; border-color: #238636; }
+  .zone-pill.warn { background: #1f1a0d; border-color: #9e6a03; }
+  .zone-pill.crit { background: #1f0d0d; border-color: #da3633; }
+  .table-wrap { background: #161b22; border: 1px solid #21262d; border-radius: 12px; overflow: hidden; }
+  table { border-collapse: collapse; width: 100%; }
+  th { background: #1c2128; color: #8b949e; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; padding: 10px 14px; text-align: left; border-bottom: 1px solid #21262d; white-space: nowrap; }
+  td { padding: 0; border: none; font-size: 13px; }
+  .zone-header td { padding: 11px 16px; font-size: 13px; font-weight: 700; cursor: pointer; background: #1c2128; border-top: 2px solid #21262d; border-bottom: 1px solid #21262d; user-select: none; }
+  .zone-header.ok td { border-left: 3px solid #238636; } .zone-header.warn td { border-left: 3px solid #9e6a03; }
+  .zone-header.down td, .zone-header.critical td { border-left: 3px solid #da3633; }
+  .zone-label { display: flex; align-items: center; gap: 10px; }
+  .zone-label .z-name { color: #79c0ff; font-size: 13px; } .zone-label .z-counts { font-size: 11px; color: #8b949e; font-weight: 400; }
+  .server-header td { padding: 9px 16px 9px 28px; cursor: pointer; background: #161b22; border-bottom: 1px solid #21262d; user-select: none; }
+  .server-header.ok td { border-left: 3px solid #238636; } .server-header.warn td { border-left: 3px solid #9e6a03; }
+  .server-header.down td, .server-header.critical td { border-left: 3px solid #da3633; }
+  .server-label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .srv-zone { font-size: 11px; color: #8b949e; font-weight: 400; } .srv-inst { font-size: 13px; color: #3fb950; font-weight: 700; }
+  .srv-name { font-size: 13px; color: #c9d1d9; } .srv-sep { color: #30363d; font-size: 13px; }
+  .inner-table { width: 100%; border-collapse: collapse; }
+  .inner-table th { background: #0d1117; padding: 8px 12px; font-size: 10px; }
+  .instance-header td { padding: 8px 12px; cursor: pointer; background: #0f1117; border-bottom: 1px solid #21262d; user-select: none; font-size: 12px; }
+  .instance-header:hover td { background: #161b22; }
+  .inst-label { display: flex; align-items: center; gap: 6px; }
+  .inst-name-text { color: #e6edf3; font-weight: 600; }
+  .chip { display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; white-space: nowrap; }
+  .chip.ok, .chip.running { background: #0d1f12; color: #3fb950; border: 1px solid #238636; }
+  .chip.warn { background: #1f1a0d; color: #d29922; border: 1px solid #9e6a03; }
+  .chip.critical, .chip.failure, .chip.stopped, .chip.down, .chip.error { background: #1f0d0d; color: #f85149; border: 1px solid #da3633; }
+  .chip.other { background: #1a1f2e; color: #79c0ff; border: 1px solid #1f6feb; }
+  .chip.slow { background: #1f1508; color: #e3b341; border: 1px solid #bb8009; }
+  .chip.na { background: #161b22; color: #8b949e; border: 1px solid #30363d; }
+  .detail-panel { background: #0d1117; border-bottom: 1px solid #21262d; }
+  .detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 1px; background: #21262d; border-top: 1px solid #21262d; }
+  .detail-cell { background: #0d1117; padding: 8px 16px; display: flex; flex-direction: column; gap: 2px; }
+  .detail-cell .d-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: #8b949e; }
+  .detail-cell .d-value { font-size: 12px; color: #c9d1d9; word-break: break-all; font-family: 'Cascadia Code', 'Consolas', monospace; }
+  .detail-cell.full-width { grid-column: 1 / -1; }
+  .detail-cell.error-cell { background: #130a0a; } .detail-cell.error-cell .d-label { color: #f85149; } .detail-cell.error-cell .d-value { color: #f85149; font-weight: 600; }
+  .detail-cell.warn-cell { background: #13100a; } .detail-cell.warn-cell .d-label { color: #d29922; } .detail-cell.warn-cell .d-value { color: #d29922; }
+  .detail-cell.changed-cell { background: #130f00; } .detail-cell.changed-cell .d-label { color: #e3b341; } .detail-cell.changed-cell .d-value { color: #e3b341; }
+  .inf-toggle { display: flex; align-items: center; gap: 8px; padding: 7px 16px; cursor: pointer; background: #0d1117; border-top: 1px solid #21262d; border-bottom: 1px solid #21262d; user-select: none; font-size: 12px; font-weight: 600; color: #79c0ff; }
+  .inf-toggle:hover { background: #161b22; }
+  .inf-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1px; background: #21262d; }
+  .inf-cell { background: #0a0d13; padding: 7px 14px; display: flex; align-items: center; gap: 8px; }
+  .inf-cell .inf-comp { font-size: 11px; font-weight: 600; color: #8b949e; width: 100px; flex-shrink: 0; font-family: 'Cascadia Code', 'Consolas', monospace; }
+  .inf-cell .inf-ms { font-size: 10px; color: #484f58; margin-left: auto; }
+  .arrow { display: inline-block; width: 16px; height: 16px; flex-shrink: 0; border-radius: 4px; background: #21262d; text-align: center; line-height: 16px; font-size: 9px; color: #8b949e; transition: transform 0.18s ease, background 0.15s; font-style: normal; }
+  .collapsed .arrow { transform: rotate(-90deg); }
+  .collapsible { display: table-row-group; } .hidden-panel { display: none; }
+  .monospace { font-family: 'Cascadia Code', 'Consolas', monospace; } .text-muted { color: #8b949e; } .mt-16 { margin-top: 16px; }
+</style></head><body>
+<div class='page-header'>
+  <div class='logo'>S</div>
+  <div><h1>Service Check Report</h1><div class='subtitle'>Tomcat / Content Server / CS Admin</div></div>
+  <div class='header-right'>
+    <div class='run-time'><strong>Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</div>
+    <div class='run-time'><strong>Servers:</strong> $serverCount &nbsp;|&nbsp; <strong>Auto-restart:</strong> $(if ($AutoRestartStopped) { 'On' } else { 'Off' })</div>
+  </div>
+</div>
+$log4jSummaryHtml
+<div class='stat-bar' id='stat-bar'></div>
+<p class='section-title'>Zones</p>
+<div class='zone-pills'>$($zoneRollupHtml -join '')</div>
+<p class='section-title mt-16'>Detail</p>
+<div class='table-wrap'>
+<table id='main-table'>
+  <thead><tr>
+    <th style='width:32px'></th><th>Instance</th><th>Status</th><th>Version</th>
+    <th>Working Set</th><th>Heap Xms/Xmx</th><th>CPU%</th><th>Mem%</th><th>Restarts</th><th>Overall</th>
+  </tr></thead>
+  <tbody>$htmlBody</tbody>
+</table>
+</div>
+<script>
+function toggleRow(h, id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    var hidden = el.style.display === 'none' || el.classList.contains('hidden-panel');
+    el.style.display = (el.tagName === 'TBODY') ? (hidden ? 'table-row-group' : 'none') : (hidden ? 'block' : 'none');
+    h.classList.toggle('collapsed', !hidden);
+}
+window.addEventListener('DOMContentLoaded', function () {
+    document.querySelectorAll('.collapsible').forEach(function(e){ e.style.display='none'; });
+    document.querySelectorAll('.hidden-panel').forEach(function(e){ e.style.display='none'; });
+    document.querySelectorAll('.zone-header,.server-header,.instance-header,.inf-toggle').forEach(function(r){ r.classList.add('collapsed'); });
+    var sel = ['.zone-header.warn','.zone-header.down','.zone-header.critical',
+               '.server-header.warn','.server-header.down','.server-header.critical',
+               '.instance-header.warn','.instance-header.down','.instance-header.critical'].join(',');
+    document.querySelectorAll(sel).forEach(function(row){
+        var next = row.nextElementSibling;
+        while (next && next.tagName !== 'TBODY') { next = next.nextElementSibling; }
+        if (next) { next.style.display = 'table-row-group'; row.classList.remove('collapsed'); }
+    });
+    document.querySelectorAll('.inf-toggle').forEach(function(row){
+        var id = row.getAttribute('data-target');
+        var el = id ? document.getElementById(id) : null;
+        if (el && el.querySelector('.chip.failure,.chip.error')) { el.style.display='block'; row.classList.remove('collapsed'); }
+    });
+    var ok=0, warn=0, crit=0, down=0;
+    document.querySelectorAll('.instance-header').forEach(function(r){
+        if (r.classList.contains('ok')) ok++;
+        else if (r.classList.contains('warn')) warn++;
+        else if (r.classList.contains('critical')) crit++;
+        else if (r.classList.contains('down')) down++;
+    });
+    document.getElementById('stat-bar').innerHTML =
+        mk(ok+warn+crit+down,'Total','total')+mk(ok,'Healthy','ok')+mk(warn,'Warning','warn')+mk(crit,'Critical','crit')+mk(down,'Down','down');
+});
+function mk(n,l,c){ return "<div class='stat-card "+c+"'><div class='stat-num'>"+n+"</div><div class='stat-label'>"+l+"</div></div>"; }
+</script>
+</body></html>
+"@
+
+$utf8Bom = New-Object System.Text.UTF8Encoding $true
+[System.IO.File]::WriteAllText($htmlFile, $htmlContent, $utf8Bom)
+Write-Log "HTML report    : $htmlFile" -Color Green
+
 # ── Alerts ────────────────────────────────────────────────────────────────────
 $issueRows = $allCsvRows | Where-Object { $_.OverallStatus -in @("DOWN","CRITICAL") }
 $alertLines = @()
