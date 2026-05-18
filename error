@@ -1,34 +1,18 @@
- │  CLUSTER PAUSE — server 1 of 4 complete                 │
-  │  Completed : AZASVWPP049.dir.ad.dla.mil
-  │  Next      : AZASVWPP048.dir.ad.dla.mil
-  ├─────────────────────────────────────────────────────┤
-  │  [ENTER] Next     [R] Rollback all   [Q] Quit      │
-  └─────────────────────────────────────────────────────┘
-
-Exception calling "ReadKey" with "1" argument(s): "The method or operation is not implemented."
-At C:\DLA-FAILSAFE\patching\newcert.ps1:527 char:9
-+         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [], MethodInvocationException
-    + FullyQualifiedErrorId : NotImplementedException
- 
-You cannot call a method on a null-valued expression.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:527 char:9
-+         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
-    + FullyQualifiedErrorId : InvokeMethodOnNull
- 
-Exception calling "ReadKey" with "1" argument(s): "The method or operation is not implemented."
-At C:\DLA-FAILSAFE\patching\newcert.ps1:527 char:9
-+         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [], MethodInvocationException
-    + FullyQualifiedErrorId : NotImplementedException
- 
-You cannot call a method on a null-valued expression.
-At C:\DLA-FAILSAFE\patching\newcert.ps1:527 char:9
-+         $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : InvalidOperation: (:) [], RuntimeException
-    + FullyQualifiedErrorId : InvokeMethodOnNull
+PS C:\DLA-FAILSAFE\patching> .\status.ps1
+At C:\DLA-FAILSAFE\patching\status.ps1:499 char:39
++             [void]$jobLog.Add("[INFO] $ComputerName: CIM session esta ...
++                                       ~~~~~~~~~~~~~~
+Variable reference is not valid. ':' was not followed by a valid variable name character. Consider using ${} to delimit the 
+name.
+At C:\DLA-FAILSAFE\patching\status.ps1:504 char:39
++             [void]$jobLog.Add("[WARN] $ComputerName: CIM/$protocol fa ...
++                                       ~~~~~~~~~~~~~~
+Variable reference is not valid. ':' was not followed by a valid variable name character. Consider using ${} to delimit the 
+name.
+At C:\DLA-FAILSAFE\patching\status.ps1:787 char:58
++ ... tch { $icError = $_; [void]$jobLog.Add("[WARN] $ComputerName: Invoke- ...
++                                                    ~~~~~~~~~~~~~~
+Variable reference is not valid. ':' was not followed by a valid variable name character. Consider using ${} to delimit the 
+name.
+    + CategoryInfo          : ParserError: (:) [], ParseException
+    + FullyQualifiedErrorId : InvalidVariableReferenceWithDrive
