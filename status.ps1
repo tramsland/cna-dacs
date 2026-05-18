@@ -1387,39 +1387,58 @@ $htmlRows | Group-Object Zone | ForEach-Object {
         }
         $log4jHtml = ""
         if ($serverLog4j.Count -gt 0) {
-            $log4jCells = ""
+            # Build Log4j rows grouped by scan root
+            $l4jVulnCount = @($serverLog4j | Where-Object { $_.IsVulnerable }).Count
+            $l4jHasIssue  = $l4jVulnCount -gt 0 -or ($serverLog4j | Where-Object { $_.Status -in @('SCAN_ERROR','UNKNOWN_VERSION') }).Count -gt 0
+            $l4jBannerClass = if ($l4jVulnCount -gt 0) { 'error-cell' } elseif ($l4jHasIssue) { 'warn-cell' } else { '' }
+            $l4jBannerChip  = if ($l4jVulnCount -gt 0) { "<span class='chip critical' style='font-size:9px;padding:1px 6px'>$l4jVulnCount VULNERABLE</span>" }
+                              elseif ($l4jHasIssue)    { "<span class='chip warn'     style='font-size:9px;padding:1px 6px'>Issues</span>" }
+                              else                      { "<span class='chip ok'       style='font-size:9px;padding:1px 6px'>Clean</span>" }
+            $log4jRows = ""
             foreach ($lf in $serverLog4j) {
                 $lfClass = switch ($lf.Status) {
-                    "VULNERABLE"          { "error-cell" }
-                    "UNKNOWN_VERSION"     { "warn-cell"  }
-                    "SCAN_ROOT_NOT_FOUND" { "warn-cell"  }
-                    "SCAN_ERROR"          { "error-cell" }
-                    default               { ""           }
+                    'VULNERABLE'          { 'error-cell' }
+                    'UNKNOWN_VERSION'     { 'warn-cell'  }
+                    'SCAN_ROOT_NOT_FOUND' { 'warn-cell'  }
+                    'SCAN_ERROR'          { 'error-cell' }
+                    default               { ''           }
                 }
                 $lfLabel = switch ($lf.Status) {
-                    "OK"                  { "OK"          }
-                    "VULNERABLE"          { "VULNERABLE"  }
-                    "NOT_FOUND"           { "Not found"   }
-                    "SCAN_ROOT_NOT_FOUND" { "Path missing" }
-                    "UNKNOWN_VERSION"     { "Unknown ver" }
-                    "SCAN_ERROR"          { "Scan error"  }
-                    default               { $lf.Status    }
+                    'OK'                  { 'OK'           }
+                    'VULNERABLE'          { 'VULNERABLE'   }
+                    'NOT_FOUND'           { 'Not found'    }
+                    'SCAN_ROOT_NOT_FOUND' { 'Path missing' }
+                    'UNKNOWN_VERSION'     { 'Unknown ver'  }
+                    'SCAN_ERROR'          { 'Scan error'   }
+                    default               { $lf.Status     }
                 }
                 $lfChipClass = switch ($lf.Status) {
-                    "OK"      { "ok"      }
-                    "VULNERABLE" { "critical" }
-                    default   { "warn"    }
+                    'OK'         { 'ok'       }
+                    'VULNERABLE' { 'critical' }
+                    default      { 'warn'     }
                 }
-                $lfDetail = if ($lf.FileName) {
-                    "$(HtmlEncode $lf.FileName)  v$(HtmlEncode $lf.Version)  <span class='text-muted'>($(HtmlEncode $lf.VersionSrc))</span><br><span class='text-muted' style='font-size:10px'>$(HtmlEncode $lf.Path)</span>"
+                $lfScanRoot  = if ($lf.ScanRoot) { "<span class='d-label' style='display:block;margin-bottom:2px'>Scan root: $(HtmlEncode $lf.ScanRoot)</span>" } else { '' }
+                $lfDetail    = if ($lf.FileName) {
+                    "<span class='monospace' style='font-size:12px'>$(HtmlEncode $lf.FileName)</span>" +
+                    "  <span class='chip $lfChipClass' style='font-size:9px;padding:1px 6px'>$lfLabel</span>" +
+                    "  <span class='text-muted'>v$(HtmlEncode $lf.Version) ($(HtmlEncode $lf.VersionSrc))</span><br>" +
+                    "<span class='text-muted' style='font-size:10px;font-family:monospace'>$(HtmlEncode $lf.Path)</span>"
                 } elseif ($lf.ScanRoot) {
-                    "<span class='text-muted'>$(HtmlEncode $lf.ScanRoot)</span>"
-                } else { "" }
-                $log4jCells += "<div class='detail-cell $lfClass full-width'>" +
-                    "<div class='d-label'>Log4j <span class='chip $lfChipClass' style='font-size:9px;padding:1px 6px'>$lfLabel</span></div>" +
-                    "<div class='d-value'>$lfDetail</div></div>"
+                    "<span class='chip $lfChipClass' style='font-size:9px;padding:1px 6px'>$lfLabel</span>" +
+                    "  <span class='text-muted' style='font-size:11px'>$(HtmlEncode $lf.ScanRoot)</span>"
+                } else { "<span class='chip $lfChipClass' style='font-size:9px;padding:1px 6px'>$lfLabel</span>" }
+                $log4jRows += "<div class='l4j-row $lfClass'>$lfScanRoot<div class='l4j-detail'>$lfDetail</div></div>"
             }
-            $log4jHtml = $log4jCells
+            $l4jId  = $serverId + '_log4j'
+            $log4jHtml = "<div class='detail-cell $l4jBannerClass full-width' style='padding:0'>" +
+                "<div class='l4j-header' onclick='toggleRow(this,&quot;$l4jId&quot;)' data-target='$l4jId'>" +
+                "<span class='arrow'>v</span>" +
+                "<span style='font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#8b949e'>Log4j Scan</span>" +
+                "  $l4jBannerChip" +
+                "  <span class='text-muted' style='font-size:10px'>min safe: $Log4jMinSafeVersion &nbsp;|&nbsp; $($serverLog4j.Count) jar(s) scanned</span>" +
+                "</div>" +
+                "<div id='$l4jId' class='l4j-body hidden-panel'>$log4jRows</div>" +
+                "</div>"
         }
 
         $csRows | ForEach-Object {
@@ -1604,23 +1623,66 @@ $zoneRollupHtml = foreach ($grp in $zoneSummary.Keys) {
 # Log4j summary panel for HTML
 $log4jSummaryHtml = ""
 if ($allLog4j -and @($allLog4j).Count -gt 0) {
-    $vulnCount    = @($allLog4j | Where-Object { $_.IsVulnerable }).Count
-    $panelClass   = if ($vulnCount -gt 0) { "error-cell" } else { "detail-cell" }
-    $scanSummary  = "<div class='$panelClass' style='padding:12px 16px;margin-bottom:16px;border-radius:8px;border:1px solid #21262d'>"
-    $scanSummary += "<div class='d-label' style='font-size:12px;margin-bottom:8px'>Log4j Scan Summary"
-    $chipClass    = if ($vulnCount -gt 0) { 'critical' } else { 'ok' }
-    $chipLabel    = if ($vulnCount -gt 0) { "$vulnCount VULNERABLE" } else { 'Clean' }
-    $scanSummary += "  <span class='chip $chipClass'>$chipLabel</span>"
-    $scanSummary += "  <span class='text-muted' style='font-size:10px;font-weight:400'>min safe: $Log4jMinSafeVersion</span></div>"
-    if ($vulnCount -gt 0) {
-        $scanSummary += "<div class='d-value'>"
-        foreach ($vf in ($allLog4j | Where-Object { $_.IsVulnerable })) {
-            $scanSummary += "$(HtmlEncode $vf.FileName)  v$(HtmlEncode $vf.Version)  &mdash;  $(HtmlEncode $vf.Path)<br>"
+    $totalVuln   = @($allLog4j | Where-Object { $_.IsVulnerable }).Count
+    $summaryRows = ""
+
+    # Build one row per server showing its Log4j status
+    foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
+        $svrFindings = @($result.Log4jFindings | Where-Object { $_ })
+        if ($svrFindings.Count -eq 0) { continue }
+        $svrVuln    = @($svrFindings | Where-Object { $_.IsVulnerable }).Count
+        $svrIssues  = @($svrFindings | Where-Object { $_.Status -in @('SCAN_ERROR','UNKNOWN_VERSION','SCAN_ROOT_NOT_FOUND') }).Count
+        $svrRowClass = if ($svrVuln -gt 0) { 'l4j-srv-vuln' } elseif ($svrIssues -gt 0) { 'l4j-srv-warn' } else { 'l4j-srv-ok' }
+        $svrChipCls  = if ($svrVuln -gt 0) { 'critical' } elseif ($svrIssues -gt 0) { 'warn' } else { 'ok' }
+        $svrChipTxt  = if ($svrVuln -gt 0) { "$svrVuln VULNERABLE" } elseif ($svrIssues -gt 0) { 'Issues' } else { 'Clean' }
+        $svrJarCount = @($svrFindings | Where-Object { $_.FileName }).Count
+
+        # Detail rows for this server (vulnerable + issues only in summary; clean collapsed)
+        $svrDetailRows = ""
+        foreach ($lf in ($svrFindings | Where-Object { $_.FileName } | Sort-Object IsVulnerable -Descending)) {
+            $dChip = if ($lf.IsVulnerable) { "<span class='chip critical' style='font-size:9px;padding:1px 5px'>VULNERABLE</span>" }
+                     else                   { "<span class='chip ok'       style='font-size:9px;padding:1px 5px'>OK</span>" }
+            $svrDetailRows += "<tr class='l4j-detail-row $(if($lf.IsVulnerable){'l4j-vuln-row'} else {''})'>"
+            $svrDetailRows += "<td class='l4j-td'>$(HtmlEncode $result.GroupName)</td>"
+            $svrDetailRows += "<td class='l4j-td monospace'>$(HtmlEncode $result.ComputerName)</td>"
+            $svrDetailRows += "<td class='l4j-td monospace'>$(HtmlEncode $lf.FileName)</td>"
+            $svrDetailRows += "<td class='l4j-td'>$dChip v$(HtmlEncode $lf.Version)</td>"
+            $svrDetailRows += "<td class='l4j-td' style='font-size:10px;color:#8b949e'>$(HtmlEncode $lf.Path)</td>"
+            $svrDetailRows += "</tr>"
         }
-        $scanSummary += "</div>"
+
+        $svrId = 'l4j_' + ($result.ComputerName -replace '[^a-zA-Z0-9]','_')
+        $summaryRows += "<tr class='l4j-srv-row $svrRowClass' onclick='toggleRow(this,&quot;$svrId&quot;)'>"
+        $summaryRows += "<td class='l4j-td'><span class='arrow'>v</span> $(HtmlEncode $result.GroupName)</td>"
+        $summaryRows += "<td class='l4j-td monospace' style='font-weight:600'>$(HtmlEncode $result.ComputerName)</td>"
+        $summaryRows += "<td class='l4j-td'><span class='chip $svrChipCls'>$svrChipTxt</span></td>"
+        $summaryRows += "<td class='l4j-td' style='color:#8b949e'>$svrJarCount jar(s) found</td>"
+        $summaryRows += "<td class='l4j-td' style='color:#8b949e'>min safe: $Log4jMinSafeVersion</td>"
+        $summaryRows += "</tr>"
+        if ($svrDetailRows) {
+            $summaryRows += "<tr><td colspan='5' style='padding:0'><table class='l4j-inner' id='$svrId' style='display:none'>"
+            $summaryRows += "<thead><tr><th class='l4j-th'>Zone</th><th class='l4j-th'>Server</th><th class='l4j-th'>Jar</th><th class='l4j-th'>Status</th><th class='l4j-th'>Path</th></tr></thead>"
+            $summaryRows += "<tbody>$svrDetailRows</tbody></table></td></tr>"
+        }
     }
-    $scanSummary += "</div>"
-    $log4jSummaryHtml = $scanSummary
+
+    $totalChipCls = if ($totalVuln -gt 0) { 'critical' } else { 'ok' }
+    $totalChipTxt = if ($totalVuln -gt 0) { "$totalVuln VULNERABLE" } else { 'All Clean' }
+    $log4jSummaryHtml = "
+<div class='l4j-section'>
+  <div class='l4j-section-header'>
+    <span class='l4j-title'>Log4j Scan</span>
+    <span class='chip $totalChipCls'>$totalChipTxt</span>
+    <span class='text-muted' style='font-size:11px'>min safe: $Log4jMinSafeVersion</span>
+  </div>
+  <div class='table-wrap' style='margin-bottom:28px'>
+  <table><thead><tr>
+    <th>Zone</th><th>Server</th><th>Status</th><th>Jars</th><th>Policy</th>
+  </tr></thead>
+  <tbody>$summaryRows</tbody>
+  </table></div>
+</div>
+"
 }
 
 $htmlContent = @"
@@ -1699,6 +1761,29 @@ $htmlContent = @"
   .collapsed .arrow { transform: rotate(-90deg); }
   .collapsible { display: table-row-group; } .hidden-panel { display: none; }
   .monospace { font-family: 'Cascadia Code', 'Consolas', monospace; } .text-muted { color: #8b949e; } .mt-16 { margin-top: 16px; }
+  /* ── Log4j section ── */
+  .l4j-section { margin-bottom: 28px; }
+  .l4j-section-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .l4j-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: #8b949e; }
+  .l4j-srv-row { cursor: pointer; user-select: none; }
+  .l4j-srv-row td { padding: 9px 14px; border-bottom: 1px solid #21262d; font-size: 12px; background: #161b22; }
+  .l4j-srv-row:hover td { background: #1c2128; }
+  .l4j-srv-vuln td { border-left: 3px solid #da3633; }
+  .l4j-srv-warn td { border-left: 3px solid #9e6a03; }
+  .l4j-srv-ok   td { border-left: 3px solid #238636; }
+  .l4j-inner { width: 100%; border-collapse: collapse; }
+  .l4j-th { background: #0d1117; color: #8b949e; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; padding: 7px 14px; text-align: left; border-bottom: 1px solid #21262d; }
+  .l4j-td { padding: 7px 14px; border-bottom: 1px solid #161b22; font-size: 12px; vertical-align: top; }
+  .l4j-detail-row td { background: #0d1117; }
+  .l4j-vuln-row td { background: #130a0a; color: #f85149; }
+  /* ── Log4j inline (per-instance detail panel) ── */
+  .l4j-header { display: flex; align-items: center; gap: 8px; padding: 8px 14px; cursor: pointer; user-select: none; font-size: 11px; border-top: 1px solid #21262d; }
+  .l4j-header:hover { background: #161b22; }
+  .l4j-body { border-top: 1px solid #21262d; }
+  .l4j-row { padding: 8px 16px; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .l4j-row.error-cell { background: #130a0a; }
+  .l4j-row.warn-cell  { background: #13100a; }
+  .l4j-detail { margin-top: 3px; font-family: 'Cascadia Code','Consolas',monospace; }
 </style></head><body>
 <div class='page-header'>
   <div class='logo'>S</div>
