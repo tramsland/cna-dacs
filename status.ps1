@@ -22,17 +22,17 @@ param(
 #endregion
 
 #region Configuration
-# Fix: $PSScriptRoot is empty when run directly from the console (not dot-sourced from a file).
-# Fall back to the script's own path, then to the current working directory.
-if (-not $PSScriptRoot) {
-    $PSScriptRoot = if ($MyInvocation.MyCommand.Path) {
-        Split-Path $MyInvocation.MyCommand.Path -Parent
-    } else {
-        (Get-Location).Path
-    }
+# $PSScriptRoot is read-only in PS 5.1 and empty in some interactive contexts.
+# Use $scriptDir for all output paths so files stay local to the script.
+$scriptDir = if ($PSScriptRoot) {
+    $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Path) {
+    Split-Path $MyInvocation.MyCommand.Path -Parent
+} else {
+    (Get-Location).Path
 }
 
-$configFile = Join-Path $PSScriptRoot "servers.txt"
+$configFile = Join-Path $scriptDir "servers.txt"
 if (-not (Test-Path $configFile)) {
     Write-Host "ERROR: Server config file not found: $configFile" -ForegroundColor Red
     Write-Host "Create a servers.txt file in the same directory as this script," -ForegroundColor Yellow
@@ -66,9 +66,9 @@ if ($serverCount -eq 0) {
 }
 
 $timestamp        = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile          = Join-Path $PSScriptRoot ("ServiceCheck_" + $timestamp + ".log")
-$csvFile          = Join-Path $PSScriptRoot ("ServiceCheck_" + $timestamp + ".csv")
-$htmlFile         = Join-Path $PSScriptRoot ("ServiceCheck_" + $timestamp + ".html")
+$logFile          = Join-Path $scriptDir ("ServiceCheck_" + $timestamp + ".log")
+$csvFile          = Join-Path $scriptDir ("ServiceCheck_" + $timestamp + ".csv")
+$htmlFile         = Join-Path $scriptDir ("ServiceCheck_" + $timestamp + ".html")
 $webTimeoutSec    = 45
 $jobTimeoutSec    = 300
 $eventLogCount    = 5
@@ -476,11 +476,29 @@ $checkServicesScript = {
         return $instanceResults
     }
 
-    # ── CIM session ───────────────────────────────────────────────────────────
-    $cimParams = @{ ComputerName = $ComputerName; ErrorAction = "Stop" }
-    if ($Credential) { $cimParams["Credential"] = $Credential }
-    try { $session = New-CimSession @cimParams }
-    catch {
+    # ── CIM session (WSMan first, DCOM fallback) ──────────────────────────────
+    # WSMan (WinRM) is preferred; fall back to DCOM if WinRM is unavailable.
+    $session = $null
+    $sessionError = $null
+    $sessionProtocol = $null
+    foreach ($protocol in @('Wsman','Dcom')) {
+        try {
+            $opt = New-CimSessionOption -Protocol $protocol
+            $cimParams = @{ ComputerName = $ComputerName; SessionOption = $opt; ErrorAction = 'Stop' }
+            if ($Credential) { $cimParams['Credential'] = $Credential }
+            $session = New-CimSession @cimParams
+            $jobLog.Add("[INFO] $ComputerName: CIM session established via $protocol")
+            $sessionProtocol = $protocol
+            break
+        } catch {
+            $sessionError = $_
+            $jobLog.Add("[WARN] $ComputerName: CIM/$protocol failed - $_")
+        }
+    }
+    if (-not $session) {
+    # mimic original catch block below
+    $_ = $sessionError
+    if ($true) {
         $out = New-Object System.Collections.Generic.List[string]
         $out.Add(""); $out.Add("========================================")
         $out.Add("Zone     : $GroupName"); $out.Add("Server   : $ComputerName")
@@ -497,7 +515,7 @@ $checkServicesScript = {
             Log4jFindings = @(); JobLog = $jobLog
         })
         return $instanceResults
-    }
+    }}
 
     # ── System data ───────────────────────────────────────────────────────────
     $os         = Get-CimInstance -CimSession $session -ClassName Win32_OperatingSystem -ErrorAction Stop
@@ -756,12 +774,16 @@ $checkServicesScript = {
             }
         }
         if ($Credential) { $icParams["Credential"] = $Credential }
-        $tomcatInfo    = try { Invoke-Command @icParams } catch { $null }
-        $tomcatVersion = if ($tomcatInfo) { $tomcatInfo.Version     } else { "Unable to retrieve" }
+        # Invoke-Command requires WinRM; skip gracefully if we fell back to DCOM.
+        $tomcatInfo = $null
+        $icError    = $null
+        try   { $tomcatInfo = Invoke-Command @icParams }
+        catch { $icError = $_; $jobLog.Add("[WARN] $ComputerName: Invoke-Command (Tomcat info) failed - $_") }
+        $tomcatVersion = if ($tomcatInfo) { $tomcatInfo.Version     } elseif ($icError) { "WinRM unavailable" } else { "Unable to retrieve" }
         $jrePath       = if ($tomcatInfo) { $tomcatInfo.JrePath     } else { "N/A" }
         $heapInitMB    = if ($tomcatInfo) { $tomcatInfo.HeapInitMB  } else { $null }
         $heapMaxMB     = if ($tomcatInfo) { $tomcatInfo.HeapMaxMB   } else { $null }
-        $gcCollector   = if ($tomcatInfo) { $tomcatInfo.GcCollector } else { "N/A" }
+        $gcCollector   = if ($tomcatInfo) { $tomcatInfo.GcCollector } elseif ($icError) { "N/A (WinRM unavailable)" } else { "N/A" }
         $tomcatHome    = if ($tomcatInfo) { $tomcatInfo.TomcatHome  } else { $null }
         if ($tomcatInfo -and $tomcatInfo.GcWarnings)  { foreach ($w in $tomcatInfo.GcWarnings)  { $gcWarnings.Add($w)  } }
         if ($tomcatInfo -and $tomcatInfo.GcRecommend) { foreach ($r in $tomcatInfo.GcRecommend) { $gcRecommend.Add($r) } }
@@ -1031,7 +1053,7 @@ $checkServicesScript = {
             if ($Credential) { $icLog4jParams["Credential"] = $Credential }
             $log4jFindings = @(Invoke-Command @icLog4jParams)
         } catch {
-            $jobLog.Add("[WARN] Log4j scan failed on $ComputerName : $_")
+            $jobLog.Add("[WARN] Log4j scan failed on $ComputerName (WinRM/Invoke-Command error): $_")
             $log4jFindings = @([PSCustomObject]@{
                 ScanRoot = ""; Path = ""; FileName = ""; Version = "ERROR"
                 VersionSrc = ""; Status = "SCAN_ERROR"; IsVulnerable = $false
@@ -1170,7 +1192,7 @@ foreach ($result in $results) {
 
 # ── Delta detection ───────────────────────────────────────────────────────────
 $prevData = @{}
-$prevCsvs = Get-ChildItem -Path $PSScriptRoot -Filter "ServiceCheck_*.csv" -ErrorAction SilentlyContinue |
+$prevCsvs = Get-ChildItem -Path $scriptDir -Filter "ServiceCheck_*.csv" -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -ne (Split-Path $csvFile -Leaf) } |
             Sort-Object LastWriteTime -Descending
 if ($prevCsvs) {
@@ -1282,7 +1304,7 @@ if ($allCsvRows) {
 }
 
 # ── Log4j CSV (separate file for easy distribution to security team) ──────────
-$log4jCsvFile = Join-Path $PSScriptRoot ("Log4jScan_" + $timestamp + ".csv")
+$log4jCsvFile = Join-Path $scriptDir ("Log4jScan_" + $timestamp + ".csv")
 if ($allLog4j) {
     # Attach ComputerName to each finding for the CSV
     $log4jCsvRows = foreach ($result in $results) {
