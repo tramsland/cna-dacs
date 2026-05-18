@@ -17,7 +17,7 @@ param(
 
     # Log4j: flag anything below this version as VULNERABLE
     # Log4j 2.x latest is 2.24.3 — set your org standard here
-    [string]$Log4jMinSafeVersion = "2.17.1"
+    [string]$Log4jMinSafeVersion = "2.25.4"
 )
 #endregion
 
@@ -1025,11 +1025,14 @@ $checkServicesScript = {
     #      (derived from service PathName: walk up from exe to instance root,
     #       then append \webservices)
     # =========================================================================
-    $log4jScanRoots = New-Object System.Collections.Generic.List[string]
+    $log4jScanRoots   = New-Object System.Collections.Generic.List[string]
+    $log4jRootToInst  = @{}   # maps scan root path -> instance name
 
     # Tomcat webapps
     if ($tomcatHome) {
-        [void]$log4jScanRoots.Add((Join-Path $tomcatHome "webapps"))
+        $tRoot = Join-Path $tomcatHome "webapps"
+        [void]$log4jScanRoots.Add($tRoot)
+        $log4jRootToInst[$tRoot] = "Tomcat"
     }
 
     # Content Server webservices — one per CS instance
@@ -1041,6 +1044,7 @@ $checkServicesScript = {
             $csRoot = Split-Path (Split-Path $exePath -Parent) -Parent
             $wsDir  = Join-Path $csRoot "webservices"
             [void]$log4jScanRoots.Add($wsDir)
+            $log4jRootToInst[$wsDir] = $cs.Name
         }
     }
 
@@ -1060,6 +1064,13 @@ $checkServicesScript = {
             }
             if ($Credential) { $icLog4jParams["Credential"] = $Credential }
             $log4jFindings = @(Invoke-Command @icLog4jParams)
+            # Tag each finding with the instance name derived from its scan root
+            foreach ($lf in $log4jFindings) {
+                $instName = if ($lf.ScanRoot -and $log4jRootToInst.ContainsKey($lf.ScanRoot)) {
+                    $log4jRootToInst[$lf.ScanRoot]
+                } else { 'Unknown' }
+                $lf | Add-Member -NotePropertyName InstanceName -NotePropertyValue $instName -Force
+            }
         } catch {
             [void]$jobLog.Add("[WARN] Log4j scan failed on $ComputerName (WinRM/Invoke-Command error): $_")
             $log4jFindings = @([PSCustomObject]@{
@@ -1643,7 +1654,10 @@ if ($allLog4j -and @($allLog4j).Count -gt 0) {
             $dChip = if ($lf.IsVulnerable) { "<span class='chip critical' style='font-size:9px;padding:1px 5px'>VULNERABLE</span>" }
                      else                   { "<span class='chip ok'       style='font-size:9px;padding:1px 5px'>OK</span>" }
             $svrDetailRows += "<tr class='l4j-detail-row $(if($lf.IsVulnerable){'l4j-vuln-row'} else {''})'>"
-            $svrDetailRows += "<td class='l4j-td'>$(HtmlEncode $result.GroupName)</td>"
+            $instLabel = if ($lf.PSObject.Properties['InstanceName'] -and $lf.InstanceName) { $lf.InstanceName } else { '' }
+            $zoneCellHtml = "$(HtmlEncode $result.GroupName)"
+            if ($instLabel) { $zoneCellHtml += "<br><span style='font-size:10px;color:#8b949e;font-family:monospace'>$(HtmlEncode $instLabel)</span>" }
+            $svrDetailRows += "<td class='l4j-td'>$zoneCellHtml</td>"
             $svrDetailRows += "<td class='l4j-td monospace'>$(HtmlEncode $result.ComputerName)</td>"
             $svrDetailRows += "<td class='l4j-td monospace'>$(HtmlEncode $lf.FileName)</td>"
             $svrDetailRows += "<td class='l4j-td'>$dChip v$(HtmlEncode $lf.Version)</td>"
