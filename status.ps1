@@ -22,15 +22,24 @@ param(
 #endregion
 
 #region Configuration
-# $PSScriptRoot is read-only in PS 5.1 and empty in some interactive contexts.
-# Use $scriptDir for all output paths so files stay local to the script.
-$scriptDir = if ($PSScriptRoot) {
-    $PSScriptRoot
+# Resolve the directory the script lives in — used for ALL output files.
+# Priority: $PSScriptRoot (set by PS when run as a file) -> $MyInvocation.MyCommand.Path
+# -> $MyInvocation.ScriptName -> explicit error. Never fall back to cwd so files
+# never end up in C:\logs or wherever the shell happens to be open.
+$scriptDir = $null
+if ($PSScriptRoot -and (Test-Path $PSScriptRoot)) {
+    $scriptDir = $PSScriptRoot
 } elseif ($MyInvocation.MyCommand.Path) {
-    Split-Path $MyInvocation.MyCommand.Path -Parent
-} else {
-    (Get-Location).Path
+    $scriptDir = Split-Path $MyInvocation.MyCommand.Path -Parent
+} elseif ($MyInvocation.ScriptName) {
+    $scriptDir = Split-Path $MyInvocation.ScriptName -Parent
 }
+if (-not $scriptDir) {
+    Write-Host "ERROR: Cannot determine script directory. Run the script as a file: .\status.ps1" -ForegroundColor Red
+    Write-Host "Do not paste or dot-source this script -- save it to disk and run it directly." -ForegroundColor Yellow
+    exit 1
+}
+$scriptDir = $scriptDir.TrimEnd('\').TrimEnd('/')
 
 $configFile = Join-Path $scriptDir "servers.txt"
 if (-not (Test-Path $configFile)) {
