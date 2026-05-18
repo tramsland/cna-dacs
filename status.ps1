@@ -505,13 +505,10 @@ $checkServicesScript = {
         }
     }
     if (-not $session) {
-    # mimic original catch block below
-    $_ = $sessionError
-    if ($true) {
         $out = New-Object System.Collections.Generic.List[string]
         $out.Add(""); $out.Add("========================================")
         $out.Add("Zone     : $GroupName"); $out.Add("Server   : $ComputerName")
-        $out.Add("  ERROR: Could not open CIM session - $_")
+        $out.Add("  ERROR: Could not open CIM session (tried WSMan and DCOM) - $sessionError")
         $out.Add("========================================")
         $instanceResults.Add([PSCustomObject]@{
             ComputerName = $ComputerName; GroupName = $GroupName
@@ -524,7 +521,7 @@ $checkServicesScript = {
             Log4jFindings = @(); JobLog = $jobLog
         })
         return $instanceResults
-    }}
+    }
 
     # ── System data ───────────────────────────────────────────────────────────
     $os         = Get-CimInstance -CimSession $session -ClassName Win32_OperatingSystem -ErrorAction Stop
@@ -805,7 +802,9 @@ $checkServicesScript = {
         if ($wsMB) { $jvmHeapText = "Working Set: ${wsMB} MB"; $jvmHeapCsvStr = "${wsMB} MB" }
     }
     if ($heapInitMB -or $heapMaxMB) {
-        $heapCfg       = "Xms: $(if($heapInitMB){"${heapInitMB} MB"}else{"?"})  Xmx: $(if($heapMaxMB){"${heapMaxMB} MB"}else{"?"})"
+        $heapInitStr   = if ($heapInitMB) { "${heapInitMB} MB" } else { '?' }
+        $heapMaxStr    = if ($heapMaxMB)  { "${heapMaxMB} MB" }  else { '?' }
+        $heapCfg       = "Xms: $heapInitStr  Xmx: $heapMaxStr"
         $jvmHeapText   = $jvmHeapText + "  |  $heapCfg"
         $jvmHeapCsvStr = $jvmHeapCsvStr + " | $heapCfg"
     }
@@ -1469,14 +1468,17 @@ $htmlRows | Group-Object Zone | ForEach-Object {
             $detCells += "<div class='detail-cell'><div class='d-label'>Run As</div><div class='d-value'>$(HtmlEncode $primary.RunAs)</div></div>"
             $detCells += "<div class='detail-cell'><div class='d-label'>Service Uptime</div><div class='d-value'>$(HtmlEncode $primary.ServiceUptime)</div></div>"
             $detCells += "<div class='detail-cell'><div class='d-label'>Restart Config</div><div class='d-value'>$(HtmlEncode $primary.RestartConfig)</div></div>"
-            $detCells += "<div class='detail-cell'><div class='d-label'>Auto-Restarts (24h)</div><div class='d-value'>$(HtmlEncode "$($primary.AutoRestarts)")</div></div>"
+            $autoRestartStr = "$($primary.AutoRestarts)"
+            $detCells += "<div class='detail-cell'><div class='d-label'>Auto-Restarts (24h)</div><div class='d-value'>$(HtmlEncode $autoRestartStr)</div></div>"
 
             if ($tomcatRow) {
                 $detCells += "<div class='detail-cell'><div class='d-label'>Tomcat Service</div><div class='d-value'>$(HtmlEncode $tomcatRow.ServiceName)</div></div>"
                 $detCells += "<div class='detail-cell'><div class='d-label'>Tomcat Version</div><div class='d-value'>$(HtmlEncode $tomcatRow.Version)</div></div>"
                 $detCells += "<div class='detail-cell full-width'><div class='d-label'>JRE Path</div><div class='d-value'>$(HtmlEncode $tomcatRow.JrePath)</div></div>"
-                $detCells += "<div class='detail-cell'><div class='d-label'>Heap Xms</div><div class='d-value'>$(if($tomcatRow.HeapInitMB){"$($tomcatRow.HeapInitMB) MB"}else{"N/A"})</div></div>"
-                $detCells += "<div class='detail-cell'><div class='d-label'>Heap Xmx</div><div class='d-value'>$(if($tomcatRow.HeapMaxMB){"$($tomcatRow.HeapMaxMB) MB"}else{"N/A"})</div></div>"
+                $heapXmsDisplay = if ($tomcatRow.HeapInitMB) { "$($tomcatRow.HeapInitMB) MB" } else { 'N/A' }
+                $detCells += "<div class='detail-cell'><div class='d-label'>Heap Xms</div><div class='d-value'>$heapXmsDisplay</div></div>"
+                $heapXmxDisplay = if ($tomcatRow.HeapMaxMB) { "$($tomcatRow.HeapMaxMB) MB" } else { 'N/A' }
+                $detCells += "<div class='detail-cell'><div class='d-label'>Heap Xmx</div><div class='d-value'>$heapXmxDisplay</div></div>"
                 $detCells += "<div class='detail-cell'><div class='d-label'>Working Set</div><div class='d-value'>$(HtmlEncode $tomcatRow.WorkingSetMB)</div></div>"
                 $gcCls = if ($serverResult -and $serverResult.GcWarnings -and $serverResult.GcWarnings.Count -gt 0) { "warn-cell" } else { "" }
                 $detCells += "<div class='detail-cell $gcCls'><div class='d-label'>GC Collector</div><div class='d-value'>$(HtmlEncode $tomcatRow.GcCollector)</div></div>"
@@ -1606,7 +1608,9 @@ if ($allLog4j -and @($allLog4j).Count -gt 0) {
     $panelClass   = if ($vulnCount -gt 0) { "error-cell" } else { "detail-cell" }
     $scanSummary  = "<div class='$panelClass' style='padding:12px 16px;margin-bottom:16px;border-radius:8px;border:1px solid #21262d'>"
     $scanSummary += "<div class='d-label' style='font-size:12px;margin-bottom:8px'>Log4j Scan Summary"
-    $scanSummary += "  <span class='chip $(if($vulnCount -gt 0){"critical"}else{"ok"})'>$(if($vulnCount -gt 0){"$vulnCount VULNERABLE"}else{"Clean"})</span>"
+    $chipClass    = if ($vulnCount -gt 0) { 'critical' } else { 'ok' }
+    $chipLabel    = if ($vulnCount -gt 0) { "$vulnCount VULNERABLE" } else { 'Clean' }
+    $scanSummary += "  <span class='chip $chipClass'>$chipLabel</span>"
     $scanSummary += "  <span class='text-muted' style='font-size:10px;font-weight:400'>min safe: $Log4jMinSafeVersion</span></div>"
     if ($vulnCount -gt 0) {
         $scanSummary += "<div class='d-value'>"
