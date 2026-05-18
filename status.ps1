@@ -211,7 +211,7 @@ $log4jScanBlock = {
 
     foreach ($root in $ScanRoots) {
         if (-not $root -or -not (Test-Path $root)) {
-            $findings.Add([PSCustomObject]@{
+            [void]$findings.Add([PSCustomObject]@{
                 ScanRoot   = $root
                 Path       = $root
                 FileName   = ""
@@ -228,7 +228,7 @@ $log4jScanBlock = {
                   Where-Object { -not $_.PSIsContainer })
 
         if ($jars.Count -eq 0) {
-            $findings.Add([PSCustomObject]@{
+            [void]$findings.Add([PSCustomObject]@{
                 ScanRoot     = $root
                 Path         = $root
                 FileName     = ""
@@ -273,7 +273,7 @@ $log4jScanBlock = {
                 }
             }
 
-            $findings.Add([PSCustomObject]@{
+            [void]$findings.Add([PSCustomObject]@{
                 ScanRoot     = $root
                 Path         = $jar.FullName
                 FileName     = $jar.Name
@@ -468,11 +468,11 @@ $checkServicesScript = {
     $pingOk = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
     if (-not $pingOk) {
         $out = New-Object System.Collections.Generic.List[string]
-        $out.Add(""); $out.Add("========================================")
-        $out.Add("Zone     : $GroupName"); $out.Add("Server   : $ComputerName")
-        $out.Add("  ERROR: Host unreachable (no ping response) - skipping.")
-        $out.Add("========================================")
-        $instanceResults.Add([PSCustomObject]@{
+        [void]$out.Add(""); [void]$out.Add("========================================")
+        [void]$out.Add("Zone     : $GroupName"); [void]$out.Add("Server   : $ComputerName")
+        [void]$out.Add("  ERROR: Host unreachable (no ping response) - skipping.")
+        [void]$out.Add("========================================")
+        [void]$instanceResults.Add([PSCustomObject]@{
             ComputerName = $ComputerName; GroupName = $GroupName
             InstanceLabel = "N/A"; Output = $out; CsvRows = $null
             OverallStatus = "DOWN"; TomcatVersion = $null
@@ -496,21 +496,21 @@ $checkServicesScript = {
             $cimParams = @{ ComputerName = $ComputerName; SessionOption = $opt; ErrorAction = 'Stop' }
             if ($Credential) { $cimParams['Credential'] = $Credential }
             $session = New-CimSession @cimParams
-            $jobLog.Add("[INFO] $ComputerName: CIM session established via $protocol")
+            [void]$jobLog.Add("[INFO] $ComputerName: CIM session established via $protocol")
             $sessionProtocol = $protocol
             break
         } catch {
             $sessionError = $_
-            $jobLog.Add("[WARN] $ComputerName: CIM/$protocol failed - $_")
+            [void]$jobLog.Add("[WARN] $ComputerName: CIM/$protocol failed - $_")
         }
     }
     if (-not $session) {
         $out = New-Object System.Collections.Generic.List[string]
-        $out.Add(""); $out.Add("========================================")
-        $out.Add("Zone     : $GroupName"); $out.Add("Server   : $ComputerName")
-        $out.Add("  ERROR: Could not open CIM session (tried WSMan and DCOM) - $sessionError")
-        $out.Add("========================================")
-        $instanceResults.Add([PSCustomObject]@{
+        [void]$out.Add(""); [void]$out.Add("========================================")
+        [void]$out.Add("Zone     : $GroupName"); [void]$out.Add("Server   : $ComputerName")
+        [void]$out.Add("  ERROR: Could not open CIM session (tried WSMan and DCOM) - $sessionError")
+        [void]$out.Add("========================================")
+        [void]$instanceResults.Add([PSCustomObject]@{
             ComputerName = $ComputerName; GroupName = $GroupName
             InstanceLabel = "N/A"; Output = $out; CsvRows = $null
             OverallStatus = "DOWN"; TomcatVersion = $null
@@ -545,8 +545,8 @@ $checkServicesScript = {
         $t = [math]::Round($_.Size / 1GB, 2); $f = [math]::Round($_.FreeSpace / 1GB, 2)
         $u = [math]::Round($t - $f, 2)
         $p = if ($t -gt 0) { [math]::Round(($u / $t) * 100, 1) } else { 0 }
-        if    ($p -ge 90) { $driveErrors.Add(  "$($_.DeviceID) $p% used ($u/$t GB)") }
-        elseif ($p -ge 75) { $driveWarnings.Add("$($_.DeviceID) $p% used ($u/$t GB)") }
+        if    ($p -ge 90) { [void]$driveErrors.Add(  "$($_.DeviceID) $p% used ($u/$t GB)") }
+        elseif ($p -ge 75) { [void]$driveWarnings.Add("$($_.DeviceID) $p% used ($u/$t GB)") }
         "$($_.DeviceID) $p% ($u/$t GB)"
     }) -join " | "
 
@@ -577,7 +577,7 @@ $checkServicesScript = {
             $lvl = switch ($ev.Level) { 1{"CRITICAL"} 2{"ERROR"} 3{"WARN"} default{"INFO"} }
             $msg = ($ev.Message -split "`n")[0].Trim()
             if ($msg.Length -gt 200) { $msg = $msg.Substring(0, 200) + "..." }
-            $eventLines.Add("[$lvl] $($ev.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))  $($ev.ProviderName): $msg")
+            [void]$eventLines.Add("[$lvl] $($ev.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'))  $($ev.ProviderName): $msg")
         }
     } catch { }
 
@@ -730,45 +730,45 @@ $checkServicesScript = {
                 } catch { }
 
                 if ($gcCollector -in @("CMS","SerialGC","ParallelGC")) {
-                    $gcWarnings.Add("Active GC collector is $gcCollector -- not recommended for Content Server")
-                    $gcRecommend.Add("Switch to G1GC: add -XX:+UseG1GC and remove -XX:+Use$gcCollector")
+                    [void]$gcWarnings.Add("Active GC collector is $gcCollector -- not recommended for Content Server")
+                    [void]$gcRecommend.Add("Switch to G1GC: add -XX:+UseG1GC and remove -XX:+Use$gcCollector")
                 }
                 if ($gcCollector -in @("G1GC","G1GC (default)")) {
                     if (-not $gcFlags.ContainsKey("MaxGCPauseMillis")) {
-                        $gcRecommend.Add("Set -XX:MaxGCPauseMillis=200 (G1GC pause target; default is 250ms)")
+                        [void]$gcRecommend.Add("Set -XX:MaxGCPauseMillis=200 (G1GC pause target; default is 250ms)")
                     }
                     $regionSize = $gcFlags["G1HeapRegionSize"]
                     if (-not $regionSize -or [int]$regionSize -lt 8388608) {
-                        $gcRecommend.Add("Set -XX:G1HeapRegionSize=16m (Content Server creates large objects)")
+                        [void]$gcRecommend.Add("Set -XX:G1HeapRegionSize=16m (Content Server creates large objects)")
                     }
                     $ihop = $gcFlags["InitiatingHeapOccupancyPercent"]
                     if (-not $ihop -or [int]$ihop -gt 45) {
-                        $gcRecommend.Add("Set -XX:InitiatingHeapOccupancyPercent=35 (triggers concurrent marking earlier)")
+                        [void]$gcRecommend.Add("Set -XX:InitiatingHeapOccupancyPercent=35 (triggers concurrent marking earlier)")
                     }
                 }
                 if ($heapInitMB -and $heapMaxMB -and $heapInitMB -ne $heapMaxMB) {
-                    $gcWarnings.Add("Xms ($heapInitMB MB) != Xmx ($heapMaxMB MB) -- JVM will resize heap at runtime")
-                    $gcRecommend.Add("Set Xms = Xmx to pre-allocate the full heap and avoid resize pauses")
+                    [void]$gcWarnings.Add("Xms ($heapInitMB MB) != Xmx ($heapMaxMB MB) -- JVM will resize heap at runtime")
+                    [void]$gcRecommend.Add("Set Xms = Xmx to pre-allocate the full heap and avoid resize pauses")
                 }
                 if ($heapMaxMB -and $totalRamMB) {
                     $heapPct = [math]::Round(($heapMaxMB / $totalRamMB) * 100, 0)
                     if ($heapPct -gt 55) {
-                        $gcWarnings.Add("Xmx ($heapMaxMB MB) is $heapPct% of total RAM ($totalRamMB MB)")
-                        $gcRecommend.Add("Consider reducing Xmx to ~$([math]::Round($totalRamMB*0.45,0)) MB (~45% of RAM)")
+                        [void]$gcWarnings.Add("Xmx ($heapMaxMB MB) is $heapPct% of total RAM ($totalRamMB MB)")
+                        [void]$gcRecommend.Add("Consider reducing Xmx to ~$([math]::Round($totalRamMB*0.45,0)) MB (~45% of RAM)")
                     } elseif ($heapMaxMB -lt 1024) {
-                        $gcWarnings.Add("Xmx is only $heapMaxMB MB -- likely undersized for Content Server")
-                        $gcRecommend.Add("Increase Xmx to at least 2048 MB for a production Content Server instance")
+                        [void]$gcWarnings.Add("Xmx is only $heapMaxMB MB -- likely undersized for Content Server")
+                        [void]$gcRecommend.Add("Increase Xmx to at least 2048 MB for a production Content Server instance")
                     }
                 }
                 $hasGcLog = $gcFlags.ContainsKey("Xlog") -or ($flagLines | Select-String "Xlog:gc")
                 if (-not $hasGcLog) {
-                    $gcRecommend.Add("Enable GC logging: -Xlog:gc*:file=C:\logs\gc.log:time,uptime:filecount=5,filesize=20m")
+                    [void]$gcRecommend.Add("Enable GC logging: -Xlog:gc*:file=C:\logs\gc.log:time,uptime:filecount=5,filesize=20m")
                 }
                 if ($gcFlags["HeapDumpOnOutOfMemoryError"] -ne $true) {
-                    $gcRecommend.Add("Add -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=C:\logs\tomcat-heap.hprof")
+                    [void]$gcRecommend.Add("Add -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=C:\logs\tomcat-heap.hprof")
                 }
                 if (-not $gcFlags.ContainsKey("MaxMetaspaceSize")) {
-                    $gcRecommend.Add("Set -XX:MaxMetaspaceSize=256m to prevent unbounded metaspace growth")
+                    [void]$gcRecommend.Add("Set -XX:MaxMetaspaceSize=256m to prevent unbounded metaspace growth")
                 }
 
                 return [PSCustomObject]@{
@@ -784,15 +784,15 @@ $checkServicesScript = {
         $tomcatInfo = $null
         $icError    = $null
         try   { $tomcatInfo = Invoke-Command @icParams }
-        catch { $icError = $_; $jobLog.Add("[WARN] $ComputerName: Invoke-Command (Tomcat info) failed - $_") }
+        catch { $icError = $_; [void]$jobLog.Add("[WARN] $ComputerName: Invoke-Command (Tomcat info) failed - $_") }
         $tomcatVersion = if ($tomcatInfo) { $tomcatInfo.Version     } elseif ($icError) { "WinRM unavailable" } else { "Unable to retrieve" }
         $jrePath       = if ($tomcatInfo) { $tomcatInfo.JrePath     } else { "N/A" }
         $heapInitMB    = if ($tomcatInfo) { $tomcatInfo.HeapInitMB  } else { $null }
         $heapMaxMB     = if ($tomcatInfo) { $tomcatInfo.HeapMaxMB   } else { $null }
         $gcCollector   = if ($tomcatInfo) { $tomcatInfo.GcCollector } elseif ($icError) { "N/A (WinRM unavailable)" } else { "N/A" }
         $tomcatHome    = if ($tomcatInfo) { $tomcatInfo.TomcatHome  } else { $null }
-        if ($tomcatInfo -and $tomcatInfo.GcWarnings)  { foreach ($w in $tomcatInfo.GcWarnings)  { $gcWarnings.Add($w)  } }
-        if ($tomcatInfo -and $tomcatInfo.GcRecommend) { foreach ($r in $tomcatInfo.GcRecommend) { $gcRecommend.Add($r) } }
+        if ($tomcatInfo -and $tomcatInfo.GcWarnings)  { foreach ($w in $tomcatInfo.GcWarnings)  { [void]$gcWarnings.Add($w)  } }
+        if ($tomcatInfo -and $tomcatInfo.GcRecommend) { foreach ($r in $tomcatInfo.GcRecommend) { [void]$gcRecommend.Add($r) } }
     }
 
     # ── JVM working set + heap display ────────────────────────────────────────
@@ -824,23 +824,23 @@ $checkServicesScript = {
 
     # ── Console header ────────────────────────────────────────────────────────
     $out = New-Object System.Collections.Generic.List[string]
-    $out.Add(""); $out.Add("========================================")
-    $out.Add("Zone     : $GroupName"); $out.Add("Server   : $ComputerName")
-    $out.Add("  Server Uptime: $uptimeStr$recentTag")
-    $out.Add("  Memory       : $memBar $memPct% used  ($usedMemGB GB / $totalMemGB GB)  Free: $freeMemGB GB$memTag")
-    $out.Add("  CPU          : $(Get-VisualBar -Pct $cpuAvg) $cpuAvg%$(Get-ThresholdTag -Pct $cpuAvg)")
-    $out.Add("  Drives:")
-    foreach ($dline in ($driveSummary -split "`n")) { $out.Add($dline) }
-    if ($driveErrors.Count   -gt 0) { $out.Add("  [ERROR] Drive critical: " + ($driveErrors   -join "; ")) }
-    if ($driveWarnings.Count -gt 0) { $out.Add("  [WARN]  Drive warning: "  + ($driveWarnings -join "; ")) }
-    $out.Add("========================================")
+    [void]$out.Add(""); [void]$out.Add("========================================")
+    [void]$out.Add("Zone     : $GroupName"); [void]$out.Add("Server   : $ComputerName")
+    [void]$out.Add("  Server Uptime: $uptimeStr$recentTag")
+    [void]$out.Add("  Memory       : $memBar $memPct% used  ($usedMemGB GB / $totalMemGB GB)  Free: $freeMemGB GB$memTag")
+    [void]$out.Add("  CPU          : $(Get-VisualBar -Pct $cpuAvg) $cpuAvg%$(Get-ThresholdTag -Pct $cpuAvg)")
+    [void]$out.Add("  Drives:")
+    foreach ($dline in ($driveSummary -split "`n")) { [void]$out.Add($dline) }
+    if ($driveErrors.Count   -gt 0) { [void]$out.Add("  [ERROR] Drive critical: " + ($driveErrors   -join "; ")) }
+    if ($driveWarnings.Count -gt 0) { [void]$out.Add("  [WARN]  Drive warning: "  + ($driveWarnings -join "; ")) }
+    [void]$out.Add("========================================")
 
     # ── Tomcat ────────────────────────────────────────────────────────────────
-    $out.Add(""); $out.Add("Tomcat Service:")
+    [void]$out.Add(""); [void]$out.Add("Tomcat Service:")
     if ($tomcatSvc) {
         $autoNote = Invoke-AutoRestart -ServiceName $tomcatSvc.Name `
             -Computer $ComputerName -CimSession $session -Enabled $AutoRestartStopped
-        if ($autoNote) { $out.Add("  [AUTO-RESTART] $autoNote") }
+        if ($autoNote) { [void]$out.Add("  [AUTO-RESTART] $autoNote") }
 
         $tomcatSvcName = $tomcatSvc.Name
         $tomcatSvc = Get-CimInstance -CimSession $session -ClassName Win32_Service `
@@ -849,26 +849,26 @@ $checkServicesScript = {
         $tState         = if ($tomcatSvc.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
         $tUp            = Get-ServiceUptime -CimSession $session -ProcessId $tomcatSvc.ProcessId
         $tRestartResult = Get-OrSet-RestartConfig -ServiceName $tomcatSvc.Name -ScHost $scHost
-        if ($tRestartResult.LogNote) { $jobLog.Add("[LOG] $($tRestartResult.LogNote)") }
+        if ($tRestartResult.LogNote) { [void]$jobLog.Add("[LOG] $($tRestartResult.LogNote)") }
         $tRestart      = $tRestartResult.Display
         $tRestartCount = Get-ServiceRestartCount -ServiceName $tomcatSvc.Name -Computer $ComputerName
         if ($tomcatSvc.State -ne "Running") { $overallStatus = "DOWN" }
 
-        $out.Add("  Name:               $($tomcatSvc.Name)")
-        $out.Add("  Status:             $tState")
-        $out.Add("  Display Name:       $($tomcatSvc.DisplayName)")
-        $out.Add("  Version:            $tomcatVersion")
-        $out.Add("  JRE Path:           $jrePath")
-        $out.Add("  Run As:             $($tomcatSvc.StartName)")
-        $out.Add("  Service Uptime:     $tUp")
-        $out.Add("  Restart Config:     $tRestart")
-        $out.Add("  Auto-Restarts(24h): $tRestartCount")
-        $out.Add("  Working Set:        $jvmHeapText")
-        $out.Add("  GC Collector:       $gcCollector")
-        foreach ($w in $gcWarnings)  { $out.Add("  [WARN] GC: $w") }
-        foreach ($r in $gcRecommend) { $out.Add("  [INFO] GC Recommend: $r") }
+        [void]$out.Add("  Name:               $($tomcatSvc.Name)")
+        [void]$out.Add("  Status:             $tState")
+        [void]$out.Add("  Display Name:       $($tomcatSvc.DisplayName)")
+        [void]$out.Add("  Version:            $tomcatVersion")
+        [void]$out.Add("  JRE Path:           $jrePath")
+        [void]$out.Add("  Run As:             $($tomcatSvc.StartName)")
+        [void]$out.Add("  Service Uptime:     $tUp")
+        [void]$out.Add("  Restart Config:     $tRestart")
+        [void]$out.Add("  Auto-Restarts(24h): $tRestartCount")
+        [void]$out.Add("  Working Set:        $jvmHeapText")
+        [void]$out.Add("  GC Collector:       $gcCollector")
+        foreach ($w in $gcWarnings)  { [void]$out.Add("  [WARN] GC: $w") }
+        foreach ($r in $gcRecommend) { [void]$out.Add("  [INFO] GC Recommend: $r") }
 
-        $csvRows.Add([PSCustomObject]@{
+        [void]$csvRows.Add([PSCustomObject]@{
             DateTime = $checkTime; Zone = $GroupName; Server = $ComputerName
             ServiceType = "Tomcat"; ServiceName = $tomcatSvc.Name
             DisplayName = $tomcatSvc.DisplayName; Description = ""
@@ -883,16 +883,16 @@ $checkServicesScript = {
             DrivesSummary = $drivesSummaryForCsv; OverallStatus = $overallStatus
         })
     } else {
-        $out.Add("  NOT FOUND")
+        [void]$out.Add("  NOT FOUND")
     }
 
     # ── Content Server(s) ─────────────────────────────────────────────────────
-    $out.Add(""); $out.Add("Content Server Service(s):")
+    [void]$out.Add(""); [void]$out.Add("Content Server Service(s):")
     if ($csSvcs) {
         foreach ($cs in $csSvcs) {
             $autoNote = Invoke-AutoRestart -ServiceName $cs.Name `
                 -Computer $ComputerName -CimSession $session -Enabled $AutoRestartStopped
-            if ($autoNote) { $out.Add("  [AUTO-RESTART] $autoNote") }
+            if ($autoNote) { [void]$out.Add("  [AUTO-RESTART] $autoNote") }
 
             $csName = $cs.Name
             $cs = Get-CimInstance -CimSession $session -ClassName Win32_Service `
@@ -901,25 +901,25 @@ $checkServicesScript = {
             $csState         = if ($cs.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
             $csUp            = Get-ServiceUptime -CimSession $session -ProcessId $cs.ProcessId
             $csRestartResult = Get-OrSet-RestartConfig -ServiceName $cs.Name -ScHost $scHost
-            if ($csRestartResult.LogNote) { $jobLog.Add("[LOG] $($csRestartResult.LogNote)") }
+            if ($csRestartResult.LogNote) { [void]$jobLog.Add("[LOG] $($csRestartResult.LogNote)") }
             $csRestart      = $csRestartResult.Display
             $csRestartCount = Get-ServiceRestartCount -ServiceName $cs.Name -Computer $ComputerName
             if ($cs.State -ne "Running") { $overallStatus = "DOWN" }
 
-            $out.Add(""); $out.Add("  Instance:           $($cs.Name)")
-            $out.Add("  Status:             $csState")
-            $out.Add("  Display Name:       $($cs.DisplayName)")
-            $out.Add("  Description:        $($cs.Description)")
-            $out.Add("  Run As:             $($cs.StartName)")
-            $out.Add("  Service Uptime:     $csUp")
-            $out.Add("  Restart Config:     $csRestart")
-            $out.Add("  Auto-Restarts(24h): $csRestartCount")
+            [void]$out.Add(""); [void]$out.Add("  Instance:           $($cs.Name)")
+            [void]$out.Add("  Status:             $csState")
+            [void]$out.Add("  Display Name:       $($cs.DisplayName)")
+            [void]$out.Add("  Description:        $($cs.Description)")
+            [void]$out.Add("  Run As:             $($cs.StartName)")
+            [void]$out.Add("  Service Uptime:     $csUp")
+            [void]$out.Add("  Restart Config:     $csRestart")
+            [void]$out.Add("  Auto-Restarts(24h): $csRestartCount")
 
             $csInformant = @{}
             if ($cs.State -eq "Running") {
                 $pingBase   = "http://$ComputerName/$($cs.Name)/cs?func=informant.ping"
                 $components = @("cs","db","adminservers","search","freespace","memoryspace","cpucheck")
-                $out.Add(""); $out.Add("  Informant Health Checks (parallel):")
+                [void]$out.Add(""); [void]$out.Add("  Informant Health Checks (parallel):")
                 $iResults = Invoke-InformantChecks -BaseUrl $pingBase -Components $components `
                     -TimeoutSec $WebTimeoutSec -WarnMs $InformantWarnMs
                 foreach ($comp in $components) {
@@ -927,7 +927,7 @@ $checkServicesScript = {
                     $msLabel = "[$($ir.Ms)ms]"
                     $slowTag = if ($ir.Ms -ge $InformantWarnMs) { " [SLOW]" } else { "" }
                     if ($ir.Error) {
-                        $out.Add("    $comp : [ERROR] - $($ir.Error) $msLabel")
+                        [void]$out.Add("    $comp : [ERROR] - $($ir.Error) $msLabel")
                         if ($overallStatus -eq "OK") { $overallStatus = "WARN" }
                         $csInformant[$comp] = [PSCustomObject]@{
                             Status = "ERROR"; Detail = $ir.Error; Ms = $ir.Ms
@@ -939,7 +939,7 @@ $checkServicesScript = {
                                   else { "OTHER" }
                         $detail = if ($tag -eq "OTHER") { $ir.Content } else { "" }
                         if ($tag -eq "FAILURE") { $overallStatus = "CRITICAL" }
-                        $out.Add("    $comp : [$tag] $msLabel$slowTag")
+                        [void]$out.Add("    $comp : [$tag] $msLabel$slowTag")
                         $csInformant[$comp] = [PSCustomObject]@{
                             Status = $tag; Detail = $detail; Ms = $ir.Ms
                             Slow = ($ir.Ms -ge $InformantWarnMs)
@@ -947,12 +947,12 @@ $checkServicesScript = {
                     }
                 }
             } else {
-                $out.Add("  [INFO] Skipped Informant checks - service is not running.")
+                [void]$out.Add("  [INFO] Skipped Informant checks - service is not running.")
             }
 
             $allInformant[$cs.Name] = $csInformant
 
-            $csvRows.Add([PSCustomObject]@{
+            [void]$csvRows.Add([PSCustomObject]@{
                 DateTime = $checkTime; Zone = $GroupName; Server = $ComputerName
                 ServiceType = "ContentServer"; ServiceName = $cs.Name
                 DisplayName = $cs.DisplayName; Description = $cs.Description
@@ -968,15 +968,15 @@ $checkServicesScript = {
             })
         }
     } else {
-        $out.Add("  NOT FOUND")
+        [void]$out.Add("  NOT FOUND")
     }
 
     # ── Content Server Admin ──────────────────────────────────────────────────
-    $out.Add(""); $out.Add("Content Server Admin Service:")
+    [void]$out.Add(""); [void]$out.Add("Content Server Admin Service:")
     if ($csAdmin) {
         $autoNote = Invoke-AutoRestart -ServiceName $csAdmin.Name `
             -Computer $ComputerName -CimSession $session -Enabled $AutoRestartStopped
-        if ($autoNote) { $out.Add("  [AUTO-RESTART] $autoNote") }
+        if ($autoNote) { [void]$out.Add("  [AUTO-RESTART] $autoNote") }
 
         $csAdminName = $csAdmin.Name
         $csAdmin = Get-CimInstance -CimSession $session -ClassName Win32_Service `
@@ -985,21 +985,21 @@ $checkServicesScript = {
         $caState         = if ($csAdmin.State -eq "Running") { "[RUNNING]" } else { "[STOPPED]" }
         $caUp            = Get-ServiceUptime -CimSession $session -ProcessId $csAdmin.ProcessId
         $caRestartResult = Get-OrSet-RestartConfig -ServiceName $csAdmin.Name -ScHost $scHost
-        if ($caRestartResult.LogNote) { $jobLog.Add("[LOG] $($caRestartResult.LogNote)") }
+        if ($caRestartResult.LogNote) { [void]$jobLog.Add("[LOG] $($caRestartResult.LogNote)") }
         $caRestart      = $caRestartResult.Display
         $caRestartCount = Get-ServiceRestartCount -ServiceName $csAdmin.Name -Computer $ComputerName
         if ($csAdmin.State -ne "Running") { $overallStatus = "DOWN" }
 
-        $out.Add("  Name:               $($csAdmin.Name)")
-        $out.Add("  Status:             $caState")
-        $out.Add("  Display Name:       $($csAdmin.DisplayName)")
-        $out.Add("  Description:        $($csAdmin.Description)")
-        $out.Add("  Run As:             $($csAdmin.StartName)")
-        $out.Add("  Service Uptime:     $caUp")
-        $out.Add("  Restart Config:     $caRestart")
-        $out.Add("  Auto-Restarts(24h): $caRestartCount")
+        [void]$out.Add("  Name:               $($csAdmin.Name)")
+        [void]$out.Add("  Status:             $caState")
+        [void]$out.Add("  Display Name:       $($csAdmin.DisplayName)")
+        [void]$out.Add("  Description:        $($csAdmin.Description)")
+        [void]$out.Add("  Run As:             $($csAdmin.StartName)")
+        [void]$out.Add("  Service Uptime:     $caUp")
+        [void]$out.Add("  Restart Config:     $caRestart")
+        [void]$out.Add("  Auto-Restarts(24h): $caRestartCount")
 
-        $csvRows.Add([PSCustomObject]@{
+        [void]$csvRows.Add([PSCustomObject]@{
             DateTime = $checkTime; Zone = $GroupName; Server = $ComputerName
             ServiceType = "ContentServerAdmin"; ServiceName = $csAdmin.Name
             DisplayName = $csAdmin.DisplayName; Description = $csAdmin.Description
@@ -1014,7 +1014,7 @@ $checkServicesScript = {
             DrivesSummary = $drivesSummaryForCsv; OverallStatus = $overallStatus
         })
     } else {
-        $out.Add("  NOT FOUND")
+        [void]$out.Add("  NOT FOUND")
     }
 
     # =========================================================================
@@ -1029,7 +1029,7 @@ $checkServicesScript = {
 
     # Tomcat webapps
     if ($tomcatHome) {
-        $log4jScanRoots.Add((Join-Path $tomcatHome "webapps"))
+        [void]$log4jScanRoots.Add((Join-Path $tomcatHome "webapps"))
     }
 
     # Content Server webservices — one per CS instance
@@ -1040,7 +1040,7 @@ $checkServicesScript = {
             # Walk up: exe -> bin (or similar) -> instance root
             $csRoot = Split-Path (Split-Path $exePath -Parent) -Parent
             $wsDir  = Join-Path $csRoot "webservices"
-            $log4jScanRoots.Add($wsDir)
+            [void]$log4jScanRoots.Add($wsDir)
         }
     }
 
@@ -1061,7 +1061,7 @@ $checkServicesScript = {
             if ($Credential) { $icLog4jParams["Credential"] = $Credential }
             $log4jFindings = @(Invoke-Command @icLog4jParams)
         } catch {
-            $jobLog.Add("[WARN] Log4j scan failed on $ComputerName (WinRM/Invoke-Command error): $_")
+            [void]$jobLog.Add("[WARN] Log4j scan failed on $ComputerName (WinRM/Invoke-Command error): $_")
             $log4jFindings = @([PSCustomObject]@{
                 ScanRoot = ""; Path = ""; FileName = ""; Version = "ERROR"
                 VersionSrc = ""; Status = "SCAN_ERROR"; IsVulnerable = $false
@@ -1070,49 +1070,49 @@ $checkServicesScript = {
     }
 
     # Console output for log4j findings
-    $out.Add(""); $out.Add("Log4j Scan  (min safe: $Log4jMinSafeVersion):")
+    [void]$out.Add(""); [void]$out.Add("Log4j Scan  (min safe: $Log4jMinSafeVersion):")
     $hasVulnerable = $false
     foreach ($f in $log4jFindings) {
         switch ($f.Status) {
             "VULNERABLE" {
                 $hasVulnerable = $true
-                $out.Add("  [VULNERABLE] $($f.FileName)  v$($f.Version) (src: $($f.VersionSrc))")
-                $out.Add("               Path: $($f.Path)")
+                [void]$out.Add("  [VULNERABLE] $($f.FileName)  v$($f.Version) (src: $($f.VersionSrc))")
+                [void]$out.Add("               Path: $($f.Path)")
                 if ($overallStatus -ne "CRITICAL") { $overallStatus = "WARN" }
             }
             "OK" {
-                $out.Add("  [OK]         $($f.FileName)  v$($f.Version) (src: $($f.VersionSrc))")
-                $out.Add("               Path: $($f.Path)")
+                [void]$out.Add("  [OK]         $($f.FileName)  v$($f.Version) (src: $($f.VersionSrc))")
+                [void]$out.Add("               Path: $($f.Path)")
             }
             "NOT_FOUND" {
-                $out.Add("  [NOT FOUND]  No log4j jars found under: $($f.ScanRoot)")
+                [void]$out.Add("  [NOT FOUND]  No log4j jars found under: $($f.ScanRoot)")
             }
             "SCAN_ROOT_NOT_FOUND" {
-                $out.Add("  [MISSING]    Scan root does not exist: $($f.Path)")
+                [void]$out.Add("  [MISSING]    Scan root does not exist: $($f.Path)")
             }
             "UNKNOWN_VERSION" {
-                $out.Add("  [UNKNOWN]    $($f.FileName) — version could not be determined")
-                $out.Add("               Path: $($f.Path)")
+                [void]$out.Add("  [UNKNOWN]    $($f.FileName) — version could not be determined")
+                [void]$out.Add("               Path: $($f.Path)")
             }
             "SCAN_ERROR" {
-                $out.Add("  [ERROR]      Scan failed — check log for details")
+                [void]$out.Add("  [ERROR]      Scan failed — check log for details")
             }
         }
     }
     if ($hasVulnerable) {
-        $out.Add("  ** VULNERABLE log4j version(s) found — immediate action required **")
+        [void]$out.Add("  ** VULNERABLE log4j version(s) found — immediate action required **")
     }
 
     # ── Event log ─────────────────────────────────────────────────────────────
     if ($eventLines.Count -gt 0) {
-        $out.Add(""); $out.Add("Recent Application Log Events (last 24h, Tomcat/CS related):")
-        foreach ($line in $eventLines) { $out.Add("  $line") }
+        [void]$out.Add(""); [void]$out.Add("Recent Application Log Events (last 24h, Tomcat/CS related):")
+        foreach ($line in $eventLines) { [void]$out.Add("  $line") }
         if ($overallStatus -eq "OK") { $overallStatus = "WARN" }
     }
 
     Remove-CimSession $session -ErrorAction SilentlyContinue
 
-    $instanceResults.Add([PSCustomObject]@{
+    [void]$instanceResults.Add([PSCustomObject]@{
         ComputerName     = $ComputerName;    GroupName        = $GroupName
         InstanceLabel    = $ComputerName;    Output           = $out
         CsvRows          = $csvRows;         OverallStatus    = $overallStatus
@@ -1237,8 +1237,8 @@ foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
         foreach ($row in $result.CsvRows) {
             $key  = "$($row.Server)|$($row.ServiceName)"; $prev = $prevData[$key]
             if ($prev) {
-                if ($prev.Status  -ne $row.Status)  { $deltaDetails.Add("$($row.ServiceName): Status $($prev.Status) -> $($row.Status)") }
-                if ($prev.Version -and $prev.Version -ne $row.Version) { $deltaDetails.Add("$($row.ServiceName): Version $($prev.Version) -> $($row.Version)") }
+                if ($prev.Status  -ne $row.Status)  { [void]$deltaDetails.Add("$($row.ServiceName): Status $($prev.Status) -> $($row.Status)") }
+                if ($prev.Version -and $prev.Version -ne $row.Version) { [void]$deltaDetails.Add("$($row.ServiceName): Version $($prev.Version) -> $($row.Version)") }
             }
         }
     }
