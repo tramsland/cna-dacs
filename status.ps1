@@ -496,12 +496,12 @@ $checkServicesScript = {
             $cimParams = @{ ComputerName = $ComputerName; SessionOption = $opt; ErrorAction = 'Stop' }
             if ($Credential) { $cimParams['Credential'] = $Credential }
             $session = New-CimSession @cimParams
-            [void]$jobLog.Add("[INFO] $ComputerName: CIM session established via $protocol")
+            [void]$jobLog.Add("[INFO] ${ComputerName}: CIM session established via $protocol")
             $sessionProtocol = $protocol
             break
         } catch {
             $sessionError = $_
-            [void]$jobLog.Add("[WARN] $ComputerName: CIM/$protocol failed - $_")
+            [void]$jobLog.Add("[WARN] ${ComputerName}: CIM/$protocol failed - $_")
         }
     }
     if (-not $session) {
@@ -784,7 +784,7 @@ $checkServicesScript = {
         $tomcatInfo = $null
         $icError    = $null
         try   { $tomcatInfo = Invoke-Command @icParams }
-        catch { $icError = $_; [void]$jobLog.Add("[WARN] $ComputerName: Invoke-Command (Tomcat info) failed - $_") }
+        catch { $icError = $_; [void]$jobLog.Add("[WARN] ${ComputerName}: Invoke-Command (Tomcat info) failed - $_") }
         $tomcatVersion = if ($tomcatInfo) { $tomcatInfo.Version     } elseif ($icError) { "WinRM unavailable" } else { "Unable to retrieve" }
         $jrePath       = if ($tomcatInfo) { $tomcatInfo.JrePath     } else { "N/A" }
         $heapInitMB    = if ($tomcatInfo) { $tomcatInfo.HeapInitMB  } else { $null }
