@@ -22,6 +22,16 @@ param(
 #endregion
 
 #region Configuration
+# Fix: $PSScriptRoot is empty when run directly from the console (not dot-sourced from a file).
+# Fall back to the script's own path, then to the current working directory.
+if (-not $PSScriptRoot) {
+    $PSScriptRoot = if ($MyInvocation.MyCommand.Path) {
+        Split-Path $MyInvocation.MyCommand.Path -Parent
+    } else {
+        (Get-Location).Path
+    }
+}
+
 $configFile = Join-Path $PSScriptRoot "servers.txt"
 if (-not (Test-Path $configFile)) {
     Write-Host "ERROR: Server config file not found: $configFile" -ForegroundColor Red
@@ -1717,9 +1727,19 @@ function mk(n,l,c){ return "<div class='stat-card "+c+"'><div class='stat-num'>"
 </body></html>
 "@
 
-$utf8Bom = New-Object System.Text.UTF8Encoding $true
-[System.IO.File]::WriteAllText($htmlFile, $htmlContent, $utf8Bom)
-Write-Log "HTML report    : $htmlFile" -Color Green
+try {
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($htmlFile, $htmlContent, $utf8Bom)
+    Write-Log "HTML report    : $htmlFile" -Color Green
+} catch {
+    Write-Log "WARNING: WriteAllText failed for HTML ($_ ) -- retrying with Out-File..." -Color Yellow
+    try {
+        $htmlContent | Out-File -FilePath $htmlFile -Encoding utf8 -Force
+        Write-Log "HTML report    : $htmlFile (written via Out-File)" -Color Green
+    } catch {
+        Write-Log "ERROR: Could not write HTML report to '$htmlFile' -- $_" -Color Red
+    }
+}
 
 # ── Alerts ────────────────────────────────────────────────────────────────────
 $issueRows = $allCsvRows | Where-Object { $_.OverallStatus -in @("DOWN","CRITICAL") }
@@ -1758,5 +1778,6 @@ Write-Log "Duration  : $($dur.ToString('mm\:ss'))" -Color Cyan
 Write-Log "========================================" -Color Cyan
 Write-Log "Log      : $logFile"        -Color Green
 Write-Log "CSV      : $csvFile"        -Color Green
+Write-Log "HTML     : $htmlFile"       -Color Green
 Write-Log "Log4j CSV: $log4jCsvFile"   -Color Green
 #endregion
