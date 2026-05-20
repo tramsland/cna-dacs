@@ -60,7 +60,9 @@
 param(
     [string]$NewVersionPath = (Join-Path $PSScriptRoot "NewVersion"),
     [string]$ServersFile    = (Join-Path $PSScriptRoot "servers.txt"),
-    [System.Management.Automation.PSCredential]$Credential
+    [System.Management.Automation.PSCredential]$Credential,
+    # Skip all pauses and deploy every server serially. Stops on first failure.
+    [switch]$AutoRun
 )
 #endregion Parameters
 
@@ -274,6 +276,7 @@ Write-Log "=== Tomcat Upgrade ===" "INFO"
 Write-Log "Servers     : $($servers.Count)" "INFO"
 Write-Log "Source      : $NewVersionPath" "INFO"
 Write-Log "Cluster mode: $(if ($Cluster) { 'ON' } else { 'OFF' })" "INFO"
+Write-Log "AutoRun mode: $(if ($AutoRun) { 'ON -- no pauses, stop on failure' } else { 'OFF -- pause after each server' })" "INFO"
 Write-Log ""
 
 #endregion Validate inputs
@@ -1013,66 +1016,80 @@ for ($di = 0; $di -lt $deployTargets.Count; $di++) {
 
     $deployResults.Add($deployRecord)
 
-    # ---- Per-server pause (always on) -----------------------------------
+    # ---- Per-server pause / AutoRun failure check ----------------------
     if (-not $script:quitRequested) {
-        $isLast     = ($di -eq ($deployTargets.Count - 1))
-        $nextSrv    = if (-not $isLast) { $deployTargets[$di + 1].Server } else { "" }
-        $deployedV  = if ($result.DeployedVersion) { $result.DeployedVersion } else { "" }
-        $bkPath     = if ($deployRecord.BackupPath) { $deployRecord.BackupPath } else { "" }
 
-        $pauseChoice = Invoke-UpdatePause `
-            -CompletedServer $ComputerName `
-            -CompletedSvc    $svcName `
-            -CompletedVer    $deployedV `
-            -NextServer      $nextSrv `
-            -ServerNum       ($di + 1) `
-            -TotalServers    $deployTargets.Count `
-            -BackupPath      $bkPath
+        if (-not $result.Success -and $AutoRun) {
+            # AutoRun: stop immediately on failure
+            Write-Log "" "INFO"
+            Write-Log "AutoRun: deployment FAILED on $ComputerName -- stopping." "ERROR" $ComputerName
+            Write-Log "Remaining servers will NOT be updated." "WARN"
+            Write-Log "Backup available at: $($deployRecord.BackupPath)" "INFO" $ComputerName
+            $script:quitRequested = $true
+        }
+        elseif ($AutoRun) {
+            # AutoRun: success -- log and continue without pausing
+            $isLast    = ($di -eq ($deployTargets.Count - 1))
+            $nextSrv   = if (-not $isLast) { $deployTargets[$di + 1].Server } else { "(last server)" }
+            $deployedV = if ($result.DeployedVersion) { $result.DeployedVersion } else { "unknown" }
+            Write-Log "AutoRun: $ComputerName complete (v$deployedV). Next: $nextSrv" "OK" $ComputerName
+        }
+        else {
+            # Interactive mode: show pause banner
+            $isLast     = ($di -eq ($deployTargets.Count - 1))
+            $nextSrv    = if (-not $isLast) { $deployTargets[$di + 1].Server } else { "" }
+            $deployedV  = if ($result.DeployedVersion) { $result.DeployedVersion } else { "" }
+            $bkPath     = if ($deployRecord.BackupPath) { $deployRecord.BackupPath } else { "" }
 
-        switch ($pauseChoice) {
-            "R" {
-                # Rollback this server inline, then continue to next
-                Write-Log "Rollback requested for $ComputerName -- $svcName" "WARN"
-                if ($deployRecord.BackupPath) {
-                    $rbOpened = Open-TargetSession -ComputerName $ComputerName
-                    if ($rbOpened) {
-                        $rbResult = Invoke-Targeted -ScriptBlock $rollbackScript -ArgumentList @(
-                            $svcName,
-                            $installDir,
-                            $deployRecord.BackupPath
-                        )
-                        Close-TargetSession
-                        if ($rbResult.Success) {
-                            Write-Log "Rollback successful -- $svcName restored." "OK" $ComputerName
-                            $deployRecord.NeedsRollback = $false
-                            $deployRecord.Error = "ROLLED BACK AT PAUSE"
+            $pauseChoice = Invoke-UpdatePause `
+                -CompletedServer $ComputerName `
+                -CompletedSvc    $svcName `
+                -CompletedVer    $deployedV `
+                -NextServer      $nextSrv `
+                -ServerNum       ($di + 1) `
+                -TotalServers    $deployTargets.Count `
+                -BackupPath      $bkPath
+
+            switch ($pauseChoice) {
+                "R" {
+                    Write-Log "Rollback requested for $ComputerName -- $svcName" "WARN"
+                    if ($deployRecord.BackupPath) {
+                        $rbOpened = Open-TargetSession -ComputerName $ComputerName
+                        if ($rbOpened) {
+                            $rbResult = Invoke-Targeted -ScriptBlock $rollbackScript -ArgumentList @(
+                                $svcName,
+                                $installDir,
+                                $deployRecord.BackupPath
+                            )
+                            Close-TargetSession
+                            if ($rbResult.Success) {
+                                Write-Log "Rollback successful -- $svcName restored." "OK" $ComputerName
+                                $deployRecord.NeedsRollback = $false
+                                $deployRecord.Error = "ROLLED BACK AT PAUSE"
+                            }
+                            else {
+                                Write-Log "Rollback FAILED: $($rbResult.Error)" "ERROR" $ComputerName
+                            }
+                            Write-Log "--- Rollback log ---" "INFO"
+                            foreach ($line in $rbResult.Log) { Write-Log "  $line" "INFO" $ComputerName }
                         }
                         else {
-                            Write-Log "Rollback FAILED: $($rbResult.Error)" "ERROR" $ComputerName
+                            Write-Log "Cannot open session for rollback -- MANUAL INTERVENTION REQUIRED." "ERROR" $ComputerName
                         }
-                        Write-Log "--- Rollback log ---" "INFO"
-                        foreach ($line in $rbResult.Log) { Write-Log "  $line" "INFO" $ComputerName }
                     }
                     else {
-                        Write-Log "Cannot open session for rollback -- MANUAL INTERVENTION REQUIRED." "ERROR" $ComputerName
+                        Write-Log "No backup path available -- rollback skipped." "WARN" $ComputerName
                     }
                 }
-                else {
-                    Write-Log "No backup path available -- rollback skipped." "WARN" $ComputerName
+                "S" {
+                    Write-Log "Skip requested -- next server will be skipped." "WARN"
+                    $script:skipNext = $true
                 }
-                # Continue to next server
-            }
-            "S" {
-                # Skip the NEXT server
-                Write-Log "Skip requested -- next server will be skipped." "WARN"
-                $script:skipNext = $true
-            }
-            "Q" {
-                Write-Log "Quit requested at update pause." "WARN"
-                $script:quitRequested = $true
-            }
-            default {
-                # C / ENTER -- continue
+                "Q" {
+                    Write-Log "Quit requested at update pause." "WARN"
+                    $script:quitRequested = $true
+                }
+                default { <# C / ENTER -- continue #> }
             }
         }
     }
