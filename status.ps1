@@ -17,7 +17,7 @@ param(
 
     # Log4j: flag anything below this version as VULNERABLE
     # Log4j 2.x latest is 2.24.3 — set your org standard here
-    [string]$Log4jMinSafeVersion = "2.17.1"
+    [string]$Log4jMinSafeVersion = "2.25.4"
 )
 #endregion
 
@@ -595,6 +595,67 @@ $checkServicesScript = {
         $_.Description -like "*Content Server Admin*"
     } | Select-Object -First 1
 
+    # ── Content Server version from opentext.ini ──────────────────────────────
+    # The CS service exe lives in the instance's 'config' subdirectory.
+    # Walking up one level reaches the CS install root which contains opentext.ini.
+    # The [general] section holds Version=<integer> (e.g. 110).
+    # Mapping: major = (n-5) \ 4    minor = n - (4*major) - 4
+    # So 110 -> 26.2,  109 -> 26.1,  108 -> 25.4,  105 -> 25.1, etc.
+    $csVersionMap = @{}   # keyed by service Name
+    foreach ($cs in $csSvcs) {
+        if ($cs.PathName) {
+            try {
+                $icCsVer = @{
+                    ComputerName = $ComputerName; ErrorAction = "Stop"
+                    ArgumentList = $cs.Name, $cs.PathName
+                    ScriptBlock  = {
+                        param([string]$SvcName, [string]$ImagePath)
+                        $ver = "N/A"
+                        try {
+                            # Strip quotes and any trailing args to get the exe path
+                            $exePath    = ($ImagePath -replace '^"?([^"]+\.exe).*$','$1').Trim('"')
+                            # exe is in the 'config' folder; parent is the CS install root
+                            $configDir  = Split-Path $exePath -Parent
+                            $installDir = Split-Path $configDir -Parent
+                            $iniPath    = Join-Path $installDir "opentext.ini"
+                            if (Test-Path $iniPath) {
+                                $inGeneral = $false
+                                foreach ($ln in (Get-Content $iniPath -ErrorAction SilentlyContinue)) {
+                                    $trimLn = $ln.Trim()
+                                    # Detect [general] section header (case-insensitive)
+                                    if ($trimLn -match '^\[general\]$') {
+                                        $inGeneral = $true
+                                        continue
+                                    }
+                                    # Stop if we hit another section header
+                                    if ($inGeneral -and $trimLn -match '^\[.+\]$') {
+                                        break
+                                    }
+                                    # Match Version= key inside [general]
+                                    if ($inGeneral -and $trimLn -match '(?i)^Version\s*=\s*(\d+)$') {
+                                        $n     = [int]$Matches[1]
+                                        $major = ($n - 5) / 4
+                                        $minor = $n - (4 * $major) - 4
+                                        $ver   = "$major.$minor  (ini: $n)"
+                                        break
+                                    }
+                                }
+                            }
+                        } catch { }
+                        return $ver
+                    }
+                }
+                if ($Credential) { $icCsVer["Credential"] = $Credential }
+                $csVersionMap[$cs.Name] = Invoke-Command @icCsVer
+            } catch {
+                $csVersionMap[$cs.Name] = "N/A"
+                [void]$jobLog.Add("[WARN] ${ComputerName}: CS version lookup failed for $($cs.Name) - $_")
+            }
+        } else {
+            $csVersionMap[$cs.Name] = "N/A"
+        }
+    }
+
     # ── Tomcat version + JVM config ───────────────────────────────────────────
     $tomcatVersion = "N/A"; $jrePath = "N/A"; $heapInitMB = $null; $heapMaxMB = $null
     $gcCollector   = "N/A"
@@ -906,9 +967,12 @@ $checkServicesScript = {
             $csRestartCount = Get-ServiceRestartCount -ServiceName $cs.Name -Computer $ComputerName
             if ($cs.State -ne "Running") { $overallStatus = "DOWN" }
 
+            $csVer = if ($csVersionMap.ContainsKey($cs.Name)) { $csVersionMap[$cs.Name] } else { "N/A" }
+
             [void]$out.Add(""); [void]$out.Add("  Instance:           $($cs.Name)")
             [void]$out.Add("  Status:             $csState")
             [void]$out.Add("  Display Name:       $($cs.DisplayName)")
+            [void]$out.Add("  Version:            $csVer")
             [void]$out.Add("  Description:        $($cs.Description)")
             [void]$out.Add("  Run As:             $($cs.StartName)")
             [void]$out.Add("  Service Uptime:     $csUp")
@@ -956,7 +1020,7 @@ $checkServicesScript = {
                 DateTime = $checkTime; Zone = $GroupName; Server = $ComputerName
                 ServiceType = "ContentServer"; ServiceName = $cs.Name
                 DisplayName = $cs.DisplayName; Description = $cs.Description
-                Status = $cs.State; Version = ""; JrePath = ""
+                Status = $cs.State; Version = $csVer; JrePath = ""
                 HeapInitMB = $null; HeapMaxMB = $null; GcCollector = ""
                 GcWarnings = ""; GcRecommend = ""; RunAs = $cs.StartName
                 ServiceUptime = $csUp; RestartConfig = $csRestart
@@ -1220,9 +1284,20 @@ foreach ($result in ($results | Sort-Object GroupName, ComputerName)) {
     $zoneSummary[$grp][$result.OverallStatus]++
 
     if ($result.TomcatVersion -and
-        $result.TomcatVersion -notin @("N/A","Unknown","Unable to retrieve")) {
+        $result.TomcatVersion -notin @("N/A","Unknown","Unable to retrieve","WinRM unavailable")) {
         if (-not $allVersions.Contains($grp)) { $allVersions[$grp] = @{} }
         $allVersions[$grp][$result.ComputerName] = $result.TomcatVersion
+    }
+    # Also track CS versions per instance for mismatch detection
+    if ($result.CsvRows) {
+        foreach ($csRow in $result.CsvRows) {
+            if ($csRow.ServiceType -eq "ContentServer" -and
+                $csRow.Version -and $csRow.Version -notin @("","N/A")) {
+                $csVerKey = $grp + "|CS"
+                if (-not $allVersions.Contains($csVerKey)) { $allVersions[$csVerKey] = @{} }
+                $allVersions[$csVerKey]["$($csRow.Server)|$($csRow.ServiceName)"] = $csRow.Version
+            }
+        }
     }
 
     if ($grp -ne $prevGroup) {
@@ -1282,8 +1357,18 @@ foreach ($grp in $zoneSummary.Keys) {
         $majority = $vg[0].Name
         $outliers = $allVersions[$grp].GetEnumerator() | Where-Object { $_.Value -ne $majority }
         if ($outliers) {
-            Write-Log "    [VERSION MISMATCH] Majority: $majority - outliers:" -Color Yellow
+            Write-Log "    [TOMCAT VERSION MISMATCH] Majority: $majority - outliers:" -Color Yellow
             foreach ($o in $outliers) { Write-Log "      $($o.Key) : $($o.Value)" -Color Yellow }
+        }
+    }
+    $csVerKey = $grp + "|CS"
+    if ($allVersions.Contains($csVerKey) -and $allVersions[$csVerKey].Count -gt 1) {
+        $vgCs   = $allVersions[$csVerKey].Values | Group-Object | Sort-Object Count -Descending
+        $majCs  = $vgCs[0].Name
+        $outlCs = $allVersions[$csVerKey].GetEnumerator() | Where-Object { $_.Value -ne $majCs }
+        if ($outlCs) {
+            Write-Log "    [CS VERSION MISMATCH] Majority: $majCs - outliers:" -Color Yellow
+            foreach ($o in $outlCs) { Write-Log "      $($o.Key) : $($o.Value)" -Color Yellow }
         }
     }
 }
@@ -1441,6 +1526,8 @@ $htmlRows | Group-Object Zone | ForEach-Object {
                 "</div>"
         }
 
+        function fmtChip { param($t,$c) "<span class='chip $c'>$t</span>" }
+
         $csRows | ForEach-Object {
             $primary  = $_
             $instName = $primary.ServiceName
@@ -1451,8 +1538,6 @@ $htmlRows | Group-Object Zone | ForEach-Object {
             $detId  = $instId + "_det"
             $infId  = $instId + "_inf"
 
-            function fmtChip { param($t,$c) "<span class='chip $c'>$t</span>" }
-
             $statusChip  = if ($primary.Status -eq "Running") { fmtChip "RUNNING" "running" }
                            else { fmtChip "STOPPED" "stopped" }
             $overallChip = switch ($primary.OverallStatus) {
@@ -1462,7 +1547,9 @@ $htmlRows | Group-Object Zone | ForEach-Object {
                 "DOWN"     { fmtChip "DOWN"       "down"    }
                 default    { fmtChip (HtmlEncode $primary.OverallStatus) "na" }
             }
-            $versionVal = if ($tomcatRow -and $tomcatRow.Version)     { HtmlEncode $tomcatRow.Version }      else { "N/A" }
+            $versionVal = if ($primary.Version -and $primary.Version -ne "") { HtmlEncode $primary.Version }
+                          elseif ($tomcatRow -and $tomcatRow.Version) { HtmlEncode $tomcatRow.Version }
+                          else { "N/A" }
             $wsVal      = if ($tomcatRow -and $tomcatRow.WorkingSetMB) { HtmlEncode $tomcatRow.WorkingSetMB } else { "N/A" }
             $heapVal    = if ($tomcatRow -and $tomcatRow.HeapInitMB) {
                               "Xms: $(HtmlEncode $tomcatRow.HeapInitMB) MB / Xmx: $(HtmlEncode $tomcatRow.HeapMaxMB) MB"
@@ -1485,6 +1572,7 @@ $htmlRows | Group-Object Zone | ForEach-Object {
                 }
             }
             $detCells += "<div class='detail-cell'><div class='d-label'>Run As</div><div class='d-value'>$(HtmlEncode $primary.RunAs)</div></div>"
+            $detCells += "<div class='detail-cell'><div class='d-label'>CS Version</div><div class='d-value'>$(HtmlEncode $primary.Version)</div></div>"
             $detCells += "<div class='detail-cell'><div class='d-label'>Service Uptime</div><div class='d-value'>$(HtmlEncode $primary.ServiceUptime)</div></div>"
             $detCells += "<div class='detail-cell'><div class='d-label'>Restart Config</div><div class='d-value'>$(HtmlEncode $primary.RestartConfig)</div></div>"
             $autoRestartStr = "$($primary.AutoRestarts)"
@@ -1580,7 +1668,7 @@ $htmlRows | Group-Object Zone | ForEach-Object {
         }
 
         $serverHtml += "
-        <tr class='server-header $serverStatus' onclick='toggleRow(this, &quot;$serverId&quot;)'>
+        <tr class='server-header $serverStatus' data-server-id='$serverId' onclick='toggleServer(this)'>
           <td colspan='10'><div class='server-label'><span class='arrow'>v</span>$serverHeaderLabel</div></td>
         </tr>
         <tbody id='$serverId' class='collapsible'>
@@ -1599,7 +1687,7 @@ $htmlRows | Group-Object Zone | ForEach-Object {
     }
 
     $htmlBody += "
-    <tr class='zone-header $zoneStatus' onclick='toggleRow(this, &quot;$zoneId&quot;)'>
+    <tr class='zone-header $zoneStatus' data-zone-id='$zoneId' onclick='toggleZone(this)'>
       <td colspan='10'>
         <div class='zone-label'>
           <span class='arrow'>v</span>
@@ -1815,23 +1903,58 @@ function toggleRow(h, id) {
     el.style.display = (el.tagName === 'TBODY') ? (hidden ? 'table-row-group' : 'none') : (hidden ? 'block' : 'none');
     h.classList.toggle('collapsed', !hidden);
 }
+function toggleZone(h) {
+    var zoneId = h.getAttribute('data-zone-id');
+    if (!zoneId) return;
+    var zoneTbody = document.getElementById(zoneId);
+    if (!zoneTbody) return;
+    var hidden = zoneTbody.style.display === 'none';
+    zoneTbody.style.display = hidden ? 'table-row-group' : 'none';
+    h.classList.toggle('collapsed', !hidden);
+}
+function toggleServer(h) {
+    var serverId = h.getAttribute('data-server-id');
+    if (!serverId) return;
+    var tbody = document.getElementById(serverId);
+    if (!tbody) return;
+    var hidden = tbody.style.display === 'none';
+    tbody.style.display = hidden ? 'table-row-group' : 'none';
+    h.classList.toggle('collapsed', !hidden);
+}
 window.addEventListener('DOMContentLoaded', function () {
+    // Hide all collapsible panels by default
     document.querySelectorAll('.collapsible').forEach(function(e){ e.style.display='none'; });
     document.querySelectorAll('.hidden-panel').forEach(function(e){ e.style.display='none'; });
     document.querySelectorAll('.zone-header,.server-header,.instance-header,.inf-toggle').forEach(function(r){ r.classList.add('collapsed'); });
-    var sel = ['.zone-header.warn','.zone-header.down','.zone-header.critical',
-               '.server-header.warn','.server-header.down','.server-header.critical',
-               '.instance-header.warn','.instance-header.down','.instance-header.critical'].join(',');
-    document.querySelectorAll(sel).forEach(function(row){
-        var next = row.nextElementSibling;
-        while (next && next.tagName !== 'TBODY') { next = next.nextElementSibling; }
-        if (next) { next.style.display = 'table-row-group'; row.classList.remove('collapsed'); }
+
+    // Auto-open zones that have warn/down/critical status — show all server rows within
+    document.querySelectorAll('.zone-header.warn,.zone-header.down,.zone-header.critical').forEach(function(row){
+        var zoneId = row.getAttribute('data-zone-id');
+        if (zoneId) {
+            var el = document.getElementById(zoneId);
+            if (el) { el.style.display = 'table-row-group'; row.classList.remove('collapsed'); }
+        }
     });
+
+    // Auto-open server headers for warn/down/critical — reveal their instance rows
+    document.querySelectorAll('.server-header.warn,.server-header.down,.server-header.critical').forEach(function(row){
+        var serverId = row.getAttribute('data-server-id');
+        if (serverId) {
+            var el = document.getElementById(serverId);
+            if (el) { el.style.display = 'table-row-group'; row.classList.remove('collapsed'); }
+        }
+    });
+
+    // Informant panels: only auto-open if there are failures/errors
     document.querySelectorAll('.inf-toggle').forEach(function(row){
         var id = row.getAttribute('data-target');
         var el = id ? document.getElementById(id) : null;
-        if (el && el.querySelector('.chip.failure,.chip.error')) { el.style.display='block'; row.classList.remove('collapsed'); }
+        if (el && el.querySelector('.chip.failure,.chip.error')) {
+            el.style.display='block'; row.classList.remove('collapsed');
+        }
     });
+
+    // Build stat bar counts
     var ok=0, warn=0, crit=0, down=0;
     document.querySelectorAll('.instance-header').forEach(function(r){
         if (r.classList.contains('ok')) ok++;
