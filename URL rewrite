@@ -1,0 +1,9 @@
+<rewrite>
+  <rules>
+    <rule name="demo-readydocs-to-5830" stopProcessing="true">
+      <match url="^demo/readydocs(.*)" />
+      <action type="Rewrite"
+              url="https://localhost:5830/demo/readydocs{R:1}" />
+    </rule>
+  </rules>
+</rewrite>
