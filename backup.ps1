@@ -8,15 +8,20 @@
 #        Dynamically resolves the instance name, Tomcat service name, and
 #        Content Server directory from remote service metadata.
 #
-#        OPTIMISATIONS vs original:
+#        OPTIMISATIONS:
 #        - Phase 1 (discovery) runs in parallel across all servers
 #        - Phase 3 (health check) runs in parallel across all servers
 #        - Write-Log uses a StreamWriter (file kept open) instead of Add-Content
-#          per line — eliminates repeated open/close overhead on every log entry
-#        - Parallel job throttle replaced busy-wait (500ms poll) with Wait-Job -Any
-#        - Compress-Archive replaced with ZipFile::CreateFromDirectory using
-#          CompressionLevel.Fastest for significantly faster compression
+#        - Parallel job throttle uses Wait-Job -Any instead of 500ms busy-poll
+#        - Compress-Archive replaced with ZipFile::CreateFromDirectory (Fastest)
 #        - Fixed {INSTANCE} regex encoding artifacts
+#        - Pre-flight ping check skips unreachable servers immediately
+#        - Zip destination collision guard (millisecond timestamp)
+#        - Run summary at completion (SUCCESS/FAILED/SKIPPED counts)
+#        - Log rotation (keeps $maxLogs most recent log files)
+#        - Start-Transcript captures all console output alongside StreamWriter log
+#        - Discovery path parsing uses .NET string methods (no -replace regex)
+#          for compatibility with older PS remoting endpoints
 #
 #        COMPATIBILITY: PowerShell 5.1
 #
@@ -48,19 +53,21 @@ if (-not (Test-Path $configFile)) {
 }
 
 $logDir          = Join-Path $PSScriptRoot "Logs"
-$localLogPath    = Join-Path $logDir "CompressionLog_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$timestamp       = Get-Date -Format 'yyyyMMdd_HHmmss'
+$localLogPath    = Join-Path $logDir "CompressionLog_${timestamp}.log"
+$transcriptPath  = Join-Path $logDir "CompressionTranscript_${timestamp}.log"
 $maxParallelJobs = 5
 $maxBackups      = 2
+$maxLogs         = 10    # number of log/transcript pairs to retain
 $svcStopTimeout  = [TimeSpan]::FromSeconds(60)
 $svcStartTimeout = [TimeSpan]::FromSeconds(60)
 
 # Stop order: outermost dependents first. Restart is the reverse.
-# OTSsystemCenterAgent and Tomcat depend on CS; CS Admin is auxiliary.
-$staticServices = @('OTSsystemCenterAgent', '{TOMCAT}', '{INSTANCE}Admin', '{INSTANCE}')
+# OTSystemCenterAgent and Tomcat depend on CS; CS Admin is auxiliary.
+$staticServices = @('OTSystemCenterAgent', '{TOMCAT}', '{INSTANCE}Admin', '{INSTANCE}')
 #endregion
 
 #region Helpers
-# StreamWriter kept open for the script lifetime — avoids file open/close on every log line.
 $script:_logWriter = $null
 
 function Write-Log {
@@ -123,6 +130,29 @@ function Resolve-ServiceNames {
         }
     } | Where-Object { $_ }
 }
+
+function Invoke-LogRotation {
+    param([string]$Dir, [int]$Keep)
+    # Rotate CompressionLog files
+    $logs = Get-ChildItem -Path $Dir -Filter 'CompressionLog_*.log' |
+            Sort-Object CreationTime
+    $excess = $logs.Count - $Keep
+    if ($excess -gt 0) {
+        $logs | Select-Object -First $excess | ForEach-Object {
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+            Write-Log "  Log rotation: deleted $($_.Name)" -Color DarkGray
+        }
+    }
+    # Rotate Transcript files
+    $transcripts = Get-ChildItem -Path $Dir -Filter 'CompressionTranscript_*.log' |
+                   Sort-Object CreationTime
+    $excess = $transcripts.Count - $Keep
+    if ($excess -gt 0) {
+        $transcripts | Select-Object -First $excess | ForEach-Object {
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 #endregion
 
 #region Discovery Script Block
@@ -153,9 +183,8 @@ $discoverScript = {
 
         if ($csSvc.PathName) {
             try {
-                # Strip surrounding quotes and any arguments after the exe path
-                # using .NET string methods to avoid -replace regex serialisation
-                # issues on older PS remoting endpoints.
+                # Strip surrounding quotes and arguments using .NET string methods
+                # to avoid -replace regex serialisation issues on older PS remoting endpoints.
                 $raw = $csSvc.PathName.Trim()
                 if ($raw.StartsWith('"')) {
                     $closeQuote = $raw.IndexOf('"', 1)
@@ -265,12 +294,20 @@ $scriptBlock = {
             }
         }
 
-        # ZipFile::CreateFromDirectory with Fastest compression is significantly
-        # quicker than Compress-Archive (which defaults to Optimal).
-        # Add-Type must be called inside the remote script block each time.
         if (-not (Test-Path $SrcPath -PathType Container)) {
             throw "Source path '$SrcPath' does not exist on $host_."
         }
+
+        # Guard against destination collision — append milliseconds if path exists
+        if (Test-Path $DestPath) {
+            $leaf      = [System.IO.Path]::GetFileNameWithoutExtension($DestPath)
+            $ms        = (Get-Date).Millisecond.ToString('000')
+            $DestPath  = [System.IO.Path]::Combine(
+                [System.IO.Path]::GetDirectoryName($DestPath),
+                "${leaf}_${ms}.zip"
+            )
+        }
+
         Write-Output "($host_) - Compressing '$SrcPath' -> '$DestPath'..."
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [System.IO.Compression.ZipFile]::CreateFromDirectory(
@@ -354,24 +391,29 @@ $verifyScript = {
 #region Main
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
-# Open StreamWriter once for the entire run (UTF-8, no BOM, no append).
+# Start transcript to capture all console output alongside the StreamWriter log
+Start-Transcript -Path $transcriptPath -Force | Out-Null
+
+# Open StreamWriter once for the entire run (UTF-8, no BOM, no append)
 $script:_logWriter = New-Object System.IO.StreamWriter(
     $localLogPath,
     $false,
     (New-Object System.Text.UTF8Encoding($false))
 )
-$script:_logWriter.AutoFlush = $false   # flush manually at end for best throughput
+$script:_logWriter.AutoFlush = $false
 
 $startTime = Get-Date
 Write-Log "---------------- SCRIPT EXECUTION STARTED ----------------" -Color Cyan
 Write-Log "Started   : $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Color Gray
 Write-Log "Log file  : $localLogPath" -Color Gray
+Write-Log "Transcript: $transcriptPath" -Color Gray
 
 $serverGroups, $totalEntries = Parse-ServersFile -Path $configFile
 
 if ($totalEntries -eq 0) {
     Write-Log "ERROR: No valid server entries found in $configFile" -Level 'ERROR' -Color Red
     Close-Log
+    Stop-Transcript
     exit 1
 }
 
@@ -385,11 +427,35 @@ $allEntries = foreach ($group in $serverGroups.Keys) {
     }
 }
 
+# --- Pre-flight: Ping check ---
+Write-Log "Pre-flight: Checking server reachability..." -Color Yellow
+$reachable = New-Object 'System.Collections.Generic.List[pscustomobject]'
+$skippedUnreachable = 0
+
+foreach ($e in $allEntries) {
+    if (Test-Connection -ComputerName $e.Fqdn -Count 1 -Quiet -ErrorAction SilentlyContinue) {
+        Write-Log "  $($e.Fqdn): reachable" -Color Gray
+        $reachable.Add($e)
+    } else {
+        Write-Log "  $($e.Fqdn): UNREACHABLE -- skipping" -Level 'WARN' -Color Yellow
+        $skippedUnreachable++
+    }
+}
+
+if ($reachable.Count -eq 0) {
+    Write-Log "ERROR: No servers are reachable. Exiting." -Level 'ERROR' -Color Red
+    Close-Log
+    Stop-Transcript
+    exit 1
+}
+
+Write-Log -Spacer
+
 # --- Phase 1: Parallel Discovery ---
 Write-Log "Phase 1: Discovering service names and paths (parallel)..." -Color Yellow
 
 $discJobs = @{}
-foreach ($e in $allEntries) {
+foreach ($e in $reachable) {
     Write-Log "  Queuing discovery for $($e.Fqdn)..." -Color Gray
     try {
         $j = Invoke-Command -ComputerName $e.Fqdn -ScriptBlock $discoverScript -AsJob
@@ -406,7 +472,7 @@ $activeDiscJobs = $discJobs.Values | Where-Object { $_ -ne $null }
 if ($activeDiscJobs) { $activeDiscJobs | Wait-Job | Out-Null }
 
 $discoveryResults = @{}
-foreach ($e in $allEntries) {
+foreach ($e in $reachable) {
     $j = $discJobs[$e.Fqdn]
     if ($null -eq $j) {
         $discoveryResults[$e.Fqdn] = [pscustomobject]@{
@@ -445,13 +511,15 @@ foreach ($e in $allEntries) {
 Write-Log -Spacer
 Write-Log "Phase 2: Queuing compression jobs..." -Color Yellow
 
-$jobs = New-Object 'System.Collections.Generic.List[pscustomobject]'
+$jobs         = New-Object 'System.Collections.Generic.List[pscustomobject]'
+$skippedDisc  = 0
 
-foreach ($e in $allEntries) {
+foreach ($e in $reachable) {
     $disc = $discoveryResults[$e.Fqdn]
 
     if (-not $disc.InstanceName -or -not $disc.ContentServerDir) {
         Write-Log "SKIPPING $($e.Fqdn) -- incomplete discovery (Instance='$($disc.InstanceName)' CSDir='$($disc.ContentServerDir)')." -Level 'WARN' -Color Yellow
+        $skippedDisc++
         continue
     }
 
@@ -461,9 +529,11 @@ foreach ($e in $allEntries) {
     $srcPath    = $disc.ContentServerDir
     $destFolder = Split-Path $srcPath -Parent
     $srcName    = Split-Path $srcPath -Leaf
-    $destPath   = Join-Path $destFolder "${srcName}_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').zip"
+    # Include milliseconds to guarantee uniqueness even within the same second
+    $tsBase     = Get-Date -Format 'yyyy-MM-dd_HHmmss'
+    $tsMs       = (Get-Date).Millisecond.ToString('000')
+    $destPath   = Join-Path $destFolder "${srcName}_${tsBase}_${tsMs}.zip"
 
-    # Throttle: Wait-Job -Any reacts immediately when a slot opens (no 500ms busy-poll)
     if ((Get-Job -State Running).Count -ge $maxParallelJobs) {
         Wait-Job -Any | Out-Null
     }
@@ -487,8 +557,12 @@ foreach ($e in $allEntries) {
     }
     catch {
         Write-Log "FAILED to queue job for $($e.Fqdn): $_" -Level 'ERROR' -Color Red
+        $skippedDisc++
     }
 }
+
+$countSuccess = 0
+$countFailed  = 0
 
 if ($jobs.Count -eq 0) {
     Write-Log "No jobs were queued. Review discovery warnings above." -Level 'WARN' -Color Yellow
@@ -522,10 +596,12 @@ if ($jobs.Count -eq 0) {
 
         if ($entry.Job.State -eq 'Completed') {
             Write-Log "RESULT: SUCCESS -- $($entry.ComputerName)" -Color Green
+            $countSuccess++
         } else {
             $err    = $entry.Job.ChildJobs[0].Error | Select-Object -First 1
             $errMsg = if ($err) { $err.Exception.Message } else { "Unreachable or access denied." }
             Write-Log "RESULT: FAILED -- $($entry.ComputerName) | $errMsg" -Level 'ERROR' -Color Red
+            $countFailed++
         }
     }
 
@@ -601,15 +677,31 @@ foreach ($entry in ($jobs | Sort-Object GroupName, ComputerName)) {
     Remove-Job -Job $vj -Force
 }
 
-$endTime = Get-Date
-$dur     = $endTime - $startTime
+# --- Summary ---
+$endTime  = Get-Date
+$dur      = $endTime - $startTime
+$skipped  = $skippedUnreachable + $skippedDisc
+$total    = $totalEntries
+
 Write-Log -Spacer
 Write-Log "========================================" -Color Cyan
+Write-Log "SUMMARY" -Color Cyan
+Write-Log "  Total servers  : $total" -Color Cyan
+Write-Log "  Success        : $countSuccess" -Color Green
+$failedColor  = if ($countFailed -gt 0) { 'Red' } else { 'Cyan' }
+$skippedColor = if ($skipped -gt 0) { 'Yellow' } else { 'Cyan' }
+Write-Log "  Failed         : $countFailed" -Color $failedColor
+Write-Log "  Skipped        : $skipped  (unreachable: $skippedUnreachable, discovery: $skippedDisc)" -Color $skippedColor
+Write-Log "----------------------------------------" -Color Cyan
 Write-Log "Completed : $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Color Cyan
-Write-Log "Duration  : $($dur.ToString('mm\:ss'))"                  -Color Cyan
-Write-Log "========================================" -Color Cyan
+Write-Log "Duration  : $($dur.ToString('mm\:ss'))" -Color Cyan
 Write-Log "Log saved : $localLogPath" -Color Green
+Write-Log "========================================" -Color Cyan
 Write-Log "---------------- SCRIPT EXECUTION FINISHED ----------------"
 
+# --- Log rotation ---
+Invoke-LogRotation -Dir $logDir -Keep $maxLogs
+
 Close-Log
+Stop-Transcript
 #endregion
