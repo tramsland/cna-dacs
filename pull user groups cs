@@ -1,0 +1,403 @@
+# ═══════════════════════════════════════════════════════════════
+# STEP 1: Extract all Users, Groups and Memberships from Content Server
+# Version  : 1.0
+# PS Ver   : 5.1 Compatible
+# ═══════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────
+
+$CS_Host    = "https://your-contentserver-host"
+$CS_User    = "Admin"
+$CS_Pass    = "yourpassword"
+$OutputPath = ".\OTDS_Migration\Step1_CS_Extract"
+$LogFile    = ".\OTDS_Migration\Step1_CS_Extract\Step1.log"
+
+# ─────────────────────────────────────────
+# Setup - Create output folder
+# ─────────────────────────────────────────
+
+if (-not (Test-Path ".\OTDS_Migration\Step1_CS_Extract")) {
+    New-Item -ItemType Directory -Force -Path ".\OTDS_Migration\Step1_CS_Extract" | Out-Null
+}
+
+# ─────────────────────────────────────────
+# Helper: Write-Log
+# ─────────────────────────────────────────
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("INFO","WARN","ERROR","SUCCESS")]
+        [string]$Level = "INFO"
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logLine   = "[$timestamp] [$Level] $Message"
+
+    # Write to log file
+    Add-Content -Path $LogFile -Value $logLine
+
+    # Write to console with colour
+    switch ($Level) {
+        "INFO"    { Write-Host $logLine -ForegroundColor Cyan }
+        "WARN"    { Write-Host $logLine -ForegroundColor Yellow }
+        "ERROR"   { Write-Host $logLine -ForegroundColor Red }
+        "SUCCESS" { Write-Host $logLine -ForegroundColor Green }
+    }
+}
+
+# ─────────────────────────────────────────
+# Helper: Invoke-CSRestCall
+# Wraps Invoke-RestMethod with error handling
+# ─────────────────────────────────────────
+
+function Invoke-CSRestCall {
+    param(
+        [string]$Uri,
+        [string]$Method = "GET",
+        [hashtable]$Headers,
+        [string]$Body = $null,
+        [string]$Description = "API Call"
+    )
+
+    Write-Log "Calling [$Method] $Uri - $Description"
+
+    try {
+        $params = @{
+            Uri     = $Uri
+            Method  = $Method
+            Headers = $Headers
+        }
+
+        if ($Body) {
+            $params.Body        = $Body
+            $params.ContentType = "application/json"
+        }
+
+        $response = Invoke-RestMethod @params
+        Write-Log "[$Description] succeeded" "SUCCESS"
+        return $response
+
+    } catch [System.Net.WebException] {
+        $statusCode = [int]$_.Exception.Response.StatusCode
+        $statusDesc = $_.Exception.Response.StatusDescription
+
+        Write-Log "[$Description] HTTP Error $statusCode - $statusDesc" "ERROR"
+        Write-Log "URI was: $Uri" "ERROR"
+
+        # Try to read response body for more detail
+        try {
+            $reader  = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $errBody = $reader.ReadToEnd()
+            Write-Log "Response body: $errBody" "ERROR"
+        } catch {
+            Write-Log "Could not read error response body" "WARN"
+        }
+
+        return $null
+
+    } catch {
+        Write-Log "[$Description] Unexpected error: $($_.Exception.Message)" "ERROR"
+        Write-Log "Stack trace: $($_.ScriptStackTrace)" "ERROR"
+        return $null
+    }
+}
+
+# ─────────────────────────────────────────
+# Helper: SSL Bypass (dev/test only)
+# ─────────────────────────────────────────
+
+function Disable-SSLValidation {
+    Write-Log "Disabling SSL validation - FOR TEST/DEV USE ONLY" "WARN"
+    try {
+        Add-Type @"
+        using System.Net;
+        using System.Security.Cryptography.X509Certificates;
+        public class TrustAllCerts : ICertificatePolicy {
+            public bool CheckValidationResult(
+                ServicePoint srvPoint, X509Certificate certificate,
+                WebRequest request, int certificateProblem) { return true; }
+        }
+"@
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
+        Write-Log "SSL validation disabled" "WARN"
+    } catch {
+        Write-Log "SSL bypass already applied or failed: $($_.Exception.Message)" "WARN"
+    }
+
+    [System.Net.ServicePointManager]::SecurityProtocol = `
+        [System.Net.SecurityProtocolType]::Tls12 -bor `
+        [System.Net.SecurityProtocolType]::Tls11 -bor `
+        [System.Net.SecurityProtocolType]::Tls
+}
+
+# ─────────────────────────────────────────
+# Helper: Export-ToCsv
+# Safe CSV export with error handling
+# ─────────────────────────────────────────
+
+function Export-ToCsv {
+    param(
+        [array]$Data,
+        [string]$FilePath,
+        [string]$Description
+    )
+
+    try {
+        if ($Data.Count -eq 0) {
+            Write-Log "No data to export for: $Description" "WARN"
+            return
+        }
+
+        $Data | Export-Csv -Path $FilePath -NoTypeInformation -Encoding UTF8
+        Write-Log "Exported $($Data.Count) rows to $FilePath [$Description]" "SUCCESS"
+
+    } catch {
+        Write-Log "Failed to export $Description to CSV: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# START
+# ═══════════════════════════════════════════════════════════════
+
+Write-Log "══════════════════════════════════════════════" "INFO"
+Write-Log " STEP 1: Content Server Extract - Started     " "INFO"
+Write-Log "══════════════════════════════════════════════" "INFO"
+Write-Log "CS Host     : $CS_Host"    "INFO"
+Write-Log "Output Path : $OutputPath" "INFO"
+
+# Apply SSL bypass
+Disable-SSLValidation
+
+# ─────────────────────────────────────────
+# Authenticate with Content Server
+# ─────────────────────────────────────────
+
+Write-Log "Authenticating with Content Server..." "INFO"
+
+$authBody = @{
+    username = $CS_User
+    password = $CS_Pass
+} | ConvertTo-Json
+
+$authResponse = Invoke-CSRestCall `
+    -Uri         "$CS_Host/api/v1/auth" `
+    -Method      "POST" `
+    -Headers     @{ "Content-Type" = "application/json" } `
+    -Body        $authBody `
+    -Description "CS Authentication"
+
+if (-not $authResponse -or -not $authResponse.ticket) {
+    Write-Log "Authentication failed. Cannot continue. Check CS_Host, CS_User and CS_Pass." "ERROR"
+    exit 1
+}
+
+$csTicket  = $authResponse.ticket
+$csHeaders = @{
+    "OTCSTicket"   = $csTicket
+    "Content-Type" = "application/json"
+}
+
+Write-Log "Authentication successful. Ticket acquired." "SUCCESS"
+
+# ─────────────────────────────────────────
+# Extract CS Users
+# ─────────────────────────────────────────
+
+Write-Log "──────────────────────────────────────────" "INFO"
+Write-Log "Extracting Users from Content Server..."    "INFO"
+Write-Log "──────────────────────────────────────────" "INFO"
+
+$csUsers    = @()
+$csPage     = 1
+$csLimit    = 100
+$keepGoing  = $true
+
+while ($keepGoing) {
+    Write-Log "Fetching users page $csPage (limit $csLimit)..." "INFO"
+
+    $response = Invoke-CSRestCall `
+        -Uri         "$CS_Host/api/v1/members?where_type=0&page=$csPage&limit=$csLimit" `
+        -Method      "GET" `
+        -Headers     $csHeaders `
+        -Description "Fetch Users Page $csPage"
+
+    if (-not $response) {
+        Write-Log "Null response on users page $csPage. Stopping user extraction." "ERROR"
+        $keepGoing = $false
+
+    } elseif (-not $response.results -or $response.results.Count -eq 0) {
+        Write-Log "No more users returned on page $csPage. Extraction complete." "INFO"
+        $keepGoing = $false
+
+    } else {
+        $batch = $response.results
+        Write-Log "Page $csPage returned $($batch.Count) users." "INFO"
+        $csUsers  += $batch
+        $csPage++
+
+        if ($batch.Count -lt $csLimit) {
+            Write-Log "Last page reached (returned less than limit)." "INFO"
+            $keepGoing = $false
+        }
+    }
+}
+
+Write-Log "Total CS Users extracted: $($csUsers.Count)" "SUCCESS"
+
+# Flatten user properties for export
+$csUsersFlat = $csUsers | ForEach-Object {
+    $p = $_.data.properties
+    [PSCustomObject]@{
+        CS_ID      = $p.id
+        Name       = $p.name
+        FirstName  = $p.first_name
+        LastName   = $p.last_name
+        Email      = $p.email
+        Type       = $p.type
+        Enabled    = $p.enabled
+        Department = $p.department
+        Title      = $p.title
+    }
+}
+
+Export-ToCsv -Data $csUsersFlat -FilePath "$OutputPath\CS_Users.csv" -Description "CS Users"
+
+# ─────────────────────────────────────────
+# Extract CS Groups
+# ─────────────────────────────────────────
+
+Write-Log "──────────────────────────────────────────" "INFO"
+Write-Log "Extracting Groups from Content Server..."   "INFO"
+Write-Log "──────────────────────────────────────────" "INFO"
+
+$csGroups  = @()
+$csPage    = 1
+$keepGoing = $true
+
+while ($keepGoing) {
+    Write-Log "Fetching groups page $csPage (limit $csLimit)..." "INFO"
+
+    $response = Invoke-CSRestCall `
+        -Uri         "$CS_Host/api/v1/members?where_type=1&page=$csPage&limit=$csLimit" `
+        -Method      "GET" `
+        -Headers     $csHeaders `
+        -Description "Fetch Groups Page $csPage"
+
+    if (-not $response) {
+        Write-Log "Null response on groups page $csPage. Stopping group extraction." "ERROR"
+        $keepGoing = $false
+
+    } elseif (-not $response.results -or $response.results.Count -eq 0) {
+        Write-Log "No more groups returned on page $csPage. Extraction complete." "INFO"
+        $keepGoing = $false
+
+    } else {
+        $batch     = $response.results
+        Write-Log "Page $csPage returned $($batch.Count) groups." "INFO"
+        $csGroups += $batch
+        $csPage++
+
+        if ($batch.Count -lt $csLimit) {
+            Write-Log "Last page reached (returned less than limit)." "INFO"
+            $keepGoing = $false
+        }
+    }
+}
+
+Write-Log "Total CS Groups extracted: $($csGroups.Count)" "SUCCESS"
+
+# Flatten group properties for export
+$csGroupsFlat = $csGroups | ForEach-Object {
+    $p = $_.data.properties
+    [PSCustomObject]@{
+        CS_ID       = $p.id
+        Name        = $p.name
+        Description = $p.description
+        Type        = $p.type
+    }
+}
+
+Export-ToCsv -Data $csGroupsFlat -FilePath "$OutputPath\CS_Groups.csv" -Description "CS Groups"
+
+# ─────────────────────────────────────────
+# Extract CS Group Memberships
+# ─────────────────────────────────────────
+
+Write-Log "──────────────────────────────────────────────" "INFO"
+Write-Log "Extracting Group Memberships from Content Server..." "INFO"
+Write-Log "──────────────────────────────────────────────" "INFO"
+
+$csMemberships = @()
+$groupCount    = 0
+$groupTotal    = $csGroups.Count
+
+foreach ($group in $csGroups) {
+    $groupCount++
+    $groupName = $group.data.properties.name
+    $groupID   = $group.data.properties.id
+
+    Write-Log "[$groupCount/$groupTotal] Fetching members for group: $groupName (ID: $groupID)" "INFO"
+
+    $membersPage   = 1
+    $keepGoing     = $true
+
+    while ($keepGoing) {
+        $response = Invoke-CSRestCall `
+            -Uri         "$CS_Host/api/v1/members/$groupID/members?page=$membersPage&limit=$csLimit" `
+            -Method      "GET" `
+            -Headers     $csHeaders `
+            -Description "Members of $groupName page $membersPage"
+
+        if (-not $response) {
+            Write-Log "Null response fetching members for $groupName page $membersPage" "ERROR"
+            $keepGoing = $false
+
+        } elseif (-not $response.results -or $response.results.Count -eq 0) {
+            Write-Log "No more members for $groupName on page $membersPage" "INFO"
+            $keepGoing = $false
+
+        } else {
+            foreach ($member in $response.results) {
+                $mp = $member.data.properties
+                $csMemberships += [PSCustomObject]@{
+                    GroupID    = $groupID
+                    GroupName  = $groupName
+                    MemberID   = $mp.id
+                    MemberName = $mp.name
+                    MemberType = if ($mp.type -eq 0) { "User" } else { "Group" }
+                }
+            }
+
+            Write-Log "  → Page $membersPage returned $($response.results.Count) members" "INFO"
+            $membersPage++
+
+            if ($response.results.Count -lt $csLimit) {
+                $keepGoing = $false
+            }
+        }
+    }
+}
+
+Write-Log "Total CS Memberships extracted: $($csMemberships.Count)" "SUCCESS"
+
+Export-ToCsv -Data $csMemberships -FilePath "$OutputPath\CS_Memberships.csv" -Description "CS Memberships"
+
+# ═══════════════════════════════════════════════════════════════
+# SUMMARY
+# ═══════════════════════════════════════════════════════════════
+
+Write-Log "══════════════════════════════════════════════" "INFO"
+Write-Log " STEP 1: COMPLETE                             " "SUCCESS"
+Write-Log "══════════════════════════════════════════════" "INFO"
+Write-Log "  Users extracted       : $($csUsers.Count)"        "SUCCESS"
+Write-Log "  Groups extracted      : $($csGroups.Count)"       "SUCCESS"
+Write-Log "  Memberships extracted : $($csMemberships.Count)"  "SUCCESS"
+Write-Log "  Output folder         : $OutputPath"              "SUCCESS"
+Write-Log "  Log file              : $LogFile"                  "SUCCESS"
+Write-Log "══════════════════════════════════════════════" "INFO"
+Write-Log "  Review CSV files then run Step 2 (OTDS Extract)" "INFO"
+Write-Log "══════════════════════════════════════════════" "INFO"
