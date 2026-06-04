@@ -1,753 +1,257 @@
-#Requires -Version 5.1
 #Requires -RunAsAdministrator
-#==================================================================================
-#
-#        SCRIPT: OTSysCenter_Update_Step1.ps1
-#
-#        DESCRIPTION:
-#        Step 1 of the OpenText System Center Agent remote update process.
-#        For each server in servers.txt:
-#          1. Discovers the OTSystemCenterAgent service and install directory
-#          2. Identifies the installed version using all available methods
-#             (FileVersionInfo on exe, version files in install dir, WMI
-#              Win32_Product) and reports which method(s) returned useful data
-#          3. Stops the service gracefully
-#          4. Backs up the install directory as a timestamped zip at the
-#             same level as the install directory
-#
-#        Runs against all servers in parallel (up to $maxParallelJobs at once).
-#        Prompts for alternate credentials at startup (10-second auto-skip).
-#        Remote connections attempt WSMan (WinRM) first, then fall back to
-#        DCOM for CIM queries. Service stop and backup require WinRM.
-#
-#        servers.txt format:
-#          [Zone Name]
-#          server1.domain.com
-#          server2.domain.com
-#
-#          [Another Zone]
-#          server3.domain.com
-#
-#        Lines starting with # and blank lines are ignored.
-#
-#        Local execution:
-#        If servers.txt contains the hostname of the machine running this
-#        script (matched by COMPUTERNAME, FQDN, or 'localhost'), that server
-#        is processed in-process rather than via Invoke-Command, avoiding a
-#        WinRM loopback which requires CredSSP or explicit credentials.
-#
-#==================================================================================
+<#
+.SYNOPSIS
+    Stops, backs up, uninstalls, reinstalls, and restarts the OTSystemCenterAgent service.
 
-#region Configuration
+.DESCRIPTION
+    1.  Stops the OTSystemCenterAgent service
+    2.  Reads the service's installation directory
+    3.  Creates a timestamped backup of that directory
+    4.  Keeps only the 2 most recent backups, deleting older ones
+    5.  Uninstalls the current agent (via msiexec)
+    6.  Clears all contents from the install directory
+    7.  Downloads and installs the latest agent to the same directory
+    8.  Restores the localcerts directory from the backup into the new install root
+    9.  Backs up the new installation's configuration\config.ini
+    10. Copies localcerts\config.ini into the configuration directory
+    11. Starts the service
 
-$configFile      = Join-Path $PSScriptRoot 'servers.txt'
-$logDir          = Join-Path $PSScriptRoot 'logs'
-$maxParallelJobs = 5
-$maxBackups      = 3
-$svcStopTimeout  = 60   # seconds
-$svcName         = 'OTSystemCenterAgent'
+    Directory layout expected under the install root:
+        <InstallDir>\
+            configuration\     <- contains config.ini
+            localcerts\        <- contains config.ini to promote
 
-$localLogPath = Join-Path $logDir "OTSysCenter_Step1_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+.NOTES
+    Must be run as Administrator.
+#>
 
-#endregion
-
-#region Bootstrap
-
-if (-not (Test-Path $configFile)) {
-    Write-Host "ERROR: servers.txt not found at: $configFile" -ForegroundColor Red
-    Write-Host "Create a servers.txt file in the same directory as this script." -ForegroundColor Yellow
-    exit 1
-}
-
-if (-not (Test-Path $logDir)) {
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-}
-
-#endregion
-
-#region Helpers
+# ─── Configuration ────────────────────────────────────────────────────────────
+$ServiceName       = "OTSystemCenterAgent"
+$ServerName        = "patch.dacs.dla.mil"
+$HttpPort          = "443"
+$InstallerUrl      = "https://${ServerName}:/downloadAgent/?ostype=win&filetype=installer"
+$InstallerName     = "OpenText_SystemCenter_Agent.msi"
+$LogName           = "sc_agent_install.log"
+$MaxBackups        = 2
+$LocalCertsDirName = "localcerts"
+$ConfigDirName     = "configuration"
+$ConfigFileName    = "config.ini"
+# ──────────────────────────────────────────────────────────────────────────────
 
 function Write-Log {
-    param(
-        [string]$Message,
-        [string]$Level = 'INFO',
-        [string]$Color = 'White',
-        [switch]$Spacer
-    )
-    if ($Spacer) {
-        Add-Content -Path $localLogPath -Value ''
-        Write-Host ''
-        return
-    }
-    $entry = "[$Level] - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
-    Write-Host $entry -ForegroundColor $Color
-    Add-Content -Path $localLogPath -Value $entry
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "[$timestamp] [$Level] $Message"
+    Write-Host $entry
+    Add-Content -Path "$PSScriptRoot\OTSystemCenterAgent_Update.log" -Value $entry
 }
 
-function Parse-ServersFile {
-    param([string]$Path)
-    $groups  = [ordered]@{}
-    $current = 'Ungrouped'
-    $count   = 0
-    foreach ($line in (Get-Content $Path)) {
-        $t = $line.Trim()
-        if ($t -match '^\s*$' -or $t -match '^\s*#') { continue }
-        if ($t -match '^\[(.+)\]$') {
-            $current = $Matches[1].Trim()
-            if (-not $groups.Contains($current)) {
-                $groups[$current] = [System.Collections.Generic.List[string]]::new()
-            }
-            continue
-        }
-        if (-not $groups.Contains($current)) {
-            $groups[$current] = [System.Collections.Generic.List[string]]::new()
-        }
-        $groups[$current].Add($t)
-        $count++
-    }
-    return $groups, $count
-}
+# ─── Step 1: Get service and resolve install directory ────────────────────────
+Write-Log "Looking up service: $ServiceName"
 
-function Test-IsLocalhost {
-    param([string]$Name)
-    $localNames = @(
-        $env:COMPUTERNAME,
-        "$($env:COMPUTERNAME).$($env:USERDNSDOMAIN)".TrimEnd('.'),
-        [System.Net.Dns]::GetHostEntry('').HostName,
-        'localhost',
-        '127.0.0.1',
-        '::1'
-    ) | Where-Object { $_ } | ForEach-Object { $_.ToLower().TrimEnd('.') }
-    return $localNames -contains $Name.ToLower().TrimEnd('.')
-}
-
-#endregion
-
-#region Remote Script Block
-# Runs on each target server via Invoke-Command -AsJob, matching backup.ps1.
-# WinRM is confirmed working in this environment — the connection pattern is
-# identical to backup.ps1 which succeeds against the same servers.
-# Credential prompt at startup ensures the correct account is used.
-
-$remoteBlock = {
-    param(
-        [string]$SvcName,
-        [int]$StopTimeoutSec,
-        [int]$MaxBackups
-    )
-
-    $hostname = $env:COMPUTERNAME
-
-    # ── Result object ────────────────────────────────────────────────────────
-    $result = [pscustomobject]@{
-        Hostname          = $hostname
-        ServiceFound      = $false
-        InstallDir        = $null
-        ExePath           = $null
-        CimProtocol       = $null   # which protocol opened the CIM session
-        VersionResults    = [System.Collections.Generic.List[pscustomobject]]::new()
-        BestVersion       = $null
-        BestVersionFrom   = $null
-        ServiceWasRunning = $false
-        ServiceStopped    = $false
-        BackupPath        = $null
-        BackupSuccess     = $false
-        ServiceRestarted  = $false
-        Messages          = [System.Collections.Generic.List[string]]::new()
-        Warnings          = [System.Collections.Generic.List[string]]::new()
-        Errors            = [System.Collections.Generic.List[string]]::new()
-    }
-
-    function Add-Msg  { param($m) $result.Messages.Add("($hostname) $m") }
-    function Add-Warn { param($m) $result.Warnings.Add("($hostname) WARN: $m") }
-    function Add-Err  { param($m) $result.Errors.Add("($hostname) ERROR: $m") }
-
-    # ── Open CIM session — WSMan first, DCOM fallback ────────────────────────
-    # Runs locally on the remote host (we're already in a WinRM session).
-    # WSMan is tried first; DCOM fallback handles edge cases.
-    $cimSession   = $null
-    $cimLastError = $null
-    foreach ($protocol in @('Wsman', 'Dcom')) {
-        try {
-            $opt       = New-CimSessionOption -Protocol $protocol
-            $cimSession = New-CimSession -ComputerName $hostname `
-                              -SessionOption $opt -ErrorAction Stop
-            $result.CimProtocol = $protocol
-            Add-Msg "CIM session opened via $protocol."
-            break
-        }
-        catch {
-            $cimLastError = $_
-            Add-Warn "CIM/$protocol failed: $_"
-        }
-    }
-
-    if (-not $cimSession) {
-        Add-Err "Could not open CIM session (tried WSMan and DCOM): $cimLastError"
-        # Fall through — Get-Service, Stop-Service etc still work in the WinRM session
-    }
-
-    # ── Step 1: Locate the service ───────────────────────────────────────────
-    $svc = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        Add-Err "Service '$SvcName' not found on this host."
-        if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
-        return $result
-    }
-
-    $result.ServiceFound      = $true
-    $result.ServiceWasRunning = ($svc.Status -eq 'Running')
-    Add-Msg "Service '$SvcName' found. Status: $($svc.Status)"
-
-    # ── Step 2: Resolve install directory from service PathName ──────────────
-    try {
-        $cimSvcParams = @{ ClassName = 'Win32_Service'; Filter = "Name='$SvcName'"; ErrorAction = 'Stop' }
-        if ($cimSession) { $cimSvcParams['CimSession'] = $cimSession }
-        $cimSvc = Get-CimInstance @cimSvcParams
-
-        if ($cimSvc -and $cimSvc.PathName) {
-            $exeRaw = $cimSvc.PathName -replace '^"([^"]+)".*$', '$1' `
-                                       -replace '^([^\s]+\.exe).*$', '$1'
-            $result.ExePath    = $exeRaw
-            $result.InstallDir = Split-Path $exeRaw -Parent
-            Add-Msg "Install directory resolved: $($result.InstallDir)"
-        } else {
-            Add-Warn "Win32_Service PathName is empty for '$SvcName'."
-        }
-    }
-    catch {
-        Add-Warn "CIM query failed resolving install dir: $_"
-    }
-
-    # ── Step 3: Version detection — all methods ───────────────────────────────
-    #
-    # Method A: FileVersionInfo on the service executable
-    #
-    if ($result.ExePath -and (Test-Path $result.ExePath)) {
-        try {
-            $fvi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($result.ExePath)
-            $ver = $fvi.FileVersion
-            if (-not $ver) { $ver = $fvi.ProductVersion }
-            $result.VersionResults.Add([pscustomobject]@{
-                Method  = 'FileVersionInfo (exe)'
-                Version = if ($ver) { $ver.Trim() } else { $null }
-                Source  = $result.ExePath
-                Success = [bool]$ver
-                Note    = if ($ver) { "FileDescription: $($fvi.FileDescription)" } else { 'No version resource in exe' }
-            })
-            Add-Msg "FileVersionInfo: $ver"
-        }
-        catch {
-            $result.VersionResults.Add([pscustomobject]@{
-                Method  = 'FileVersionInfo (exe)'; Version = $null
-                Source  = $result.ExePath;         Success = $false
-                Note    = "Exception: $_"
-            })
-        }
-    }
-    else {
-        $result.VersionResults.Add([pscustomobject]@{
-            Method  = 'FileVersionInfo (exe)'; Version = $null
-            Source  = $result.ExePath;         Success = $false
-            Note    = if ($result.ExePath) { 'Exe path not accessible' } else { 'Exe path not resolved' }
-        })
-    }
-
-    #
-    # Method B: Version/manifest files in the install directory
-    #
-    if ($result.InstallDir -and (Test-Path $result.InstallDir)) {
-        $versionFilePatterns = @(
-            'version.txt', 'version.properties', 'version.xml',
-            'build.properties', 'manifest.xml', 'agent.properties',
-            '*.version', '*.ver', '*.build'
-        )
-
-        $foundFiles = foreach ($pattern in $versionFilePatterns) {
-            Get-ChildItem -Path $result.InstallDir -Filter $pattern `
-                -Recurse -Depth 2 -ErrorAction SilentlyContinue
-        }
-
-        if ($foundFiles) {
-            foreach ($vf in ($foundFiles | Select-Object -Unique)) {
-                try {
-                    $content   = Get-Content $vf.FullName -Raw -ErrorAction Stop
-                    $extracted = $null
-                    foreach ($pattern in @(
-                        '(?im)^version\s*[=:]\s*(.+)$',
-                        '(?im)^product\.version\s*[=:]\s*(.+)$',
-                        '(?im)^build\.version\s*[=:]\s*(.+)$',
-                        '(?im)^agent\.version\s*[=:]\s*(.+)$',
-                        '(?im)<version>([^<]+)</version>'
-                    )) {
-                        if ($content -match $pattern) { $extracted = $Matches[1].Trim(); break }
-                    }
-                    if (-not $extracted) {
-                        $firstLine = ($content -split "`n" |
-                                      Where-Object { $_.Trim() -ne '' } |
-                                      Select-Object -First 1)
-                        if ($firstLine -and $firstLine.Trim().Length -lt 60) {
-                            $extracted = $firstLine.Trim()
-                        }
-                    }
-                    $result.VersionResults.Add([pscustomobject]@{
-                        Method  = 'Version file'; Version = $extracted
-                        Source  = $vf.FullName;   Success = [bool]$extracted
-                        Note    = "File: $($vf.Name)"
-                    })
-                    Add-Msg "Version file '$($vf.Name)': $extracted"
-                }
-                catch {
-                    $result.VersionResults.Add([pscustomobject]@{
-                        Method  = 'Version file'; Version = $null
-                        Source  = $vf.FullName;   Success = $false
-                        Note    = "Read error: $_"
-                    })
-                }
-            }
-        }
-        else {
-            $result.VersionResults.Add([pscustomobject]@{
-                Method  = 'Version file'; Version = $null
-                Source  = $result.InstallDir; Success = $false
-                Note    = 'No recognised version files found in install directory (depth 2)'
-            })
-            Add-Warn "No version files found under $($result.InstallDir)"
-        }
-    }
-    else {
-        $result.VersionResults.Add([pscustomobject]@{
-            Method  = 'Version file'; Version = $null
-            Source  = $result.InstallDir; Success = $false
-            Note    = if ($result.InstallDir) { 'Install directory not accessible' } else { 'Install directory not resolved' }
-        })
-    }
-
-    #
-    # Method C: Win32_Product — slowest, triggers MSI consistency check.
-    # Uses the CIM session (WSMan or DCOM) opened above.
-    #
-    try {
-        $prodParams = @{ ClassName = 'Win32_Product'; ErrorAction = 'Stop' }
-        if ($cimSession) { $prodParams['CimSession'] = $cimSession }
-        $products = Get-CimInstance @prodParams |
-                    Where-Object { $_.Name -like '*System Center*' -or
-                                   $_.Name -like '*OTSystemCenter*' -or
-                                   $_.Name -like '*OpenText*Agent*' }
-        if ($products) {
-            foreach ($p in $products) {
-                $result.VersionResults.Add([pscustomobject]@{
-                    Method  = 'Win32_Product'; Version = $p.Version
-                    Source  = "Name: $($p.Name)  InstallLocation: $($p.InstallLocation)"
-                    Success = [bool]$p.Version
-                    Note    = "IdentifyingNumber: $($p.IdentifyingNumber)"
-                })
-                Add-Msg "Win32_Product match: '$($p.Name)' version $($p.Version)"
-            }
-        }
-        else {
-            $result.VersionResults.Add([pscustomobject]@{
-                Method  = 'Win32_Product'; Version = $null
-                Source  = 'Win32_Product query'; Success = $false
-                Note    = 'No products matched System Center / OTSystemCenter / OpenText Agent'
-            })
-            Add-Warn 'Win32_Product: no matching product found.'
-        }
-    }
-    catch {
-        $result.VersionResults.Add([pscustomobject]@{
-            Method  = 'Win32_Product'; Version = $null
-            Source  = 'Win32_Product query'; Success = $false
-            Note    = "Query failed: $_"
-        })
-    }
-
-    # ── Determine best version ────────────────────────────────────────────────
-    # Priority: Win32_Product > FileVersionInfo > version file
-    # Win32_Product is confirmed to return the correct installed version.
-    $best = $result.VersionResults |
-            Where-Object { $_.Success -and $_.Version -and $_.Method -eq 'Win32_Product' } |
-            Select-Object -First 1
-    if (-not $best) {
-        $best = $result.VersionResults |
-                Where-Object { $_.Success -and $_.Version } |
-                Select-Object -First 1
-    }
-    if ($best) {
-        $result.BestVersion     = $best.Version
-        $result.BestVersionFrom = $best.Method
-        Add-Msg "Best version: $($result.BestVersion) (from $($result.BestVersionFrom))"
-    }
-    else {
-        Add-Warn 'Version could not be determined by any method.'
-    }
-
-    # ── Step 4: Stop the service ─────────────────────────────────────────────
-    if ($svc.Status -eq 'Running') {
-        try {
-            Add-Msg "Stopping service '$SvcName'..."
-            Stop-Service -Name $SvcName -Force -ErrorAction Stop
-            $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($StopTimeoutSec))
-            $result.ServiceStopped = $true
-            Add-Msg "Service '$SvcName' stopped successfully."
-        }
-        catch [System.ServiceProcess.TimeoutException] {
-            Add-Err "Timed out waiting for '$SvcName' to stop after ${StopTimeoutSec}s."
-            if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
-            return $result
-        }
-        catch {
-            Add-Err "Failed to stop '$SvcName': $_"
-            if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
-            return $result
-        }
-    }
-    else {
-        Add-Msg "Service '$SvcName' was already stopped — no stop action needed."
-        $result.ServiceStopped = $true
-    }
-
-    # ── Step 5: Backup the install directory ─────────────────────────────────
-    if (-not $result.InstallDir) {
-        Add-Err 'Cannot backup — install directory not resolved.'
-        if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
-        return $result
-    }
-
-    if (-not (Test-Path $result.InstallDir -PathType Container)) {
-        Add-Err "Install directory '$($result.InstallDir)' does not exist on $hostname."
-        if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
-        return $result
-    }
-
-    $parentDir  = Split-Path $result.InstallDir -Parent
-    $folderName = Split-Path $result.InstallDir -Leaf
-    $timestamp  = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-    $zipPath    = Join-Path $parentDir "${folderName}_${timestamp}.zip"
-
-    try {
-        Add-Msg "Compressing '$($result.InstallDir)' → '$zipPath'..."
-        Compress-Archive -Path $result.InstallDir -DestinationPath $zipPath -Force
-        $result.BackupPath    = $zipPath
-        $result.BackupSuccess = $true
-        Add-Msg "Backup completed: $zipPath"
-    }
-    catch {
-        Add-Err "Compression failed: $_"
-        if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
-        return $result
-    }
-
-    # ── Backup rotation ───────────────────────────────────────────────────────
-    try {
-        $existing = Get-ChildItem -Path $parentDir -Filter "${folderName}_*.zip" |
-                    Sort-Object CreationTime
-        $excess = $existing.Count - $MaxBackups
-        if ($excess -gt 0) {
-            Add-Msg "Rotating backups: removing $excess old zip(s), keeping $MaxBackups."
-            $existing | Select-Object -First $excess | ForEach-Object {
-                Remove-Item $_.FullName -Force
-                Add-Msg "Deleted old backup: $($_.Name)"
-            }
-        }
-        else {
-            Add-Msg "$($existing.Count) backup(s) present — no rotation needed (max $MaxBackups)."
-        }
-    }
-    catch {
-        Add-Warn "Backup rotation encountered an error: $_"
-    }
-
-    # ── Step 6: Restart the service ───────────────────────────────────────────
-    # Only restart if the service was running before we stopped it.
-    if ($result.ServiceWasRunning) {
-        try {
-            Add-Msg "Starting service '$SvcName'..."
-            Start-Service -Name $SvcName -ErrorAction Stop
-            $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds($StopTimeoutSec))
-            $result.ServiceRestarted = $true
-            Add-Msg "Service '$SvcName' started successfully."
-        }
-        catch [System.ServiceProcess.TimeoutException] {
-            Add-Err "Timed out waiting for '$SvcName' to start after ${StopTimeoutSec}s."
-        }
-        catch {
-            Add-Err "Failed to restart '$SvcName': $_"
-        }
-    }
-    else {
-        Add-Msg "Service '$SvcName' was not running before backup — leaving stopped."
-    }
-    return $result
-}
-
-#endregion
-
-#region Main
-
-$startTime = Get-Date
-Write-Log '===============================================================' -Color Cyan
-Write-Log "  OTSysCenter_Update_Step1 — $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Color Cyan
-Write-Log '===============================================================' -Color Cyan
-Write-Log "Log       : $localLogPath" -Color Gray
-Write-Log "Service   : $svcName" -Color Gray
-Write-Log "MaxJobs   : $maxParallelJobs" -Color Gray
-Write-Log "MaxBackups: $maxBackups" -Color Gray
-Write-Log -Spacer
-
-# ── Credential prompt — mirrors status.ps1 behaviour ─────────────────────────
-# Gives a 10-second window to enter alternate credentials before auto-skipping.
-# In non-interactive sessions (scheduled tasks, CI) the prompt is bypassed.
-$Credential = $null
-$consoleAvailable = $false
-try { $null = [System.Console]::KeyAvailable; $consoleAvailable = $true } catch { }
-
-if ($consoleAvailable) {
-    try { while ([System.Console]::KeyAvailable) { [System.Console]::ReadKey($true) | Out-Null } } catch { }
-    Write-Host 'Use alternate credentials? (y/n)  [auto-skipping in 10 seconds]' -ForegroundColor Cyan
-    $useCreds = ''; $deadline = (Get-Date).AddSeconds(10)
-    while ((Get-Date) -lt $deadline) {
-        $keyAvail = $false
-        try { $keyAvail = [System.Console]::KeyAvailable } catch { break }
-        if ($keyAvail) {
-            $key = [System.Console]::ReadKey($true)
-            $useCreds = $key.KeyChar.ToString().ToLower()
-            Write-Host $useCreds
-            break
-        }
-        Start-Sleep -Milliseconds 100
-    }
-    if ($useCreds -eq 'y') {
-        $Credential = Get-Credential -Message 'Enter credentials for remote servers'
-    }
-} else {
-    Write-Log 'Non-interactive session — using default credentials.' -Color Gray
-}
-
-if ($Credential) {
-    Write-Log "Credentials : $($Credential.UserName)" -Color Gray
-} else {
-    Write-Log 'Credentials : default (current user)' -Color Gray
-}
-Write-Log -Spacer
-
-# ── Parse servers.txt ─────────────────────────────────────────────────────────
-$serverGroups, $totalServers = Parse-ServersFile -Path $configFile
-
-if ($totalServers -eq 0) {
-    Write-Log 'ERROR: No valid server entries found in servers.txt.' -Level 'ERROR' -Color Red
+$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if (-not $svc) {
+    Write-Log "Service '$ServiceName' not found. Aborting." "ERROR"
     exit 1
 }
 
-Write-Log "Servers   : $totalServers across $($serverGroups.Keys.Count) zone(s)" -Color Gray
-Write-Log -Spacer
+# Pull the binary path from WMI to find the install directory
+$wmiSvc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'"
+if (-not $wmiSvc) {
+    Write-Log "Could not query WMI for service '$ServiceName'. Aborting." "ERROR"
+    exit 1
+}
 
-# ── Queue parallel jobs ───────────────────────────────────────────────────────
-# Local server runs in-process; remotes via Invoke-Command with optional creds.
-Write-Log 'Queuing jobs...' -Color Yellow
-$jobs      = [System.Collections.Generic.List[pscustomobject]]::new()
-$localJobs = [System.Collections.Generic.List[pscustomobject]]::new()
+# PathName may look like: "C:\Program Files\OpenText\SystemCenter\Agent\OTAgent.exe" -args
+$rawPath    = $wmiSvc.PathName -replace '^"([^"]+)".*$', '$1'   # strip quotes & args
+$rawPath    = $rawPath -replace "^([^ ]+).*$", '$1'              # handle unquoted path
+$InstallDir = Split-Path -Parent $rawPath
 
-foreach ($group in $serverGroups.Keys) {
-    foreach ($fqdn in $serverGroups[$group]) {
+if (-not (Test-Path $InstallDir)) {
+    Write-Log "Resolved install directory '$InstallDir' does not exist. Aborting." "ERROR"
+    exit 1
+}
 
-        if (Test-IsLocalhost -Name $fqdn) {
-            # ── Local execution — run scriptblock in-process ──────────────────
-            Write-Log "  LOCAL [$group] $fqdn — running in-process" -Color Yellow
-            try {
-                $r = & $remoteBlock $svcName $svcStopTimeout $maxBackups
-            }
-            catch {
-                $r = [pscustomobject]@{
-                    Hostname          = $env:COMPUTERNAME
-                    ServiceFound      = $false; InstallDir = $null; ExePath = $null
-                    CimProtocol       = $null
-                    VersionResults    = [System.Collections.Generic.List[pscustomobject]]::new()
-                    BestVersion       = $null; BestVersionFrom = $null
-                    ServiceWasRunning = $false; ServiceStopped = $false
-                    BackupPath        = $null; BackupSuccess   = $false
-                    Messages          = [System.Collections.Generic.List[string]]::new()
-                    Warnings          = [System.Collections.Generic.List[string]]::new()
-                    Errors            = [System.Collections.Generic.List[string]]@("In-process execution threw: $_")
-                }
-            }
-            $localJobs.Add([pscustomobject]@{
-                Result  = $r; FQDN = $fqdn; Group = $group; IsLocal = $true
-            })
+Write-Log "Install directory resolved to: $InstallDir"
 
-        } else {
-            # ── Remote execution — Invoke-Command -AsJob matching backup.ps1 ──
-            while ((Get-Job -State Running).Count -ge $maxParallelJobs) {
-                Start-Sleep -Milliseconds 500
-            }
+# Derive key paths from the install directory
+$LocalCertsDir      = Join-Path $InstallDir $LocalCertsDirName
+$ConfigDir          = Join-Path $InstallDir $ConfigDirName
+$ConfigFile         = Join-Path $ConfigDir $ConfigFileName
+$LocalCertsConfig   = Join-Path $LocalCertsDir $ConfigFileName
 
-            Write-Log "  Queuing [$group] $fqdn" -Color Gray
+Write-Log "Configuration directory : $ConfigDir"
+Write-Log "localcerts directory    : $LocalCertsDir"
 
-            $icParams = @{
-                ComputerName = $fqdn
-                ScriptBlock  = $remoteBlock
-                ArgumentList = $svcName, $svcStopTimeout, $maxBackups
-                AsJob        = $true
-            }
-            if ($Credential) { $icParams['Credential'] = $Credential }
+# ─── Step 2: Stop the service ─────────────────────────────────────────────────
+Write-Log "Stopping service: $ServiceName"
+try {
+    Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+    Write-Log "Service stopped successfully."
+} catch {
+    Write-Log "Failed to stop service: $_" "ERROR"
+    exit 1
+}
 
-            $job      = Invoke-Command @icParams
-            $job.Name = $fqdn
+# ─── Step 3: Back up the install directory ────────────────────────────────────
+$dirName    = Split-Path -Leaf $InstallDir
+$parentDir  = Split-Path -Parent $InstallDir
+$timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
+$backupName = "${dirName}_${timestamp}"
+$backupPath = Join-Path $parentDir $backupName
 
-            $jobs.Add([pscustomobject]@{
-                Job     = $job; FQDN = $fqdn; Group = $group; IsLocal = $false
-            })
-        }
+Write-Log "Creating backup: $backupPath"
+try {
+    Copy-Item -Path $InstallDir -Destination $backupPath -Recurse -Force -ErrorAction Stop
+    Write-Log "Backup created successfully."
+} catch {
+    Write-Log "Backup failed: $_" "ERROR"
+    Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    exit 1
+}
+
+# ─── Step 4: Prune old backups (keep only the 2 most recent) ─────────────────
+Write-Log "Pruning old backups (keeping $MaxBackups most recent)..."
+$existingBackups = Get-ChildItem -Path $parentDir -Directory |
+    Where-Object { $_.Name -match "^${dirName}_\d{8}_\d{6}$" } |
+    Sort-Object Name -Descending   # newest first (timestamp in name is sortable)
+
+if ($existingBackups.Count -gt $MaxBackups) {
+    $toDelete = $existingBackups | Select-Object -Skip $MaxBackups
+    foreach ($old in $toDelete) {
+        Write-Log "Deleting old backup: $($old.FullName)"
+        Remove-Item -Path $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
-Write-Log -Spacer
-if ($jobs.Count -gt 0) {
-    Write-Log "Waiting for $($jobs.Count) remote job(s) to complete..." -Color Yellow
-    $jobs | ForEach-Object { $_.Job } | Wait-Job | Out-Null
-}
-if ($localJobs.Count -gt 0) {
-    Write-Log "$($localJobs.Count) local job(s) already complete." -Color Yellow
-}
-Write-Log 'All jobs finished. Aggregating results...' -Color Yellow
+# ─── Step 5: Uninstall current agent ─────────────────────────────────────────
+Write-Log "Uninstalling current OTSystemCenterAgent..."
 
-# ── Merge and display results ─────────────────────────────────────────────────
-$allEntries = [System.Collections.Generic.List[pscustomobject]]::new()
-foreach ($lj in $localJobs) { $allEntries.Add($lj) }
-foreach ($rj in $jobs)      { $allEntries.Add($rj) }
+$uninstallRoots = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+)
 
-$summary   = [System.Collections.Generic.List[pscustomobject]]::new()
-$prevGroup = $null
-
-foreach ($entry in ($allEntries | Sort-Object Group, FQDN)) {
-
-    if ($entry.Group -ne $prevGroup) {
-        Write-Log -Spacer
-        Write-Log '########################################' -Color Magenta
-        Write-Log "# Zone: $($entry.Group)"                -Color Magenta
-        Write-Log '########################################' -Color Magenta
-        $prevGroup = $entry.Group
+$productCode = $null
+foreach ($root in $uninstallRoots) {
+    $found = Get-ChildItem $root -ErrorAction SilentlyContinue |
+        Get-ItemProperty -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match "OpenText.*SystemCenter.*Agent|OTSystemCenter" } |
+        Select-Object -First 1
+    if ($found) {
+        $productCode = $found.PSChildName
+        break
     }
+}
 
-    $localTag = if ($entry.IsLocal) { ' [LOCAL]' } else { '' }
-    Write-Log "--- $($entry.FQDN)$localTag ---" -Color Cyan
-
-    if ($entry.IsLocal) {
-        $r = $entry.Result
+if ($productCode) {
+    Write-Log "Found product code: $productCode — running uninstall..."
+    $proc = Start-Process "msiexec.exe" -ArgumentList "/qn /x $productCode" -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+        Write-Log "Uninstall returned exit code $($proc.ExitCode). Continuing anyway." "WARN"
     } else {
-        if ($entry.Job.State -ne 'Completed') {
-            $childErr = $entry.Job.ChildJobs[0].Error | Select-Object -First 1
-            $errMsg   = if ($childErr) {
-                "$($childErr.Exception.Message) [$($childErr.FullyQualifiedErrorId)]"
-            } else {
-                $entry.Job.ChildJobs[0].JobStateInfo.Reason.Message
-            }
-            if (-not $errMsg) { $errMsg = "Job state: $($entry.Job.State) — no error detail captured" }
-            Write-Log "  REMOTING FAILED: $errMsg" -Level 'ERROR' -Color Red
-            $summary.Add([pscustomobject]@{
-                FQDN = $entry.FQDN; Group = $entry.Group
-                Overall = 'REMOTING FAILED'; Version = 'N/A'; VersionFrom = 'N/A'
-                ServiceStopped = $false; BackupPath = 'N/A'; Error = $errMsg
-            })
-            $entry.Job | Remove-Job -Force
-            continue
-        }
-        $r = $entry.Job | Receive-Job
+        Write-Log "Uninstall completed successfully."
     }
-
-    # Log CIM protocol used
-    if ($r.CimProtocol) {
-        Write-Log "  CIM session: $($r.CimProtocol)" -Color Gray
-    }
-
-    # Messages
-    foreach ($m in $r.Messages) {
-        $color = switch -Regex ($m) {
-            'ERROR'     { 'Red'    }
-            'WARN'      { 'Yellow' }
-            'stopped|completed|backup|version|resolved|CIM session' { 'Green' }
-            default     { 'Gray'   }
-        }
-        Write-Log "  $m" -Color $color
-    }
-    foreach ($w in $r.Warnings) { Write-Log "  $w" -Level 'WARN'  -Color Yellow }
-    foreach ($e in $r.Errors)   { Write-Log "  $e" -Level 'ERROR' -Color Red    }
-
-    # Version detection table
-    if ($r.VersionResults.Count -gt 0) {
-        Write-Log '  Version detection results:' -Color Gray
-        foreach ($vr in $r.VersionResults) {
-            $tick  = if ($vr.Success) { '[OK]  ' } else { '[----]' }
-            $color = if ($vr.Success) { 'Green' } else { 'DarkGray' }
-            Write-Log ("  {0} {1,-30} Version: {2,-20} Source: {3}" -f `
-                $tick, $vr.Method,
-                $(if ($vr.Version) { $vr.Version } else { '(none)' }),
-                $vr.Note) -Color $color
-        }
-    }
-
-    # Overall outcome — restart is required for success if service was running
-    $overallOK = $r.ServiceFound -and $r.ServiceStopped -and $r.BackupSuccess -and
-                 (-not $r.ServiceWasRunning -or $r.ServiceRestarted)
-    $overall   = if ($overallOK) { 'SUCCESS' } else { 'PARTIAL/FAILED' }
-    $oColor    = if ($overallOK) { 'Green'   } else { 'Red' }
-
-    Write-Log ("  RESULT: {0} | Version: {1} (from {2}) | CIM: {3} | Stopped: {4} | Restarted: {5} | Backup: {6}" -f `
-        $overall,
-        $(if ($r.BestVersion)     { $r.BestVersion }     else { 'unknown' }),
-        $(if ($r.BestVersionFrom) { $r.BestVersionFrom } else { 'N/A'     }),
-        $(if ($r.CimProtocol)     { $r.CimProtocol }     else { 'N/A'     }),
-        $r.ServiceStopped,
-        $r.ServiceRestarted,
-        $(if ($r.BackupPath)      { $r.BackupPath }      else { 'none'    })
-    ) -Color $oColor
-
-    $summary.Add([pscustomobject]@{
-        FQDN             = $entry.FQDN
-        Group            = $entry.Group
-        Overall          = $overall
-        Version          = if ($r.BestVersion)     { $r.BestVersion }     else { 'unknown' }
-        VersionFrom      = if ($r.BestVersionFrom) { $r.BestVersionFrom } else { 'N/A'     }
-        CimProtocol      = if ($r.CimProtocol)     { $r.CimProtocol }     else { 'N/A'     }
-        ServiceStopped   = $r.ServiceStopped
-        ServiceRestarted = $r.ServiceRestarted
-        BackupPath       = if ($r.BackupPath)      { $r.BackupPath }      else { 'none'    }
-        Error            = ($r.Errors -join '; ')
-    })
-
-    if (-not $entry.IsLocal) { $entry.Job | Remove-Job -Force }
+} else {
+    Write-Log "No matching product found in registry. Skipping uninstall step." "WARN"
 }
 
-# ── Final summary table ───────────────────────────────────────────────────────
-Write-Log -Spacer
-Write-Log '===============================================================' -Color Cyan
-Write-Log '  STEP 1 SUMMARY' -Color Cyan
-Write-Log '===============================================================' -Color Cyan
-
-$hdr = '{0,-40} {1,-16} {2,-16} {3,-20} {4,-10} {5,-10} {6}' -f `
-    'Server', 'CIM Protocol', 'Result', 'Version', 'Stopped', 'Restarted', 'Backup path / Error'
-Write-Log $hdr -Color White
-Write-Log ('-' * 150) -Color DarkGray
-
-foreach ($s in ($summary | Sort-Object Group, FQDN)) {
-    $line = '{0,-40} {1,-16} {2,-16} {3,-20} {4,-10} {5,-10} {6}' -f `
-        $s.FQDN,
-        $s.CimProtocol,
-        $s.Overall,
-        $s.Version,
-        $s.ServiceStopped,
-        $s.ServiceRestarted,
-        $(if ($s.Error) { $s.Error } else { $s.BackupPath })
-    $color = if ($s.Overall -eq 'SUCCESS') { 'Green' } else { 'Red' }
-    Write-Log $line -Color $color
+# ─── Step 6: Clear the install directory contents ────────────────────────────
+# The directory itself is preserved so INSTALLDIR points to the same path.
+# All files and subfolders inside are removed for a clean install.
+Write-Log "Clearing install directory contents: $InstallDir"
+try {
+    Get-ChildItem -Path $InstallDir -Force |
+        Remove-Item -Recurse -Force -ErrorAction Stop
+    Write-Log "Install directory cleared successfully."
+} catch {
+    Write-Log "Failed to clear install directory: $_" "ERROR"
+    exit 1
 }
 
-$endTime = Get-Date
-$dur     = $endTime - $startTime
-Write-Log -Spacer
-Write-Log "Completed : $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Color Cyan
-Write-Log "Duration  : $($dur.ToString('mm\:ss'))"                  -Color Cyan
-Write-Log "Log saved : $localLogPath"                                -Color Green
-Write-Log '===============================================================' -Color Cyan
+# ─── Step 7: Download and install the new agent ───────────────────────────────
+$workDir       = $PSScriptRoot
+$installerPath = Join-Path $workDir $InstallerName
+$logPath       = Join-Path $workDir $LogName
 
-#endregion
+Write-Log "Downloading installer from $InstallerUrl ..."
+try {
+    (New-Object System.Net.WebClient).DownloadFile($InstallerUrl, $installerPath)
+    Write-Log "Download complete: $installerPath"
+} catch {
+    Write-Log "Download failed: $_" "ERROR"
+    exit 1
+}
+
+Write-Log "Installing agent to: $InstallDir (log: $logPath) ..."
+$installArgs = "/qn /l*vx `"$logPath`" /i `"$installerPath`" INSTALLDIR=`"$InstallDir`" HTTP_PORT_NUMBER=`"$HttpPort`" SERVER_NAME=`"$ServerName`""
+$proc = Start-Process "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
+
+if ($proc.ExitCode -ne 0) {
+    Write-Log "Installation failed with exit code $($proc.ExitCode). Check log: $logPath" "ERROR"
+    exit 1
+}
+Write-Log "Installation completed successfully."
+
+# ─── Step 8: Restore localcerts from backup ───────────────────────────────────
+# Source is the backup copy taken in Step 3, guaranteeing the pre-wipe content.
+$localCertsBackup = Join-Path $backupPath $LocalCertsDirName
+
+if (Test-Path $localCertsBackup) {
+    Write-Log "Restoring '$LocalCertsDirName' from backup to: $LocalCertsDir"
+    try {
+        Copy-Item -Path $localCertsBackup -Destination $LocalCertsDir -Recurse -Force -ErrorAction Stop
+        Write-Log "'$LocalCertsDirName' restored successfully."
+    } catch {
+        Write-Log "Failed to restore '$LocalCertsDirName': $_" "WARN"
+    }
+} else {
+    Write-Log "'$LocalCertsDirName' not found in backup ($localCertsBackup). Skipping restore." "WARN"
+}
+
+# ─── Step 9: Back up new install config.ini, then apply localcerts config.ini ─
+# The restored localcerts\config.ini is the authoritative config for this host.
+# Before overwriting, the installer-generated config.ini is preserved with a
+# timestamp so it can be referenced if needed.
+
+if (-not (Test-Path $LocalCertsConfig)) {
+    Write-Log "'$LocalCertsDirName\$ConfigFileName' not found at '$LocalCertsConfig'. Skipping config replacement." "WARN"
+} elseif (-not (Test-Path $ConfigDir)) {
+    Write-Log "Configuration directory '$ConfigDir' does not exist in new install. Skipping config replacement." "WARN"
+} else {
+    # Back up the installer-generated config.ini before overwriting
+    if (Test-Path $ConfigFile) {
+        $configBackup = "${ConfigFile}_${timestamp}.bak"
+        Write-Log "Backing up new install $ConfigFileName to: $configBackup"
+        try {
+            Copy-Item -Path $ConfigFile -Destination $configBackup -Force -ErrorAction Stop
+            Write-Log "$ConfigFileName backed up successfully."
+        } catch {
+            Write-Log "Failed to back up $ConfigFileName: $_" "WARN"
+        }
+    } else {
+        Write-Log "No $ConfigFileName found in '$ConfigDir' — skipping backup, copying anyway." "WARN"
+    }
+
+    # Copy localcerts\config.ini into the configuration directory
+    Write-Log "Copying '$LocalCertsDirName\$ConfigFileName' to: $ConfigFile"
+    try {
+        Copy-Item -Path $LocalCertsConfig -Destination $ConfigFile -Force -ErrorAction Stop
+        Write-Log "$ConfigFileName replaced successfully."
+    } catch {
+        Write-Log "Failed to copy $ConfigFileName from '$LocalCertsDirName': $_" "ERROR"
+        exit 1
+    }
+}
+
+# ─── Step 10: Start the service ──────────────────────────────────────────────
+Write-Log "Starting service: $ServiceName"
+try {
+    Start-Service -Name $ServiceName -ErrorAction Stop
+    Write-Log "Service started successfully."
+} catch {
+    Write-Log "Failed to start service: $_" "ERROR"
+    exit 1
+}
+
+Write-Log "OTSystemCenterAgent update complete."
