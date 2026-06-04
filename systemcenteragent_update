@@ -7,7 +7,7 @@
 #        DESCRIPTION:
 #        Step 1 of the OpenText System Center Agent remote update process.
 #        For each server in servers.txt:
-#          1. Discovers the OTSsystemCenterAgent service and install directory
+#          1. Discovers the OTSystemCenterAgent service and install directory
 #          2. Identifies the installed version using all available methods
 #             (FileVersionInfo on exe, version files in install dir, WMI
 #              Win32_Product) and reports which method(s) returned useful data
@@ -16,7 +16,9 @@
 #             same level as the install directory
 #
 #        Runs against all servers in parallel (up to $maxParallelJobs at once).
-#        Requires WinRM access and local admin rights on each target.
+#        Prompts for alternate credentials at startup (10-second auto-skip).
+#        Remote connections attempt WSMan (WinRM) first, then fall back to
+#        DCOM for CIM queries. Service stop and backup require WinRM.
 #
 #        servers.txt format:
 #          [Zone Name]
@@ -39,11 +41,11 @@
 #region Configuration
 
 $configFile      = Join-Path $PSScriptRoot 'servers.txt'
-$logDir          = 'C:\Logs'
+$logDir          = Join-Path $PSScriptRoot 'logs'
 $maxParallelJobs = 5
 $maxBackups      = 3
 $svcStopTimeout  = 60   # seconds
-$svcName         = 'OTSsystemCenterAgent'
+$svcName         = 'OTSystemCenterAgent'
 
 $localLogPath = Join-Path $logDir "OTSysCenter_Step1_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
@@ -108,7 +110,6 @@ function Parse-ServersFile {
 
 function Test-IsLocalhost {
     param([string]$Name)
-    # Match against short name, FQDN, and common loopback aliases
     $localNames = @(
         $env:COMPUTERNAME,
         "$($env:COMPUTERNAME).$($env:USERDNSDOMAIN)".TrimEnd('.'),
@@ -117,14 +118,14 @@ function Test-IsLocalhost {
         '127.0.0.1',
         '::1'
     ) | Where-Object { $_ } | ForEach-Object { $_.ToLower().TrimEnd('.') }
-
     return $localNames -contains $Name.ToLower().TrimEnd('.')
 }
 
 #endregion
 
 #region Remote Script Block
-# Runs on each target server via Invoke-Command.
+# Runs on each target server via Invoke-Command (WinRM).
+# CIM queries inside use WSMan first, DCOM fallback — matching status.ps1 behaviour.
 # Returns a structured result object that the orchestrator logs and stores.
 
 $remoteBlock = {
@@ -138,48 +139,72 @@ $remoteBlock = {
 
     # ── Result object ────────────────────────────────────────────────────────
     $result = [pscustomobject]@{
-        Hostname        = $hostname
-        ServiceFound    = $false
-        InstallDir      = $null
-        ExePath         = $null
-
-        # Version detection — one entry per method attempted
-        VersionResults  = [System.Collections.Generic.List[pscustomobject]]::new()
-        BestVersion     = $null
-        BestVersionFrom = $null
-
+        Hostname          = $hostname
+        ServiceFound      = $false
+        InstallDir        = $null
+        ExePath           = $null
+        CimProtocol       = $null   # which protocol opened the CIM session
+        VersionResults    = [System.Collections.Generic.List[pscustomobject]]::new()
+        BestVersion       = $null
+        BestVersionFrom   = $null
         ServiceWasRunning = $false
         ServiceStopped    = $false
         BackupPath        = $null
         BackupSuccess     = $false
-
-        Messages        = [System.Collections.Generic.List[string]]::new()
-        Warnings        = [System.Collections.Generic.List[string]]::new()
-        Errors          = [System.Collections.Generic.List[string]]::new()
+        Messages          = [System.Collections.Generic.List[string]]::new()
+        Warnings          = [System.Collections.Generic.List[string]]::new()
+        Errors            = [System.Collections.Generic.List[string]]::new()
     }
 
     function Add-Msg  { param($m) $result.Messages.Add("($hostname) $m") }
     function Add-Warn { param($m) $result.Warnings.Add("($hostname) WARN: $m") }
     function Add-Err  { param($m) $result.Errors.Add("($hostname) ERROR: $m") }
 
+    # ── Open CIM session — WSMan first, DCOM fallback ────────────────────────
+    # Mirrors the approach in status.ps1 so that servers without WinRM can
+    # still be queried for service discovery and version information.
+    $cimSession   = $null
+    $cimLastError = $null
+    foreach ($protocol in @('Wsman', 'Dcom')) {
+        try {
+            $opt        = New-CimSessionOption -Protocol $protocol
+            $cimSession = New-CimSession -ComputerName $hostname `
+                              -SessionOption $opt -ErrorAction Stop
+            $result.CimProtocol = $protocol
+            Add-Msg "CIM session opened via $protocol."
+            break
+        }
+        catch {
+            $cimLastError = $_
+            Add-Warn "CIM/$protocol failed: $_"
+        }
+    }
+
+    if (-not $cimSession) {
+        Add-Err "Could not open CIM session (tried WSMan and DCOM): $cimLastError"
+        # Fall through — service checks via Get-Service will still run locally
+        # since this block executes in the WinRM session on the remote host.
+    }
+
     # ── Step 1: Locate the service ───────────────────────────────────────────
     $svc = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
     if (-not $svc) {
         Add-Err "Service '$SvcName' not found on this host."
+        if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
         return $result
     }
 
-    $result.ServiceFound    = $true
+    $result.ServiceFound      = $true
     $result.ServiceWasRunning = ($svc.Status -eq 'Running')
     Add-Msg "Service '$SvcName' found. Status: $($svc.Status)"
 
     # ── Step 2: Resolve install directory from service PathName ──────────────
     try {
-        $cimSvc = Get-CimInstance -ClassName Win32_Service `
-                    -Filter "Name='$SvcName'" -ErrorAction Stop
+        $cimSvcParams = @{ ClassName = 'Win32_Service'; Filter = "Name='$SvcName'"; ErrorAction = 'Stop' }
+        if ($cimSession) { $cimSvcParams['CimSession'] = $cimSession }
+        $cimSvc = Get-CimInstance @cimSvcParams
 
         if ($cimSvc -and $cimSvc.PathName) {
-            # Strip surrounding quotes and any trailing arguments
             $exeRaw = $cimSvc.PathName -replace '^"([^"]+)".*$', '$1' `
                                        -replace '^([^\s]+\.exe).*$', '$1'
             $result.ExePath    = $exeRaw
@@ -196,7 +221,6 @@ $remoteBlock = {
     # ── Step 3: Version detection — all methods ───────────────────────────────
     #
     # Method A: FileVersionInfo on the service executable
-    # Most reliable when the exe is a native Windows binary with a version resource.
     #
     if ($result.ExePath -and (Test-Path $result.ExePath)) {
         try {
@@ -214,28 +238,22 @@ $remoteBlock = {
         }
         catch {
             $result.VersionResults.Add([pscustomobject]@{
-                Method  = 'FileVersionInfo (exe)'
-                Version = $null
-                Source  = $result.ExePath
-                Success = $false
+                Method  = 'FileVersionInfo (exe)'; Version = $null
+                Source  = $result.ExePath;         Success = $false
                 Note    = "Exception: $_"
             })
         }
     }
     else {
         $result.VersionResults.Add([pscustomobject]@{
-            Method  = 'FileVersionInfo (exe)'
-            Version = $null
-            Source  = $result.ExePath
-            Success = $false
+            Method  = 'FileVersionInfo (exe)'; Version = $null
+            Source  = $result.ExePath;         Success = $false
             Note    = if ($result.ExePath) { 'Exe path not accessible' } else { 'Exe path not resolved' }
         })
     }
 
     #
     # Method B: Version/manifest files in the install directory
-    # OT products often ship version.txt, version.properties, manifest.xml,
-    # *.version, or build.properties alongside the executable.
     #
     if ($result.InstallDir -and (Test-Path $result.InstallDir)) {
         $versionFilePatterns = @(
@@ -252,9 +270,7 @@ $remoteBlock = {
         if ($foundFiles) {
             foreach ($vf in ($foundFiles | Select-Object -Unique)) {
                 try {
-                    $content = Get-Content $vf.FullName -Raw -ErrorAction Stop
-
-                    # Try common key=value patterns first
+                    $content   = Get-Content $vf.FullName -Raw -ErrorAction Stop
                     $extracted = $null
                     foreach ($pattern in @(
                         '(?im)^version\s*[=:]\s*(.+)$',
@@ -263,13 +279,8 @@ $remoteBlock = {
                         '(?im)^agent\.version\s*[=:]\s*(.+)$',
                         '(?im)<version>([^<]+)</version>'
                     )) {
-                        if ($content -match $pattern) {
-                            $extracted = $Matches[1].Trim()
-                            break
-                        }
+                        if ($content -match $pattern) { $extracted = $Matches[1].Trim(); break }
                     }
-
-                    # If no pattern matched, use first non-blank line as a fallback
                     if (-not $extracted) {
                         $firstLine = ($content -split "`n" |
                                       Where-Object { $_.Trim() -ne '' } |
@@ -278,22 +289,17 @@ $remoteBlock = {
                             $extracted = $firstLine.Trim()
                         }
                     }
-
                     $result.VersionResults.Add([pscustomobject]@{
-                        Method  = 'Version file'
-                        Version = $extracted
-                        Source  = $vf.FullName
-                        Success = [bool]$extracted
+                        Method  = 'Version file'; Version = $extracted
+                        Source  = $vf.FullName;   Success = [bool]$extracted
                         Note    = "File: $($vf.Name)"
                     })
                     Add-Msg "Version file '$($vf.Name)': $extracted"
                 }
                 catch {
                     $result.VersionResults.Add([pscustomobject]@{
-                        Method  = 'Version file'
-                        Version = $null
-                        Source  = $vf.FullName
-                        Success = $false
+                        Method  = 'Version file'; Version = $null
+                        Source  = $vf.FullName;   Success = $false
                         Note    = "Read error: $_"
                     })
                 }
@@ -301,10 +307,8 @@ $remoteBlock = {
         }
         else {
             $result.VersionResults.Add([pscustomobject]@{
-                Method  = 'Version file'
-                Version = $null
-                Source  = $result.InstallDir
-                Success = $false
+                Method  = 'Version file'; Version = $null
+                Source  = $result.InstallDir; Success = $false
                 Note    = 'No recognised version files found in install directory (depth 2)'
             })
             Add-Warn "No version files found under $($result.InstallDir)"
@@ -312,30 +316,27 @@ $remoteBlock = {
     }
     else {
         $result.VersionResults.Add([pscustomobject]@{
-            Method  = 'Version file'
-            Version = $null
-            Source  = $result.InstallDir
-            Success = $false
+            Method  = 'Version file'; Version = $null
+            Source  = $result.InstallDir; Success = $false
             Note    = if ($result.InstallDir) { 'Install directory not accessible' } else { 'Install directory not resolved' }
         })
     }
 
     #
-    # Method C: WMI Win32_Product
-    # Slowest method — triggers an MSI consistency check on every installed
-    # product. Included as a fallback; useful when the exe has no version
-    # resource and no version files are present.
+    # Method C: Win32_Product — slowest, triggers MSI consistency check.
+    # Uses the CIM session (WSMan or DCOM) opened above.
     #
     try {
-        $products = Get-CimInstance -ClassName Win32_Product -ErrorAction Stop |
+        $prodParams = @{ ClassName = 'Win32_Product'; ErrorAction = 'Stop' }
+        if ($cimSession) { $prodParams['CimSession'] = $cimSession }
+        $products = Get-CimInstance @prodParams |
                     Where-Object { $_.Name -like '*System Center*' -or
-                                   $_.Name -like '*OTSsystemCenter*' -or
+                                   $_.Name -like '*OTSystemCenter*' -or
                                    $_.Name -like '*OpenText*Agent*' }
         if ($products) {
             foreach ($p in $products) {
                 $result.VersionResults.Add([pscustomobject]@{
-                    Method  = 'Win32_Product'
-                    Version = $p.Version
+                    Method  = 'Win32_Product'; Version = $p.Version
                     Source  = "Name: $($p.Name)  InstallLocation: $($p.InstallLocation)"
                     Success = [bool]$p.Version
                     Note    = "IdentifyingNumber: $($p.IdentifyingNumber)"
@@ -345,27 +346,22 @@ $remoteBlock = {
         }
         else {
             $result.VersionResults.Add([pscustomobject]@{
-                Method  = 'Win32_Product'
-                Version = $null
-                Source  = 'Win32_Product query'
-                Success = $false
-                Note    = 'No products matched System Center / OTSsystemCenter / OpenText Agent'
+                Method  = 'Win32_Product'; Version = $null
+                Source  = 'Win32_Product query'; Success = $false
+                Note    = 'No products matched System Center / OTSystemCenter / OpenText Agent'
             })
             Add-Warn 'Win32_Product: no matching product found.'
         }
     }
     catch {
         $result.VersionResults.Add([pscustomobject]@{
-            Method  = 'Win32_Product'
-            Version = $null
-            Source  = 'Win32_Product query'
-            Success = $false
+            Method  = 'Win32_Product'; Version = $null
+            Source  = 'Win32_Product query'; Success = $false
             Note    = "Query failed: $_"
         })
     }
 
     # ── Determine best version ────────────────────────────────────────────────
-    # Priority: FileVersionInfo > version file > Win32_Product
     $best = $result.VersionResults |
             Where-Object { $_.Success -and $_.Version } |
             Select-Object -First 1
@@ -389,26 +385,30 @@ $remoteBlock = {
         }
         catch [System.ServiceProcess.TimeoutException] {
             Add-Err "Timed out waiting for '$SvcName' to stop after ${StopTimeoutSec}s."
+            if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
             return $result
         }
         catch {
             Add-Err "Failed to stop '$SvcName': $_"
+            if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
             return $result
         }
     }
     else {
         Add-Msg "Service '$SvcName' was already stopped — no stop action needed."
-        $result.ServiceStopped = $true   # treat as ready to backup
+        $result.ServiceStopped = $true
     }
 
     # ── Step 5: Backup the install directory ─────────────────────────────────
     if (-not $result.InstallDir) {
         Add-Err 'Cannot backup — install directory not resolved.'
+        if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
         return $result
     }
 
     if (-not (Test-Path $result.InstallDir -PathType Container)) {
         Add-Err "Install directory '$($result.InstallDir)' does not exist on $hostname."
+        if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
         return $result
     }
 
@@ -426,6 +426,7 @@ $remoteBlock = {
     }
     catch {
         Add-Err "Compression failed: $_"
+        if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
         return $result
     }
 
@@ -449,6 +450,7 @@ $remoteBlock = {
         Add-Warn "Backup rotation encountered an error: $_"
     }
 
+    if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
     return $result
 }
 
@@ -466,7 +468,43 @@ Write-Log "MaxJobs   : $maxParallelJobs" -Color Gray
 Write-Log "MaxBackups: $maxBackups" -Color Gray
 Write-Log -Spacer
 
-# Parse servers.txt
+# ── Credential prompt — mirrors status.ps1 behaviour ─────────────────────────
+# Gives a 10-second window to enter alternate credentials before auto-skipping.
+# In non-interactive sessions (scheduled tasks, CI) the prompt is bypassed.
+$Credential = $null
+$consoleAvailable = $false
+try { $null = [System.Console]::KeyAvailable; $consoleAvailable = $true } catch { }
+
+if ($consoleAvailable) {
+    try { while ([System.Console]::KeyAvailable) { [System.Console]::ReadKey($true) | Out-Null } } catch { }
+    Write-Host 'Use alternate credentials? (y/n)  [auto-skipping in 10 seconds]' -ForegroundColor Cyan
+    $useCreds = ''; $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        $keyAvail = $false
+        try { $keyAvail = [System.Console]::KeyAvailable } catch { break }
+        if ($keyAvail) {
+            $key = [System.Console]::ReadKey($true)
+            $useCreds = $key.KeyChar.ToString().ToLower()
+            Write-Host $useCreds
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if ($useCreds -eq 'y') {
+        $Credential = Get-Credential -Message 'Enter credentials for remote servers'
+    }
+} else {
+    Write-Log 'Non-interactive session — using default credentials.' -Color Gray
+}
+
+if ($Credential) {
+    Write-Log "Credentials : $($Credential.UserName)" -Color Gray
+} else {
+    Write-Log 'Credentials : default (current user)' -Color Gray
+}
+Write-Log -Spacer
+
+# ── Parse servers.txt ─────────────────────────────────────────────────────────
 $serverGroups, $totalServers = Parse-ServersFile -Path $configFile
 
 if ($totalServers -eq 0) {
@@ -477,7 +515,8 @@ if ($totalServers -eq 0) {
 Write-Log "Servers   : $totalServers across $($serverGroups.Keys.Count) zone(s)" -Color Gray
 Write-Log -Spacer
 
-# Queue parallel jobs — local server runs in-process, remotes via Invoke-Command
+# ── Queue parallel jobs ───────────────────────────────────────────────────────
+# Local server runs in-process; remotes via Invoke-Command with optional creds.
 Write-Log 'Queuing jobs...' -Color Yellow
 $jobs      = [System.Collections.Generic.List[pscustomobject]]::new()
 $localJobs = [System.Collections.Generic.List[pscustomobject]]::new()
@@ -487,58 +526,49 @@ foreach ($group in $serverGroups.Keys) {
 
         if (Test-IsLocalhost -Name $fqdn) {
             # ── Local execution — run scriptblock in-process ──────────────────
-            # WinRM loopback requires CredSSP or explicit creds; skip it entirely.
             Write-Log "  LOCAL [$group] $fqdn — running in-process" -Color Yellow
-
             try {
                 $r = & $remoteBlock $svcName $svcStopTimeout $maxBackups
             }
             catch {
                 $r = [pscustomobject]@{
-                    Hostname        = $env:COMPUTERNAME
-                    ServiceFound    = $false
-                    InstallDir      = $null
-                    ExePath         = $null
-                    VersionResults  = [System.Collections.Generic.List[pscustomobject]]::new()
-                    BestVersion     = $null
-                    BestVersionFrom = $null
-                    ServiceWasRunning = $false
-                    ServiceStopped  = $false
-                    BackupPath      = $null
-                    BackupSuccess   = $false
-                    Messages        = [System.Collections.Generic.List[string]]::new()
-                    Warnings        = [System.Collections.Generic.List[string]]::new()
-                    Errors          = [System.Collections.Generic.List[string]]@("In-process execution threw: $_")
+                    Hostname          = $env:COMPUTERNAME
+                    ServiceFound      = $false; InstallDir = $null; ExePath = $null
+                    CimProtocol       = $null
+                    VersionResults    = [System.Collections.Generic.List[pscustomobject]]::new()
+                    BestVersion       = $null; BestVersionFrom = $null
+                    ServiceWasRunning = $false; ServiceStopped = $false
+                    BackupPath        = $null; BackupSuccess   = $false
+                    Messages          = [System.Collections.Generic.List[string]]::new()
+                    Warnings          = [System.Collections.Generic.List[string]]::new()
+                    Errors            = [System.Collections.Generic.List[string]]@("In-process execution threw: $_")
                 }
             }
-
             $localJobs.Add([pscustomobject]@{
-                Result = $r
-                FQDN   = $fqdn
-                Group  = $group
-                IsLocal = $true
+                Result  = $r; FQDN = $fqdn; Group = $group; IsLocal = $true
             })
 
         } else {
-            # ── Remote execution ──────────────────────────────────────────────
-            # Throttle — wait if at capacity
+            # ── Remote execution — WinRM via Invoke-Command ───────────────────
             while ((Get-Job -State Running).Count -ge $maxParallelJobs) {
                 Start-Sleep -Milliseconds 500
             }
 
             Write-Log "  Queuing [$group] $fqdn" -Color Gray
 
-            $job = Invoke-Command -ComputerName $fqdn `
-                       -ScriptBlock $remoteBlock `
-                       -ArgumentList $svcName, $svcStopTimeout, $maxBackups `
-                       -AsJob
+            $icParams = @{
+                ComputerName = $fqdn
+                ScriptBlock  = $remoteBlock
+                ArgumentList = $svcName, $svcStopTimeout, $maxBackups
+                AsJob        = $true
+            }
+            if ($Credential) { $icParams['Credential'] = $Credential }
+
+            $job      = Invoke-Command @icParams
             $job.Name = $fqdn
 
             $jobs.Add([pscustomobject]@{
-                Job     = $job
-                FQDN    = $fqdn
-                Group   = $group
-                IsLocal = $false
+                Job     = $job; FQDN = $fqdn; Group = $group; IsLocal = $false
             })
         }
     }
@@ -554,12 +584,11 @@ if ($localJobs.Count -gt 0) {
 }
 Write-Log 'All jobs finished. Aggregating results...' -Color Yellow
 
-# Merge local and remote into a single list for uniform result processing
+# ── Merge and display results ─────────────────────────────────────────────────
 $allEntries = [System.Collections.Generic.List[pscustomobject]]::new()
 foreach ($lj in $localJobs) { $allEntries.Add($lj) }
 foreach ($rj in $jobs)      { $allEntries.Add($rj) }
 
-# Collect and display results
 $summary   = [System.Collections.Generic.List[pscustomobject]]::new()
 $prevGroup = $null
 
@@ -576,11 +605,9 @@ foreach ($entry in ($allEntries | Sort-Object Group, FQDN)) {
     $localTag = if ($entry.IsLocal) { ' [LOCAL]' } else { '' }
     Write-Log "--- $($entry.FQDN)$localTag ---" -Color Cyan
 
-    # Resolve result object — local jobs carry it directly, remote jobs via Receive-Job
     if ($entry.IsLocal) {
         $r = $entry.Result
     } else {
-        # Check for remoting-level failure (unreachable, auth denied, etc.)
         if ($entry.Job.State -ne 'Completed') {
             $errMsg = $entry.Job.ChildJobs[0].Error |
                       Select-Object -First 1 |
@@ -588,14 +615,9 @@ foreach ($entry in ($allEntries | Sort-Object Group, FQDN)) {
             if (-not $errMsg) { $errMsg = 'Unreachable or access denied' }
             Write-Log "  REMOTING FAILED: $errMsg" -Level 'ERROR' -Color Red
             $summary.Add([pscustomobject]@{
-                FQDN           = $entry.FQDN
-                Group          = $entry.Group
-                Overall        = 'REMOTING FAILED'
-                Version        = 'N/A'
-                VersionFrom    = 'N/A'
-                ServiceStopped = $false
-                BackupPath     = 'N/A'
-                Error          = $errMsg
+                FQDN = $entry.FQDN; Group = $entry.Group
+                Overall = 'REMOTING FAILED'; Version = 'N/A'; VersionFrom = 'N/A'
+                ServiceStopped = $false; BackupPath = 'N/A'; Error = $errMsg
             })
             $entry.Job | Remove-Job -Force
             continue
@@ -603,12 +625,17 @@ foreach ($entry in ($allEntries | Sort-Object Group, FQDN)) {
         $r = $entry.Job | Receive-Job
     }
 
+    # Log CIM protocol used
+    if ($r.CimProtocol) {
+        Write-Log "  CIM session: $($r.CimProtocol)" -Color Gray
+    }
+
     # Messages
     foreach ($m in $r.Messages) {
         $color = switch -Regex ($m) {
             'ERROR'     { 'Red'    }
             'WARN'      { 'Yellow' }
-            'stopped|completed|backup|version|resolved' { 'Green' }
+            'stopped|completed|backup|version|resolved|CIM session' { 'Green' }
             default     { 'Gray'   }
         }
         Write-Log "  $m" -Color $color
@@ -623,8 +650,9 @@ foreach ($entry in ($allEntries | Sort-Object Group, FQDN)) {
             $tick  = if ($vr.Success) { '[OK]  ' } else { '[----]' }
             $color = if ($vr.Success) { 'Green' } else { 'DarkGray' }
             Write-Log ("  {0} {1,-30} Version: {2,-20} Source: {3}" -f `
-                $tick, $vr.Method, $(if ($vr.Version) { $vr.Version } else { '(none)' }), $vr.Note) `
-                -Color $color
+                $tick, $vr.Method,
+                $(if ($vr.Version) { $vr.Version } else { '(none)' }),
+                $vr.Note) -Color $color
         }
     }
 
@@ -633,10 +661,11 @@ foreach ($entry in ($allEntries | Sort-Object Group, FQDN)) {
     $overall   = if ($overallOK) { 'SUCCESS' } else { 'PARTIAL/FAILED' }
     $oColor    = if ($overallOK) { 'Green'   } else { 'Red' }
 
-    Write-Log ("  RESULT: {0} | Version: {1} (from {2}) | Stopped: {3} | Backup: {4}" -f `
+    Write-Log ("  RESULT: {0} | Version: {1} (from {2}) | CIM: {3} | Stopped: {4} | Backup: {5}" -f `
         $overall,
         $(if ($r.BestVersion)     { $r.BestVersion }     else { 'unknown' }),
         $(if ($r.BestVersionFrom) { $r.BestVersionFrom } else { 'N/A'     }),
+        $(if ($r.CimProtocol)     { $r.CimProtocol }     else { 'N/A'     }),
         $r.ServiceStopped,
         $(if ($r.BackupPath)      { $r.BackupPath }      else { 'none'    })
     ) -Color $oColor
@@ -647,6 +676,7 @@ foreach ($entry in ($allEntries | Sort-Object Group, FQDN)) {
         Overall        = $overall
         Version        = if ($r.BestVersion)     { $r.BestVersion }     else { 'unknown' }
         VersionFrom    = if ($r.BestVersionFrom) { $r.BestVersionFrom } else { 'N/A'     }
+        CimProtocol    = if ($r.CimProtocol)     { $r.CimProtocol }     else { 'N/A'     }
         ServiceStopped = $r.ServiceStopped
         BackupPath     = if ($r.BackupPath)      { $r.BackupPath }      else { 'none'    }
         Error          = ($r.Errors -join '; ')
@@ -655,25 +685,24 @@ foreach ($entry in ($allEntries | Sort-Object Group, FQDN)) {
     if (-not $entry.IsLocal) { $entry.Job | Remove-Job -Force }
 }
 
-# Final summary table
+# ── Final summary table ───────────────────────────────────────────────────────
 Write-Log -Spacer
 Write-Log '===============================================================' -Color Cyan
 Write-Log '  STEP 1 SUMMARY' -Color Cyan
 Write-Log '===============================================================' -Color Cyan
 
-$colW = @(40, 8, 20, 10, 10, 50)
-$hdr  = '{0,-40} {1,-8} {2,-20} {3,-10} {4,-10} {5}' -f `
-        'Server', 'Result', 'Version', 'SvcStop', 'Backup', 'Backup path / Error'
+$hdr = '{0,-40} {1,-16} {2,-8} {3,-20} {4,-10} {5}' -f `
+    'Server', 'CIM Protocol', 'Result', 'Version', 'Stopped', 'Backup path / Error'
 Write-Log $hdr -Color White
 Write-Log ('-' * 140) -Color DarkGray
 
 foreach ($s in ($summary | Sort-Object Group, FQDN)) {
-    $line = '{0,-40} {1,-8} {2,-20} {3,-10} {4,-10} {5}' -f `
+    $line = '{0,-40} {1,-16} {2,-8} {3,-20} {4,-10} {5}' -f `
         $s.FQDN,
+        $s.CimProtocol,
         $s.Overall,
         $s.Version,
         $s.ServiceStopped,
-        $(if ($s.BackupPath -ne 'none' -and $s.BackupPath -ne 'N/A') { 'Yes' } else { 'No' }),
         $(if ($s.Error) { $s.Error } else { $s.BackupPath })
     $color = if ($s.Overall -eq 'SUCCESS') { 'Green' } else { 'Red' }
     Write-Log $line -Color $color
