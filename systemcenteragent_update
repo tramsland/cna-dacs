@@ -37,7 +37,14 @@ $MaxBackups        = 2
 $LocalCertsDirName = "localcerts"
 $ConfigDirName     = "configuration"
 $ConfigFileName    = "config.ini"
+$WorkDir           = "C:\DLA-Failsafe\"
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ─── Validate working directory ──────────────────────────────────────────────
+if (-not (Test-Path -Path $WorkDir)) {
+    Write-Host ("[ERROR] Working directory '" + $WorkDir + "' does not exist. Create it and re-run.")
+    exit 1
+}
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -173,9 +180,8 @@ try {
 }
 
 # ─── Step 7: Download and install the new agent ───────────────────────────────
-$workDir       = $PSScriptRoot
-$installerPath = Join-Path $workDir $InstallerName
-$logPath       = Join-Path $workDir $LogName
+$installerPath = Join-Path $WorkDir $InstallerName
+$logPath       = Join-Path $WorkDir $LogName
 
 Write-Log ("Downloading installer from " + $InstallerUrl + " ...")
 try {
@@ -189,7 +195,7 @@ try {
 
 Write-Log ("Installing agent to: " + $InstallDir + " (log: " + $logPath + ") ...")
 $installArgs = "/qn /l*vx `"" + $logPath + "`" /i `"" + $installerPath + "`" INSTALLDIR=`"" + $InstallDir + "`" HTTP_PORT_NUMBER=`"" + $HttpPort + "`" SERVER_NAME=`"" + $ServerName + "`""
-$proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -Wait -PassThru
+$proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -WorkingDirectory $WorkDir -Wait -PassThru
 
 if ($proc.ExitCode -ne 0) {
     Write-Log ("Installation failed with exit code " + $proc.ExitCode + ". Check log: " + $logPath) "ERROR"
