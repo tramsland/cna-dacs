@@ -1,59 +1,77 @@
-[INFO] - 2026-06-04 15:44:27 - ===============================================================
-[INFO] - 2026-06-04 15:44:27 -   OTSysCenter_Update_Step1 — 2026-06-04 15:44:27
-[INFO] - 2026-06-04 15:44:27 - ===============================================================
-[INFO] - 2026-06-04 15:44:27 - Log       : C:\Logs\OTSysCenter_Step1_20260604_154427.log
-[INFO] - 2026-06-04 15:44:27 - Service   : OTSsystemCenterAgent
-[INFO] - 2026-06-04 15:44:27 - MaxJobs   : 5
-[INFO] - 2026-06-04 15:44:27 - MaxBackups: 3
+[INFO] - 2026-06-04 16:08:53 - ===============================================================
+[INFO] - 2026-06-04 16:08:53 -   OTSysCenter_Update_Step1 — 2026-06-04 16:08:53
+[INFO] - 2026-06-04 16:08:53 - ===============================================================
+[INFO] - 2026-06-04 16:08:53 - Log       : C:\DLA-FAILSAFE\patching\logs\OTSysCenter_Step1_20260604_160853.log
+[INFO] - 2026-06-04 16:08:53 - Service   : OTSystemCenterAgent
+[INFO] - 2026-06-04 16:08:53 - MaxJobs   : 5
+[INFO] - 2026-06-04 16:08:53 - MaxBackups: 3
 
-[INFO] - 2026-06-04 15:44:27 - Servers   : 7 across 1 zone(s)
+[INFO] - 2026-06-04 16:08:53 - Non-interactive session — using default credentials.
+[INFO] - 2026-06-04 16:08:53 - Credentials : default (current user)
 
-[INFO] - 2026-06-04 15:44:27 - Queuing jobs...
-[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR050.public.dla.mil
-[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR045.public.dla.mil
-[INFO] - 2026-06-04 15:44:28 -   LOCAL [Stage - Public] AZASVWSR046.public.dla.mil — running in-process
-[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR047.public.dla.mil
-[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR043.public.dla.mil
-[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR044.public.dla.mil
-[INFO] - 2026-06-04 15:44:49 -   Queuing [Stage - Public] AZASVWSR048.public.dla.mil
+[INFO] - 2026-06-04 16:08:53 - Servers   : 7 across 1 zone(s)
 
-[INFO] - 2026-06-04 15:44:50 - Waiting for 6 remote job(s) to complete...
-[INFO] - 2026-06-04 15:45:11 - 1 local job(s) already complete.
-[INFO] - 2026-06-04 15:45:11 - All jobs finished. Aggregating results...
+[INFO] - 2026-06-04 16:08:53 - Queuing jobs...
+[INFO] - 2026-06-04 16:08:53 -   Queuing [Stage - Public] AZASVWSR050.public.dla.mil
+[INFO] - 2026-06-04 16:08:53 -   Queuing [Stage - Public] AZASVWSR045.public.dla.mil
+[INFO] - 2026-06-04 16:08:53 -   LOCAL [Stage - Public] AZASVWSR046.public.dla.mil — running in-process
+[INFO] - 2026-06-04 16:10:29 -   Queuing [Stage - Public] AZASVWSR047.public.dla.mil
+[INFO] - 2026-06-04 16:10:29 -   Queuing [Stage - Public] AZASVWSR043.public.dla.mil
+[INFO] - 2026-06-04 16:10:29 -   Queuing [Stage - Public] AZASVWSR044.public.dla.mil
+[INFO] - 2026-06-04 16:10:29 -   Queuing [Stage - Public] AZASVWSR048.public.dla.mil
 
-[INFO] - 2026-06-04 15:45:11 - ########################################
-[INFO] - 2026-06-04 15:45:11 - # Zone: Stage - Public
-[INFO] - 2026-06-04 15:45:11 - ########################################
-[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR043.public.dla.mil ---
-[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR044.public.dla.mil ---
-[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR045.public.dla.mil ---
-[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR046.public.dla.mil [LOCAL] ---
-[ERROR] - 2026-06-04 15:45:11 -   (AZASVWSR046) ERROR: Service 'OTSsystemCenterAgent' not found on this host.
-[INFO] - 2026-06-04 15:45:11 -   RESULT: PARTIAL/FAILED | Version: unknown (from N/A) | Stopped: False | Backup: none
-[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR047.public.dla.mil ---
-[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR048.public.dla.mil ---
-[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR050.public.dla.mil ---
-[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 16:10:29 - Waiting for 6 remote job(s) to complete...
+[INFO] - 2026-06-04 16:10:50 - 1 local job(s) already complete.
+[INFO] - 2026-06-04 16:10:50 - All jobs finished. Aggregating results...
 
-[INFO] - 2026-06-04 15:45:11 - ===============================================================
-[INFO] - 2026-06-04 15:45:11 -   STEP 1 SUMMARY
-[INFO] - 2026-06-04 15:45:11 - ===============================================================
-[INFO] - 2026-06-04 15:45:11 - Server                                   Result   Version              SvcStop    Backup     Backup path / Error
-[INFO] - 2026-06-04 15:45:11 - --------------------------------------------------------------------------------------------------------------------------------------------
-[INFO] - 2026-06-04 15:45:11 - AZASVWSR043.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - AZASVWSR044.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - AZASVWSR045.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - AZASVWSR046.public.dla.mil               PARTIAL/FAILED unknown              False      No         (AZASVWSR046) ERROR: Service 'OTSsystemCenterAgent' not found on this host.
-[INFO] - 2026-06-04 15:45:11 - AZASVWSR047.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - AZASVWSR048.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
-[INFO] - 2026-06-04 15:45:11 - AZASVWSR050.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - ########################################
+[INFO] - 2026-06-04 16:10:50 - # Zone: Stage - Public
+[INFO] - 2026-06-04 16:10:50 - ########################################
+[INFO] - 2026-06-04 16:10:50 - --- AZASVWSR043.public.dla.mil ---
+[ERROR] - 2026-06-04 16:10:50 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - --- AZASVWSR044.public.dla.mil ---
+[ERROR] - 2026-06-04 16:10:50 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - --- AZASVWSR045.public.dla.mil ---
+[ERROR] - 2026-06-04 16:10:50 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - --- AZASVWSR046.public.dla.mil [LOCAL] ---
+[INFO] - 2026-06-04 16:10:50 -   CIM session: Wsman
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) CIM session opened via Wsman.
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) Service 'OTSystemCenterAgent' found. Status: Stopped
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) Install directory resolved: E:\Customers\Shared\DACS\SystemCenter
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) FileVersionInfo: 1.2.4.0
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) Win32_Product match: 'OpenText System Center Agent' version 26.1.0.2428
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) Best version: 1.2.4.0 (from FileVersionInfo (exe))
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) Service 'OTSystemCenterAgent' was already stopped — no stop action needed.
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) Compressing 'E:\Customers\Shared\DACS\SystemCenter' ? 'E:\Customers\Shared\DACS\SystemCenter_2026-06-04_160936.zip'...
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) Backup completed: E:\Customers\Shared\DACS\SystemCenter_2026-06-04_160936.zip
+[INFO] - 2026-06-04 16:10:50 -   (AZASVWSR046) 2 backup(s) present — no rotation needed (max 3).
+[WARN] - 2026-06-04 16:10:50 -   (AZASVWSR046) WARN: No version files found under E:\Customers\Shared\DACS\SystemCenter
+[INFO] - 2026-06-04 16:10:50 -   Version detection results:
+[INFO] - 2026-06-04 16:10:50 -   [OK]   FileVersionInfo (exe)          Version: 1.2.4.0              Source: FileDescription: Apache Commons Daemon Service Runner
+[INFO] - 2026-06-04 16:10:50 -   [----] Version file                   Version: (none)               Source: No recognised version files found in install directory (depth 2)
+[INFO] - 2026-06-04 16:10:50 -   [OK]   Win32_Product                  Version: 26.1.0.2428          Source: IdentifyingNumber: {44FD34A7-05DD-46D4-ABCD-E5BB69DD5346}
+[INFO] - 2026-06-04 16:10:50 -   RESULT: SUCCESS | Version: 1.2.4.0 (from FileVersionInfo (exe)) | CIM: Wsman | Stopped: True | Backup: E:\Customers\Shared\DACS\SystemCenter_2026-06-04_160936.zip
+[INFO] - 2026-06-04 16:10:50 - --- AZASVWSR047.public.dla.mil ---
+[ERROR] - 2026-06-04 16:10:50 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - --- AZASVWSR048.public.dla.mil ---
+[ERROR] - 2026-06-04 16:10:50 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - --- AZASVWSR050.public.dla.mil ---
+[ERROR] - 2026-06-04 16:10:50 -   REMOTING FAILED: Unreachable or access denied
 
-[INFO] - 2026-06-04 15:45:11 - Completed : 2026-06-04 15:45:11
-[INFO] - 2026-06-04 15:45:11 - Duration  : 00:44
-[INFO] - 2026-06-04 15:45:11 - Log saved : C:\Logs\OTSysCenter_Step1_20260604_154427.log
-[INFO] - 2026-06-04 15:45:11 - ===============================================================
+[INFO] - 2026-06-04 16:10:50 - ===============================================================
+[INFO] - 2026-06-04 16:10:50 -   STEP 1 SUMMARY
+[INFO] - 2026-06-04 16:10:50 - ===============================================================
+[INFO] - 2026-06-04 16:10:50 - Server                                   CIM Protocol     Result   Version              Stopped    Backup path / Error
+[INFO] - 2026-06-04 16:10:50 - --------------------------------------------------------------------------------------------------------------------------------------------
+[INFO] - 2026-06-04 16:10:50 - AZASVWSR043.public.dla.mil                                REMOTING FAILED N/A                  False      Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - AZASVWSR044.public.dla.mil                                REMOTING FAILED N/A                  False      Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - AZASVWSR045.public.dla.mil                                REMOTING FAILED N/A                  False      Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - AZASVWSR046.public.dla.mil               Wsman            SUCCESS  1.2.4.0              True       E:\Customers\Shared\DACS\SystemCenter_2026-06-04_160936.zip
+[INFO] - 2026-06-04 16:10:50 - AZASVWSR047.public.dla.mil                                REMOTING FAILED N/A                  False      Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - AZASVWSR048.public.dla.mil                                REMOTING FAILED N/A                  False      Unreachable or access denied
+[INFO] - 2026-06-04 16:10:50 - AZASVWSR050.public.dla.mil                                REMOTING FAILED N/A                  False      Unreachable or access denied
+
+[INFO] - 2026-06-04 16:10:50 - Completed : 2026-06-04 16:10:50
+[INFO] - 2026-06-04 16:10:50 - Duration  : 01:56
+[INFO] - 2026-06-04 16:10:50 - Log saved : C:\DLA-FAILSAFE\patching\logs\OTSysCenter_Step1_20260604_160853.log
+[INFO] - 2026-06-04 16:10:50 - ===============================================================
