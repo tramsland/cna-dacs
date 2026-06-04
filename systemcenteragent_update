@@ -1,14 +1,15 @@
 #==================================================================================
 #
-#        SCRIPT: System Center Agent Audit (Parallel)
+#        SCRIPT: OpenText System Center Agent Audit (Parallel)
 #
 #        DESCRIPTION:
-#        Evaluates the current state of the System Center (SCOM/OMS) agent
+#        Evaluates the current state of the OpenText System Center Agent
 #        across a list of remote servers. For each server, reports:
 #          - Content Server instance name (resolved from service metadata)
-#          - System Center Agent service status
-#          - Installed agent version
+#          - System Center Agent service status and version (from ARP)
 #          - All installation path mappings resolved from the service
+#          - otcs.log validation for wss://patch.dacs.dla.mil:443 and wss://localhost:8888
+#          - For servers without agent installed: locates, compresses, and clears SystemCenter folder
 #
 #        servers.txt format:
 #        - Place in the same directory as this script.
@@ -88,30 +89,35 @@ function Parse-ServersFile {
 
 #region Remote Audit Script Block
 $auditScript = {
+
     $result = [pscustomobject]@{
-        ComputerName        = $env:COMPUTERNAME
-        Zone                = $null   # populated by caller
+        ComputerName          = $env:COMPUTERNAME
+        Zone                  = $null
         ContentServerInstance = $null
-        ContentServerDir    = $null
-        AgentServiceName    = $null
-        AgentDisplayName    = $null
-        AgentStatus         = $null
-        AgentStartType      = $null
-        AgentVersion        = $null
-        AgentInstallPath    = $null
-        AgentExePath        = $null
-        AgentDataPath       = $null
-        AgentConfigPath     = $null
-        AgentAccountName    = $null
-        AgentDescription    = $null
-        AgentPID            = $null
-        Errors              = [System.Collections.Generic.List[string]]::new()
+        ContentServerDir      = $null
+        AgentServiceName      = $null
+        AgentDisplayName      = $null
+        AgentStatus           = $null
+        AgentStartType        = $null
+        AgentVersion          = $null
+        AgentInstallPath      = $null
+        AgentExePath          = $null
+        AgentDataPath         = $null
+        AgentConfigPath       = $null
+        AgentAccountName      = $null
+        AgentDescription      = $null
+        AgentPID              = $null
+        LogPath               = $null
+        PatchConnectOK        = $null
+        LocalhostFailures     = $null
+        LogErrors             = [System.Collections.Generic.List[string]]::new()
+        Errors                = [System.Collections.Generic.List[string]]::new()
     }
 
     try {
         $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
 
-        #--- Resolve Content Server instance (mirrors existing discovery logic) ---
+        #--- Resolve Content Server instance ---
         $csSvc = $allSvcs | Where-Object {
             $_.Description -like '*Content Server*' -and
             $_.Description -notlike '*Content Server Admin*'
@@ -119,7 +125,6 @@ $auditScript = {
 
         if ($csSvc) {
             $result.ContentServerInstance = $csSvc.Name
-
             if ($csSvc.PathName) {
                 $exePath = $csSvc.PathName -replace '^"([^"]+)".*$', '$1' `
                                            -replace '^([^\s]+\.exe).*$', '$1'
@@ -145,8 +150,7 @@ $auditScript = {
             $result.Errors.Add("WARNING: No Content Server service found (excluding Admin).")
         }
 
-        #--- Resolve System Center / SCOM / OMS Agent service ---
-        # Searches by known service names and display name patterns
+        #--- Resolve OpenText System Center Agent service ---
         $agentSvc = $allSvcs | Where-Object {
             $_.Name        -eq 'OTSystemCenterAgent'             -or
             $_.DisplayName -eq 'Open Text System Center Agent'   -or
@@ -154,10 +158,11 @@ $auditScript = {
         } | Select-Object -First 1
 
         if ($agentSvc) {
+
             $result.AgentServiceName  = $agentSvc.Name
             $result.AgentDisplayName  = $agentSvc.DisplayName
-            $result.AgentStatus       = $agentSvc.State          # Running / Stopped / etc.
-            $result.AgentStartType    = $agentSvc.StartMode       # Auto / Manual / Disabled
+            $result.AgentStatus       = $agentSvc.State
+            $result.AgentStartType    = $agentSvc.StartMode
             $result.AgentAccountName  = $agentSvc.StartName
             $result.AgentDescription  = $agentSvc.Description
             $result.AgentPID          = $agentSvc.ProcessId
@@ -168,9 +173,7 @@ $auditScript = {
                                              -replace '^([^\s]+\.exe).*$', '$1'
                 $result.AgentExePath     = $rawExe
                 $result.AgentInstallPath = Split-Path $rawExe -Parent
-
-                # Attempt to resolve well-known sub-paths relative to install dir
-                $installDir = $result.AgentInstallPath
+                $installDir              = $result.AgentInstallPath
 
                 $dataCandidates = @(
                     (Join-Path $installDir 'Health Service State'),
@@ -194,8 +197,31 @@ $auditScript = {
                 $result.Errors.Add("WARNING: Agent service '$($agentSvc.Name)' has no PathName.")
             }
 
-            #--- Resolve installed version from the executable ---
-            if ($result.AgentExePath -and (Test-Path $result.AgentExePath)) {
+            #--- Version from Add/Remove Programs (returns 26.1.x product version) ---
+            $arpPaths = @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+            )
+            foreach ($arpBase in $arpPaths) {
+                if (-not (Test-Path $arpBase)) { continue }
+                $arpMatch = Get-ChildItem $arpBase -ErrorAction SilentlyContinue | ForEach-Object {
+                    Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                } | Where-Object {
+                    $_.DisplayName -like '*Open Text System Center Agent*' -or
+                    $_.DisplayName -like '*OTSystemCenterAgent*'
+                } | Select-Object -First 1
+
+                if ($arpMatch) {
+                    $result.AgentVersion = $arpMatch.DisplayVersion
+                    if (-not $result.AgentInstallPath -and $arpMatch.InstallLocation) {
+                        $result.AgentInstallPath = $arpMatch.InstallLocation
+                    }
+                    break
+                }
+            }
+
+            #--- Fallback: file version from executable ---
+            if (-not $result.AgentVersion -and $result.AgentExePath -and (Test-Path $result.AgentExePath)) {
                 try {
                     $vi = (Get-Item $result.AgentExePath -ErrorAction Stop).VersionInfo
                     $result.AgentVersion = $vi.FileVersion
@@ -204,41 +230,125 @@ $auditScript = {
                 }
             }
 
-            #--- Fallback: try registry for version ---
-            if (-not $result.AgentVersion) {
-                $regPaths = @(
-                    'HKLM:\SOFTWARE\Microsoft\Microsoft Operations Manager\3.0\Setup',
-                    'HKLM:\SOFTWARE\Microsoft\System Center Operations Manager\12\Setup',
-                    'HKLM:\SOFTWARE\Microsoft\System Center\2012\Agent\Setup',
-                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft Operations Manager\3.0\Setup'
-                )
-                foreach ($rp in $regPaths) {
-                    if (Test-Path $rp) {
-                        $ver = (Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue).AgentVersion
-                        if (-not $ver) {
-                            $ver = (Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue).CurrentVersion
-                        }
-                        if ($ver) {
-                            $result.AgentVersion = $ver
-
-                            # Also pull install path from registry if not resolved from service
-                            if (-not $result.AgentInstallPath) {
-                                $regInstall = (Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue).InstallDirectory
-                                if ($regInstall) { $result.AgentInstallPath = $regInstall }
-                            }
-                            break
-                        }
-                    }
+            #--- Validate otcs.log ---
+            $logPath = $null
+            if ($result.AgentInstallPath) {
+                $candidate = Join-Path $result.AgentInstallPath "logs\otcs.log"
+                if (Test-Path $candidate) {
+                    $logPath = $candidate
                 }
             }
 
+            if ($logPath) {
+                $result.LogPath = $logPath
+                $result.LogErrors.Add("INFO: Evaluating log file: '$logPath'.")
+                try {
+                    $lines = Get-Content $logPath -Tail 2000 -ErrorAction Stop
+
+                    $patchOK = $lines | Where-Object {
+                        $_ -match 'wss://patch\.dacs\.dla\.mil:443/otcs-server/v1/agentwebsocket'
+                    }
+                    $localFail = $lines | Where-Object {
+                        $_ -match 'wss://localhost:8888/otcs-server/v1/agentwebsocket'
+                    }
+
+                    $result.PatchConnectOK    = if ($patchOK)   { $patchOK.Count }   else { 0 }
+                    $result.LocalhostFailures = if ($localFail) { $localFail.Count } else { 0 }
+
+                    if ($patchOK) {
+                        $result.LogErrors.Add("PATCH OK (last match)  : $($patchOK | Select-Object -Last 1)")
+                    }
+                    if ($localFail) {
+                        $result.LogErrors.Add("LOCALHOST FAIL (last)  : $($localFail | Select-Object -Last 1)")
+                    }
+                } catch {
+                    $result.LogErrors.Add("ERROR reading log '$logPath': $_")
+                    $result.PatchConnectOK    = 'ERROR'
+                    $result.LocalhostFailures = 'ERROR'
+                }
+            } else {
+                $checkedPath = if ($result.AgentInstallPath) { "$($result.AgentInstallPath)\logs\otcs.log" } else { 'AgentInstallPath not resolved' }
+                $result.LogErrors.Add("WARNING: otcs.log not found. Checked path: '$checkedPath'.")
+                $result.PatchConnectOK    = 'LOG NOT FOUND'
+                $result.LocalhostFailures = 'LOG NOT FOUND'
+            }
+
         } else {
-            $result.AgentStatus  = 'NOT INSTALLED'
-            $result.AgentVersion = 'N/A'
-            $result.Errors.Add("WARNING: No System Center Agent service found on this host.")
+
+            #--- Agent not installed --- 
+            $result.AgentStatus       = 'NOT INSTALLED'
+            $result.AgentVersion      = 'N/A'
+            $result.PatchConnectOK    = 'N/A'
+            $result.LocalhostFailures = 'N/A'
+            $result.Errors.Add("WARNING: No OpenText System Center Agent service found on this host.")
+
+            #--- Locate SystemCenter folder from known candidate paths ---
+            $scCandidates = @(
+                'C:\Program Files\OpenText\SystemCenter',
+                'C:\Program Files (x86)\OpenText\SystemCenter',
+                'C:\OpenText\SystemCenter',
+                'D:\Program Files\OpenText\SystemCenter',
+                'D:\OpenText\SystemCenter'
+            )
+            if ($result.ContentServerDir) {
+                $otRoot = Split-Path (Split-Path $result.ContentServerDir -Parent) -Parent
+                $scCandidates += Join-Path $otRoot 'SystemCenter'
+                $scCandidates += Join-Path (Split-Path $result.ContentServerDir -Parent) 'SystemCenter'
+            }
+
+            $scFolder = $null
+            foreach ($c in $scCandidates) {
+                if (Test-Path $c -PathType Container) {
+                    $scFolder = $c
+                    break
+                }
+            }
+
+            if ($scFolder) {
+                $result.AgentInstallPath = $scFolder
+                $items = Get-ChildItem $scFolder -Recurse -ErrorAction SilentlyContinue
+
+                if ($items) {
+                    # Save archive one level above the SystemCenter folder with timestamp
+                    $parentDir   = Split-Path (Split-Path $scFolder -Parent) -Parent
+                    $folderName  = Split-Path $scFolder -Leaf
+                    $archivePath = Join-Path $parentDir "${folderName}_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').zip"
+
+                    try {
+                        Compress-Archive -Path $scFolder -DestinationPath $archivePath -Force -ErrorAction Stop
+                        $result.Errors.Add("INFO: Compressed '$scFolder' to '$archivePath'.")
+
+                        # Backup rotation — keep only 2 most recent archives
+                        $existingBackups = Get-ChildItem -Path $parentDir -Filter "${folderName}_*.zip" -ErrorAction SilentlyContinue |
+                            Sort-Object CreationTime
+                        $excess = $existingBackups.Count - 2
+                        if ($excess -gt 0) {
+                            $existingBackups | Select-Object -First $excess | ForEach-Object {
+                                Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                                $result.Errors.Add("INFO: Removed old backup '$($_.Name)'.")
+                            }
+                        }
+
+                        # Delete contents but leave the folder itself
+                        Get-ChildItem $scFolder -Recurse -ErrorAction SilentlyContinue |
+                            Sort-Object FullName -Descending |
+                            ForEach-Object {
+                                Remove-Item $_.FullName -Force -Recurse -ErrorAction SilentlyContinue
+                            }
+                        $result.Errors.Add("INFO: Contents of '$scFolder' deleted after compression.")
+                    } catch {
+                        $result.Errors.Add("ERROR: Failed to compress '$scFolder': $_")
+                    }
+                } else {
+                    $result.Errors.Add("INFO: SystemCenter folder found at '$scFolder' but it is already empty. No action taken.")
+                }
+            } else {
+                $result.AgentInstallPath = 'NOT FOUND'
+                $result.Errors.Add("INFO: No SystemCenter installation folder found on this host.")
+            }
         }
-    }
-    catch {
+
+    } catch {
         $result.Errors.Add("ERROR during audit: $_")
     }
 
@@ -253,7 +363,7 @@ $startTime = Get-Date
 Write-Log "---------------- SCOM AGENT AUDIT STARTED ----------------" -Color Cyan
 Write-Log "Started  : $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Color Gray
 Write-Log "Log file : $localLogPath" -Color Gray
-Write-Log "CSV file : $csvPath" -Color Gray
+Write-Log "CSV file : $csvPath"      -Color Gray
 
 $serverGroups, $totalEntries = Parse-ServersFile -Path $configFile
 
@@ -272,7 +382,6 @@ $jobs = [System.Collections.Generic.List[pscustomobject]]::new()
 
 foreach ($group in $serverGroups.Keys) {
     foreach ($fqdn in $serverGroups[$group]) {
-
         while ((Get-Job -State Running).Count -ge $maxParallelJobs) { Start-Sleep -Milliseconds 500 }
 
         $job = Invoke-Command -ComputerName $fqdn `
@@ -300,101 +409,167 @@ $prevGroup  = $null
 foreach ($entry in ($jobs | Sort-Object GroupName, ComputerName)) {
 
     if ($entry.GroupName -ne $prevGroup) {
-        Write-Log "########################################" -Color Magenta
-        Write-Log "# Zone: $($entry.GroupName)"            -Color Magenta
-        Write-Log "########################################" -Color Magenta
+        Write-Log -Spacer
+        Write-Log "╔══════════════════════════════════════════════════════════╗" -Color Magenta
+        Write-Log "║  ZONE: $($entry.GroupName.PadRight(50))║" -Color Magenta
+        Write-Log "╚══════════════════════════════════════════════════════════╝" -Color Magenta
+        Write-Log -Spacer
         $prevGroup = $entry.GroupName
     }
-
-    Write-Log "--- $($entry.ComputerName) ---" -Color Cyan
 
     if ($entry.Job.State -ne 'Completed') {
         $err    = $entry.Job.ChildJobs[0].Error | Select-Object -First 1
         $errMsg = if ($err) { $err.Exception.Message } else { "Unreachable or access denied." }
+        Write-Log "--- [$($entry.GroupName)] $($entry.ComputerName) ---" -Color Cyan
         Write-Log "  FAILED to connect: $errMsg" -Level 'ERROR' -Color Red
 
         $allResults.Add([pscustomobject]@{
-            Zone                    = $entry.GroupName
-            ComputerName            = $entry.ComputerName
-            ContentServerInstance   = 'N/A'
-            ContentServerDir        = 'N/A'
-            AgentServiceName        = 'N/A'
-            AgentDisplayName        = 'N/A'
-            AgentStatus             = 'UNREACHABLE'
-            AgentStartType          = 'N/A'
-            AgentVersion            = 'N/A'
-            AgentInstallPath        = 'N/A'
-            AgentExePath            = 'N/A'
-            AgentDataPath           = 'N/A'
-            AgentConfigPath         = 'N/A'
-            AgentAccountName        = 'N/A'
-            AgentPID                = 'N/A'
-            Errors                  = $errMsg
+            Zone                  = $entry.GroupName
+            ComputerName          = $entry.ComputerName
+            ContentServerInstance = 'N/A'
+            ContentServerDir      = 'N/A'
+            AgentServiceName      = 'N/A'
+            AgentDisplayName      = 'N/A'
+            AgentStatus           = 'UNREACHABLE'
+            AgentStartType        = 'N/A'
+            AgentVersion          = 'N/A'
+            AgentInstallPath      = 'N/A'
+            AgentExePath          = 'N/A'
+            AgentDataPath         = 'N/A'
+            AgentConfigPath       = 'N/A'
+            AgentAccountName      = 'N/A'
+            AgentPID              = 'N/A'
+            LogPath               = 'N/A'
+            PatchConnectOK        = 'N/A'
+            LocalhostFailures     = 'N/A'
+            Errors                = $errMsg
         })
         continue
     }
 
-    $r = $entry.Job | Receive-Job
+    $r      = $entry.Job | Receive-Job
     $r.Zone = $entry.GroupName
 
-    # Warn messages from remote
-    $r.Errors | ForEach-Object { Write-Log "  $_" -Level 'WARN' -Color Yellow }
+    $instanceLabel = if ($r.ContentServerInstance) { " | Instance: $($r.ContentServerInstance)" } else { '' }
+    Write-Log "--- [$($entry.GroupName)] $($entry.ComputerName)$instanceLabel ---" -Color Cyan
 
-    # Console summary
+    $r.Errors    | ForEach-Object { Write-Log "  $_" -Level 'WARN' -Color Yellow }
+    $r.LogErrors | ForEach-Object { Write-Log "  $_" -Level 'WARN' -Color Yellow }
+
     $agentColor = switch ($r.AgentStatus) {
         'Running'       { 'Green'  }
         'Stopped'       { 'Red'    }
         'NOT INSTALLED' { 'Yellow' }
         default         { 'Gray'   }
     }
+    $patchColor = if ($r.PatchConnectOK  -match '^\d+$' -and [int]$r.PatchConnectOK  -gt 0) { 'Green' } else { 'Red' }
+    $localColor = if ($r.LocalhostFailures -match '^\d+$' -and [int]$r.LocalhostFailures -gt 0) { 'Red' } else { 'Green' }
 
-    Write-Log "  Content Server Instance : $($r.ContentServerInstance)"   -Color Gray
-    Write-Log "  Content Server Dir      : $($r.ContentServerDir)"        -Color Gray
-    Write-Log "  Agent Service Name      : $($r.AgentServiceName)"        -Color Gray
-    Write-Log "  Agent Display Name      : $($r.AgentDisplayName)"        -Color Gray
-    Write-Log "  Agent Status            : $($r.AgentStatus)"             -Color $agentColor
-    Write-Log "  Agent Start Type        : $($r.AgentStartType)"          -Color Gray
-    Write-Log "  Agent Version           : $($r.AgentVersion)"            -Color Gray
-    Write-Log "  Agent Install Path      : $($r.AgentInstallPath)"        -Color Gray
-    Write-Log "  Agent Exe Path          : $($r.AgentExePath)"            -Color Gray
-    Write-Log "  Agent Data Path         : $($r.AgentDataPath)"           -Color Gray
-    Write-Log "  Agent Config Path       : $($r.AgentConfigPath)"         -Color Gray
-    Write-Log "  Agent Account           : $($r.AgentAccountName)"        -Color Gray
-    Write-Log "  Agent PID               : $($r.AgentPID)"                -Color Gray
+    Write-Log "  Content Server Instance        : $($r.ContentServerInstance)"  -Color Gray
+    Write-Log "  Content Server Dir             : $($r.ContentServerDir)"       -Color Gray
+    Write-Log "  Agent Service Name             : $($r.AgentServiceName)"       -Color Gray
+    Write-Log "  Agent Display Name             : $($r.AgentDisplayName)"       -Color Gray
+    Write-Log "  Agent Status                   : $($r.AgentStatus)"            -Color $agentColor
+    Write-Log "  Agent Start Type               : $($r.AgentStartType)"         -Color Gray
+    Write-Log "  Agent Version                  : $($r.AgentVersion)"           -Color Gray
+    Write-Log "  Agent Install Path             : $($r.AgentInstallPath)"       -Color Gray
+    Write-Log "  Agent Exe Path                 : $($r.AgentExePath)"           -Color Gray
+    Write-Log "  Agent Data Path                : $($r.AgentDataPath)"          -Color Gray
+    Write-Log "  Agent Config Path              : $($r.AgentConfigPath)"        -Color Gray
+    Write-Log "  Agent Account                  : $($r.AgentAccountName)"       -Color Gray
+    Write-Log "  Agent PID                      : $($r.AgentPID)"               -Color Gray
+    Write-Log "  Log Path                       : $($r.LogPath)"                -Color Gray
+    Write-Log "  patch.dacs.dla.mil:443 OK hits : $($r.PatchConnectOK)"         -Color $patchColor
+    Write-Log "  localhost:8888 Failures        : $($r.LocalhostFailures)"      -Color $localColor
     Write-Log -Spacer
 
     $allResults.Add([pscustomobject]@{
-        Zone                    = $r.Zone
-        ComputerName            = $r.ComputerName
-        ContentServerInstance   = $r.ContentServerInstance
-        ContentServerDir        = $r.ContentServerDir
-        AgentServiceName        = $r.AgentServiceName
-        AgentDisplayName        = $r.AgentDisplayName
-        AgentStatus             = $r.AgentStatus
-        AgentStartType          = $r.AgentStartType
-        AgentVersion            = $r.AgentVersion
-        AgentInstallPath        = $r.AgentInstallPath
-        AgentExePath            = $r.AgentExePath
-        AgentDataPath           = $r.AgentDataPath
-        AgentConfigPath         = $r.AgentConfigPath
-        AgentAccountName        = $r.AgentAccountName
-        AgentPID                = $r.AgentPID
-        Errors                  = ($r.Errors -join ' | ')
+        Zone                  = $r.Zone
+        ComputerName          = $r.ComputerName
+        ContentServerInstance = $r.ContentServerInstance
+        ContentServerDir      = $r.ContentServerDir
+        AgentServiceName      = $r.AgentServiceName
+        AgentDisplayName      = $r.AgentDisplayName
+        AgentStatus           = $r.AgentStatus
+        AgentStartType        = $r.AgentStartType
+        AgentVersion          = $r.AgentVersion
+        AgentInstallPath      = $r.AgentInstallPath
+        AgentExePath          = $r.AgentExePath
+        AgentDataPath         = $r.AgentDataPath
+        AgentConfigPath       = $r.AgentConfigPath
+        AgentAccountName      = $r.AgentAccountName
+        AgentPID              = $r.AgentPID
+        LogPath               = $r.LogPath
+        PatchConnectOK        = $r.PatchConnectOK
+        LocalhostFailures     = $r.LocalhostFailures
+        Errors                = (($r.Errors + $r.LogErrors) -join ' | ')
     })
 }
 
 $jobs | ForEach-Object { $_.Job | Remove-Job -Force }
 
+# --- Summary Report ---
+Write-Log -Spacer
+Write-Log "========== AUDIT SUMMARY ==========" -Color Cyan
+
+$total        = $allResults.Count
+$reachable    = $allResults | Where-Object { $_.AgentStatus -ne 'UNREACHABLE' }
+$unreachable  = $allResults | Where-Object { $_.AgentStatus -eq 'UNREACHABLE' }
+$running      = $allResults | Where-Object { $_.AgentStatus -eq 'Running' }
+$stopped      = $allResults | Where-Object { $_.AgentStatus -eq 'Stopped' }
+$notInstalled = $allResults | Where-Object { $_.AgentStatus -eq 'NOT INSTALLED' }
+$patchOK      = $allResults | Where-Object { $_.PatchConnectOK    -match '^\d+$' -and [int]$_.PatchConnectOK    -gt 0 }
+$patchFail    = $allResults | Where-Object { $_.PatchConnectOK    -match '^\d+$' -and [int]$_.PatchConnectOK    -eq 0 }
+$localFail    = $allResults | Where-Object { $_.LocalhostFailures -match '^\d+$' -and [int]$_.LocalhostFailures -gt 0 }
+$logMissing   = $allResults | Where-Object { $_.PatchConnectOK    -eq 'LOG NOT FOUND' }
+
+Write-Log "  Total servers evaluated          : $total"                -Color Gray
+Write-Log "  Reachable                        : $($reachable.Count)"   -Color Gray
+Write-Log "  Unreachable                      : $($unreachable.Count)" -Color $(if ($unreachable.Count  -gt 0) { 'Red'    } else { 'Green' })
+Write-Log -Spacer
+Write-Log "  Agent Running                    : $($running.Count)"      -Color $(if ($running.Count -eq $reachable.Count) { 'Green' } else { 'Yellow' })
+Write-Log "  Agent Stopped                    : $($stopped.Count)"      -Color $(if ($stopped.Count      -gt 0) { 'Red'    } else { 'Green' })
+Write-Log "  Agent Not Installed              : $($notInstalled.Count)" -Color $(if ($notInstalled.Count -gt 0) { 'Yellow' } else { 'Green' })
+Write-Log -Spacer
+Write-Log "  patch.dacs.dla.mil:443 OK hits   : $($patchOK.Count)"     -Color $(if ($patchOK.Count -eq $reachable.Count) { 'Green' } else { 'Yellow' })
+Write-Log "  patch.dacs.dla.mil:443 No hits   : $($patchFail.Count)"   -Color $(if ($patchFail.Count    -gt 0) { 'Red'    } else { 'Green' })
+Write-Log "  localhost:8888 Failures          : $($localFail.Count)"   -Color $(if ($localFail.Count    -gt 0) { 'Red'    } else { 'Green' })
+Write-Log "  Log file not found               : $($logMissing.Count)"  -Color $(if ($logMissing.Count   -gt 0) { 'Yellow' } else { 'Green' })
+
+# Version breakdown
+Write-Log -Spacer
+Write-Log "  Version breakdown:" -Color Gray
+$allResults | Where-Object { $_.AgentVersion -and $_.AgentVersion -ne 'N/A' } |
+    Group-Object AgentVersion | Sort-Object Name |
+    ForEach-Object { Write-Log "    $($_.Name) — $($_.Count) server(s)" -Color Gray }
+
+# Servers needing attention
+$attention = $allResults | Where-Object {
+    $_.AgentStatus -ne 'Running' -or
+    ($_.LocalhostFailures -match '^\d+$' -and [int]$_.LocalhostFailures -gt 0) -or
+    ($_.PatchConnectOK    -match '^\d+$' -and [int]$_.PatchConnectOK    -eq 0)
+}
+if ($attention.Count -gt 0) {
+    Write-Log -Spacer
+    Write-Log "  Servers requiring attention:" -Color Yellow
+    foreach ($s in $attention) {
+        $reasons = [System.Collections.Generic.List[string]]::new()
+        if ($s.AgentStatus -ne 'Running') { $reasons.Add("Agent: $($s.AgentStatus)") }
+        if ($s.LocalhostFailures -match '^\d+$' -and [int]$s.LocalhostFailures -gt 0) {
+            $reasons.Add("localhost:8888 failures: $($s.LocalhostFailures)")
+        }
+        if ($s.PatchConnectOK -match '^\d+$' -and [int]$s.PatchConnectOK -eq 0) {
+            $reasons.Add("No patch.dacs.dla.mil:443 hits")
+        }
+        Write-Log "    $($s.ComputerName) [$($s.Zone)] — $($reasons -join ' | ')" -Color Red
+    }
+}
+
+Write-Log -Spacer
+
 # --- Export CSV ---
 $allResults | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 Write-Log "CSV exported : $csvPath" -Color Green
-
-# --- Summary table to console ---
-Write-Log -Spacer
-Write-Log "========== AUDIT SUMMARY ==========" -Color Cyan
-$allResults | Format-Table -AutoSize `
-    Zone, ComputerName, ContentServerInstance, AgentStatus, AgentVersion, AgentInstallPath `
-    | Out-String | ForEach-Object { Write-Host $_ -ForegroundColor Gray }
 
 $endTime = Get-Date
 $dur     = $endTime - $startTime
