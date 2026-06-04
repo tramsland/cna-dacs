@@ -1,103 +1,59 @@
-PS C:\DLA-FAILSAFE\patching> .\backup.ps1
-[INFO] - 2026-05-26 09:06:37 - ---------------- SCRIPT EXECUTION STARTED ----------------
-[INFO] - 2026-05-26 09:06:37 - Started   : 2026-05-26 09:06:37
-[INFO] - 2026-05-26 09:06:37 - Log file  : C:\Logs\CompressionLog_20260526_090637.log
-[INFO] - 2026-05-26 09:06:37 - Servers   : 4 across 1 zone(s)
+[INFO] - 2026-06-04 15:44:27 - ===============================================================
+[INFO] - 2026-06-04 15:44:27 -   OTSysCenter_Update_Step1 — 2026-06-04 15:44:27
+[INFO] - 2026-06-04 15:44:27 - ===============================================================
+[INFO] - 2026-06-04 15:44:27 - Log       : C:\Logs\OTSysCenter_Step1_20260604_154427.log
+[INFO] - 2026-06-04 15:44:27 - Service   : OTSsystemCenterAgent
+[INFO] - 2026-06-04 15:44:27 - MaxJobs   : 5
+[INFO] - 2026-06-04 15:44:27 - MaxBackups: 3
 
-[INFO] - 2026-05-26 09:06:37 - Phase 1: Discovering service names and paths...
-[INFO] - 2026-05-26 09:06:37 -   Discovering AZASVWSP079.dir.ad.dla.mil...
-[WARN] - 2026-05-26 09:06:41 -   AZASVWSP079.dir.ad.dla.mil: ERROR during discovery: The term '-replace' is not recognized as the name
- of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the p
-ath is correct and try again.
-[INFO] - 2026-05-26 09:06:41 -   AZASVWSP079.dir.ad.dla.mil: Instance='dcaa'  Tomcat=''  CSDir=''
-[INFO] - 2026-05-26 09:06:41 -   Discovering AZASVWSP075.dir.ad.dla.mil...
-[WARN] - 2026-05-26 09:06:42 -   AZASVWSP075.dir.ad.dla.mil: ERROR during discovery: The term '-replace' is not recognized as the name
- of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the p
-ath is correct and try again.
-[INFO] - 2026-05-26 09:06:42 -   AZASVWSP075.dir.ad.dla.mil: Instance='dacsrm'  Tomcat=''  CSDir=''
-[INFO] - 2026-05-26 09:06:42 -   Discovering AZASVWSP074.dir.ad.dla.mil...
-[WARN] - 2026-05-26 09:06:47 -   AZASVWSP074.dir.ad.dla.mil: ERROR during discovery: The term '-replace' is not recognized as the name
- of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the p
-ath is correct and try again.
-[INFO] - 2026-05-26 09:06:47 -   AZASVWSP074.dir.ad.dla.mil: Instance='dla'  Tomcat=''  CSDir=''
-[INFO] - 2026-05-26 09:06:47 -   Discovering AZASVWSP076.dir.ad.dla.mil...
-[WARN] - 2026-05-26 09:06:51 -   AZASVWSP076.dir.ad.dla.mil: ERROR during discovery: The term '-replace' is not recognized as the name
- of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the p
-ath is correct and try again.
-[INFO] - 2026-05-26 09:06:51 -   AZASVWSP076.dir.ad.dla.mil: Instance='ccad'  Tomcat=''  CSDir=''
+[INFO] - 2026-06-04 15:44:27 - Servers   : 7 across 1 zone(s)
 
-[INFO] - 2026-05-26 09:06:51 - Phase 2: Queuing compression jobs...
-[WARN] - 2026-05-26 09:06:51 - SKIPPING AZASVWSP079.dir.ad.dla.mil — incomplete discovery (Instance='dcaa' CSDir='').
-[WARN] - 2026-05-26 09:06:51 - SKIPPING AZASVWSP075.dir.ad.dla.mil — incomplete discovery (Instance='dacsrm' CSDir='').
-[WARN] - 2026-05-26 09:06:51 - SKIPPING AZASVWSP074.dir.ad.dla.mil — incomplete discovery (Instance='dla' CSDir='').
-[WARN] - 2026-05-26 09:06:51 - SKIPPING AZASVWSP076.dir.ad.dla.mil — incomplete discovery (Instance='ccad' CSDir='').
-[WARN] - 2026-05-26 09:06:51 - No jobs were queued. Review discovery warnings above.
+[INFO] - 2026-06-04 15:44:27 - Queuing jobs...
+[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR050.public.dla.mil
+[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR045.public.dla.mil
+[INFO] - 2026-06-04 15:44:28 -   LOCAL [Stage - Public] AZASVWSR046.public.dla.mil — running in-process
+[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR047.public.dla.mil
+[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR043.public.dla.mil
+[INFO] - 2026-06-04 15:44:28 -   Queuing [Stage - Public] AZASVWSR044.public.dla.mil
+[INFO] - 2026-06-04 15:44:49 -   Queuing [Stage - Public] AZASVWSR048.public.dla.mil
 
-[INFO] - 2026-05-26 09:06:51 - Phase 3: Verifying service states on all processed servers...
+[INFO] - 2026-06-04 15:44:50 - Waiting for 6 remote job(s) to complete...
+[INFO] - 2026-06-04 15:45:11 - 1 local job(s) already complete.
+[INFO] - 2026-06-04 15:45:11 - All jobs finished. Aggregating results...
 
-[INFO] - 2026-05-26 09:06:51 - ========================================
-[INFO] - 2026-05-26 09:06:51 - Completed : 2026-05-26 09:06:51
-Exception calling "ToString" with "1" argument(s): "Input string was not in a correct format."
-At C:\DLA-FAILSAFE\patching\backup.ps1:979 char:26
-+ Write-Log "Duration  : $($dur.ToString('mm¥:ss'))"                  - ...
-+                          ~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [], MethodInvocationException
-    + FullyQualifiedErrorId : FormatException
- 
-[INFO] - 2026-05-26 09:06:51 - Duration  : 
-[INFO] - 2026-05-26 09:06:51 - ========================================
-[INFO] - 2026-05-26 09:06:51 - Log saved : C:\Logs\CompressionLog_20260526_090637.log
-[INFO] - 2026-05-26 09:06:51 - ---------------- SCRIPT EXECUTION FINISHED ----------------
-[INFO] - 2026-05-26 09:06:51 - ---------------- SCRIPT EXECUTION STARTED ----------------
-[INFO] - 2026-05-26 09:06:51 - Started   : 2026-05-26 09:06:51
-[INFO] - 2026-05-26 09:06:51 - Log file  : C:¥Logs\CompressionLog_20260526_090651.log
-[INFO] - 2026-05-26 09:06:51 - Servers   : 5 across 1 zone(s)
+[INFO] - 2026-06-04 15:45:11 - ########################################
+[INFO] - 2026-06-04 15:45:11 - # Zone: Stage - Public
+[INFO] - 2026-06-04 15:45:11 - ########################################
+[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR043.public.dla.mil ---
+[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR044.public.dla.mil ---
+[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR045.public.dla.mil ---
+[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR046.public.dla.mil [LOCAL] ---
+[ERROR] - 2026-06-04 15:45:11 -   (AZASVWSR046) ERROR: Service 'OTSsystemCenterAgent' not found on this host.
+[INFO] - 2026-06-04 15:45:11 -   RESULT: PARTIAL/FAILED | Version: unknown (from N/A) | Stopped: False | Backup: none
+[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR047.public.dla.mil ---
+[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR048.public.dla.mil ---
+[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - --- AZASVWSR050.public.dla.mil ---
+[ERROR] - 2026-06-04 15:45:11 -   REMOTING FAILED: Unreachable or access denied
 
-[INFO] - 2026-05-26 09:06:51 - Phase 1: Discovering service names and paths...
-[INFO] - 2026-05-26 09:06:51 -   Discovering [Stage - Private]...
-[ERROR] - 2026-05-26 09:06:51 -   [Stage - Private]: Discovery FAILED - One or more computer names are not valid. If you are trying to
- pass a URI, use the -ConnectionUri parameter, or pass URI objects instead of strings.
-[INFO] - 2026-05-26 09:06:51 -   Discovering AZASVWSP079.dir.ad.dla.mil...
-[WARN] - 2026-05-26 09:06:55 -   AZASVWSP079.dir.ad.dla.mil: ERROR during discovery: The term '-replace' is not recognized as the name
- of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the p
-ath is correct and try again.
-[INFO] - 2026-05-26 09:06:55 -   AZASVWSP079.dir.ad.dla.mil: Instance='dcaa'  Tomcat=''  CSDir=''
-[INFO] - 2026-05-26 09:06:55 -   Discovering AZASVWSP075.dir.ad.dla.mil...
-[WARN] - 2026-05-26 09:06:56 -   AZASVWSP075.dir.ad.dla.mil: ERROR during discovery: The term '-replace' is not recognized as the name
- of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the p
-ath is correct and try again.
-[INFO] - 2026-05-26 09:06:56 -   AZASVWSP075.dir.ad.dla.mil: Instance='dacsrm'  Tomcat=''  CSDir=''
-[INFO] - 2026-05-26 09:06:57 -   Discovering AZASVWSP074.dir.ad.dla.mil...
-[WARN] - 2026-05-26 09:07:01 -   AZASVWSP074.dir.ad.dla.mil: ERROR during discovery: The term '-replace' is not recognized as the name
- of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the p
-ath is correct and try again.
-[INFO] - 2026-05-26 09:07:01 -   AZASVWSP074.dir.ad.dla.mil: Instance='dla'  Tomcat=''  CSDir=''
-[INFO] - 2026-05-26 09:07:01 -   Discovering AZASVWSP076.dir.ad.dla.mil...
-[WARN] - 2026-05-26 09:07:05 -   AZASVWSP076.dir.ad.dla.mil: ERROR during discovery: The term '-replace' is not recognized as the name
- of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the p
-ath is correct and try again.
-[INFO] - 2026-05-26 09:07:05 -   AZASVWSP076.dir.ad.dla.mil: Instance='ccad'  Tomcat=''  CSDir=''
+[INFO] - 2026-06-04 15:45:11 - ===============================================================
+[INFO] - 2026-06-04 15:45:11 -   STEP 1 SUMMARY
+[INFO] - 2026-06-04 15:45:11 - ===============================================================
+[INFO] - 2026-06-04 15:45:11 - Server                                   Result   Version              SvcStop    Backup     Backup path / Error
+[INFO] - 2026-06-04 15:45:11 - --------------------------------------------------------------------------------------------------------------------------------------------
+[INFO] - 2026-06-04 15:45:11 - AZASVWSR043.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - AZASVWSR044.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - AZASVWSR045.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - AZASVWSR046.public.dla.mil               PARTIAL/FAILED unknown              False      No         (AZASVWSR046) ERROR: Service 'OTSsystemCenterAgent' not found on this host.
+[INFO] - 2026-06-04 15:45:11 - AZASVWSR047.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - AZASVWSR048.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
+[INFO] - 2026-06-04 15:45:11 - AZASVWSR050.public.dla.mil               REMOTING FAILED N/A                  False      No         Unreachable or access denied
 
-[INFO] - 2026-05-26 09:07:05 - Phase 2: Queuing compression jobs...
-[WARN] - 2026-05-26 09:07:05 - SKIPPING [Stage - Private] — incomplete discovery (Instance='' CSDir='').
-[WARN] - 2026-05-26 09:07:05 - SKIPPING AZASVWSP079.dir.ad.dla.mil — incomplete discovery (Instance='dcaa' CSDir='').
-[WARN] - 2026-05-26 09:07:05 - SKIPPING AZASVWSP075.dir.ad.dla.mil — incomplete discovery (Instance='dacsrm' CSDir='').
-[WARN] - 2026-05-26 09:07:05 - SKIPPING AZASVWSP074.dir.ad.dla.mil — incomplete discovery (Instance='dla' CSDir='').
-[WARN] - 2026-05-26 09:07:05 - SKIPPING AZASVWSP076.dir.ad.dla.mil — incomplete discovery (Instance='ccad' CSDir='').
-[WARN] - 2026-05-26 09:07:05 - No jobs were queued. Review discovery warnings above.
-
-[INFO] - 2026-05-26 09:07:05 - Phase 3: Verifying service states on all processed servers...
-
-[INFO] - 2026-05-26 09:07:05 - ========================================
-[INFO] - 2026-05-26 09:07:05 - Completed : 2026-05-26 09:07:05
-Exception calling "ToString" with "1" argument(s): "Input string was not in a correct format."
-At C:\DLA-FAILSAFE\patching\backup.ps1:1965 char:26
-+ Write-Log "Duration  : $($dur.ToString('mm¥:ss'))"                  - ...
-+                          ~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (:) [], MethodInvocationException
-    + FullyQualifiedErrorId : FormatException
- 
-[INFO] - 2026-05-26 09:07:05 - Duration  : 
-[INFO] - 2026-05-26 09:07:05 - ========================================
-[INFO] - 2026-05-26 09:07:05 - Log saved : C:¥Logs\CompressionLog_20260526_090651.log
-[INFO] - 2026-05-26 09:07:05 - ---------------- SCRIPT EXECUTION FINISHED ----------------
+[INFO] - 2026-06-04 15:45:11 - Completed : 2026-06-04 15:45:11
+[INFO] - 2026-06-04 15:45:11 - Duration  : 00:44
+[INFO] - 2026-06-04 15:45:11 - Log saved : C:\Logs\OTSysCenter_Step1_20260604_154427.log
+[INFO] - 2026-06-04 15:45:11 - ===============================================================
