@@ -82,8 +82,6 @@ $TomcatConfig = [pscustomobject]@{
     ThrottleLimit     = 5
     ServiceCandidates = @(
         "E:\Customers\dacs\shared\tomcat10",
-        "E:\Customers\dacs\shared\tomcat9",
-        "E:\Customers\dacs\shared\tomcat85",
         "E:\Customers\dacs\shared\tomcat"
     )
 }
@@ -1141,9 +1139,118 @@ function Invoke-StageSoftware {
 }
 #endregion
 
+
+#region Version Detection
+function Get-InstalledVersions {
+    # Detect locally installed Tomcat version via version.bat
+    $script:TomcatInstalledVersion = 'Not detected'
+    $script:TomcatInstallPath      = $null
+
+    $candidates = @(
+        $TomcatConfig.ServiceCandidates | ForEach-Object { $_ }
+    )
+
+    # Also try to find path from running service registry (same logic as deploy)
+    $svcs = @(Get-Service -Name '*Tomcat*' -ErrorAction SilentlyContinue)
+    if ($svcs.Count -eq 0) {
+        $svcs = @(Get-Service -DisplayName '*Apache Tomcat*' -ErrorAction SilentlyContinue)
+    }
+    foreach ($svc in $svcs) {
+        $rp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)" `
+               -ErrorAction SilentlyContinue).ImagePath
+        if ($rp) {
+            $ex   = $rp.Trim('"').Split(' ')[0]
+            $root = Split-Path (Split-Path $ex -Parent) -Parent
+            if ((Test-Path "$root\bin") -and (Test-Path "$root\lib")) {
+                # Prepend service-resolved path so it is tried first
+                $candidates = @($root) + $candidates
+            }
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        $versionBat = Join-Path $candidate 'bin\version.bat'
+        if (Test-Path $versionBat) {
+            try {
+                $output = & cmd.exe /c "`"$versionBat`" 2>&1"
+                $vLine  = $output | Select-String -Pattern 'Server version\s*:\s*Apache Tomcat/(\S+)' |
+                          Select-Object -First 1
+                if ($vLine) {
+                    $script:TomcatInstalledVersion = $vLine.Matches[0].Groups[1].Value
+                } else {
+                    # Fallback: any version pattern in output
+                    $vLine2 = $output | Select-String -Pattern '(\d+\.\d+\.\d+)' | Select-Object -First 1
+                    if ($vLine2) { $script:TomcatInstalledVersion = $vLine2.Matches[0].Groups[1].Value }
+                }
+                $script:TomcatInstallPath = $candidate
+                break
+            }
+            catch {
+                $script:TomcatInstalledVersion = 'Error running version.bat'
+            }
+        }
+    }
+
+    # Detect locally installed System Center Agent version
+    $script:SCAgentInstalledVersion = 'Not detected'
+
+    # Method 1: Win32_Product (most reliable, slower)
+    try {
+        $scProd = Get-CimInstance -ClassName Win32_Product -ErrorAction Stop |
+                  Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
+                  Select-Object -First 1
+        if ($scProd) {
+            $script:SCAgentInstalledVersion = $scProd.Version
+            return
+        }
+    }
+    catch { }
+
+    # Method 2: Uninstall registry keys (faster fallback)
+    $regPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($regPath in $regPaths) {
+        if (-not (Test-Path $regPath)) { continue }
+        $keys = Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue
+        foreach ($key in $keys) {
+            $props = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
+            if ($props.DisplayName -like '*System Center*' -or $props.DisplayName -like '*OTS*') {
+                if ($props.DisplayVersion) {
+                    $script:SCAgentInstalledVersion = $props.DisplayVersion
+                    return
+                }
+            }
+        }
+    }
+
+    # Method 3: Check version file in install directory
+    $verFile = Join-Path $SCConfig.InstallDir 'version.txt'
+    if (Test-Path $verFile) {
+        $vContent = Get-Content $verFile -TotalCount 5 | Select-String -Pattern '(\d+\.\d+[\.\d]*)' |
+                    Select-Object -First 1
+        if ($vContent) { $script:SCAgentInstalledVersion = $vContent.Matches[0].Groups[1].Value }
+    }
+}
+#endregion
+
 #region Menu
 function Show-Menu {
     Write-Header "CNA-DACS Maintenance  |  $RootDir"
+
+    # ---- Installed version banner ----
+    $tcVer  = $script:TomcatInstalledVersion
+    $tcPath = if ($script:TomcatInstallPath) { $script:TomcatInstallPath } else { 'path not found' }
+    $scVer  = $script:SCAgentInstalledVersion
+
+    $tcColor = if ($tcVer -eq 'Not detected' -or $tcVer -like 'Error*') { 'Yellow' } else { 'Green' }
+    $scColor = if ($scVer -eq 'Not detected') { 'Yellow' } else { 'Green' }
+
+    Write-Host '  Installed Software Versions:' -ForegroundColor White
+    Write-Host ("    Tomcat         : {0}  ({1})" -f $tcVer, $tcPath) -ForegroundColor $tcColor
+    Write-Host ("    SC Agent       : {0}" -f $scVer)                  -ForegroundColor $scColor
+    Write-Host ''
     Write-Host '  Operations:' -ForegroundColor White
     Write-Host ''
 
@@ -1208,6 +1315,11 @@ if (-not (Test-Path $serversFile)) {
     Write-Host ''
     Start-Sleep -Seconds 2
 }
+
+# Detect installed versions once at startup — displayed in menu header each refresh
+Write-Host ''
+Write-Host '  Detecting installed software versions...' -ForegroundColor Gray
+Get-InstalledVersions
 #endregion
 
 #region Main Loop
