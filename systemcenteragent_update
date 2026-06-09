@@ -1,404 +1,407 @@
 #==================================================================================
 #
-#   SCRIPT: systemcenteragent_update.ps1
+#   SCRIPT: Launch-CNA-DACS.ps1
 #
 #   DESCRIPTION:
-#   Local upgrade procedure for the OpenText System Center Agent.
+#   Interactive launcher for CNA-DACS maintenance scripts.
+#   Must be run from C:\DLA-failsafe\patching\ on the admin workstation.
 #
-#   SEQUENCE:
-#     1.  Stop dependent services (OTSystemCenterAgent, Tomcat, CS Admin, CS)
-#     2.  Compress install directory to a timestamped backup zip
-#     3.  Uninstall current agent via msiexec
-#     4.  Empty the install directory
-#     5.  Install new agent from locally staged MSI
-#     6.  Restore configuration.conf.ini from backup zip to install root
-#     7.  Copy conf.ini from localhost subfolder to install root
-#     8.  Start services in reverse stop order
+#   EXPECTED FOLDER LAYOUT (on admin workstation and staged to each server):
 #
-#   EXPECTED FOLDER LAYOUT:
-#     C:\DLA-failsafe\SystemCenter\
-#     └── systemcenteragent_update.ps1    <- this file (no pre-staged MSI needed)
+#     C:\DLA-failsafe\patching\
+#     ├── Launch-CNA-DACS.ps1              <- this file
+#     ├── servers.txt                      <- one FQDN per line, zone headers optional
+#     ├── Backup\
+#     │   └── backup.ps1
+#     ├── SystemCenter\
+#     │   └── systemcenteragent_update.ps1
+#     └── TomcatUpgrade\
+#         ├── tomcatupgrade.ps1
+#         └── NewVersion\                  <- Tomcat build files staged here
 #
-#   PATHS (edit $Config below if your environment differs):
-#     Install dir  : E:\Customers\dacs\shared\systemcenteragent
-#     Localhost dir: E:\Customers\dacs\shared\systemcenteragent\localhost
-#     Backup dir   : E:\Customers\dacs\shared\   (parent of install dir)
-#     Log dir      : C:\Logs
+#   STAGE operation copies to each server in servers.txt:
+#     \\server\e$\DLA-failsafe\patching\Launch-CNA-DACS.ps1   (this script)
+#     \\server\e$\DLA-failsafe\patching\TomcatUpgrade\        (full folder, overwrite)
+#
+#   SELECTION EXAMPLES:
+#     1          Backup only
+#     2          SystemCenter only
+#     3          TomcatUpgrade only
+#     1,3        Backup then TomcatUpgrade
+#     2,3        SystemCenter then TomcatUpgrade
+#     1,2,3      All three in sequence (same as A)
+#     A          Run all available scripts in sequence
+#     S          Stage software to all servers in servers.txt
+#     Q          Quit
 #
 #   REQUIREMENTS:
 #     - PowerShell 5.1 or later
 #     - Run as Administrator
-#     - Network access to patch.dacs.dla.mil (internal patch server)
+#     - Admin share access (\\server\e$) to all target servers
 #
 #==================================================================================
 
-#region Bootstrap
+#region Bootstrap — must run as Administrator
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "[ERROR] Must be run as Administrator." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  [ERROR] This launcher must be run as Administrator." -ForegroundColor Red
+    Write-Host "          Right-click PowerShell and choose 'Run as Administrator'." -ForegroundColor Yellow
+    Write-Host ""
+    pause
     exit 1
 }
 #endregion
 
 #region Configuration
-$Config = [pscustomobject]@{
+# Execution directory — launcher must live here
+$RootDir = "C:\DLA-failsafe\patching"
 
-    # --- Paths ---
-    InstallDir    = 'E:\Customers\dacs\shared\systemcenteragent'
-    LocalhostDir  = 'E:\Customers\dacs\shared\systemcenteragent\localhost'
-    LogDir        = 'C:\Logs'
+# Remote destination base path — server name is inserted between \\ and \e$
+$RemoteBase = "e$\DLA-failsafe\patching"
 
-    # --- MSI download from internal patch server ---
-    MsiUrl        = 'https://patch.dacs.dla.mil/downloadAgent/?ostype=win&filetype=installer'
-    MsiName       = 'OpenText_SystemCenter_Agent.msi'
-    # MSI is downloaded to a temp folder at runtime — no pre-staging required
+# Items to copy during staging (relative to $RootDir)
+# Each entry: Name shown in output, relative source path, type (File or Folder)
+$StageItems = @(
+    [pscustomobject]@{ Label = 'Launcher script'; RelPath = 'Launch-CNA-DACS.ps1'; Type = 'File'   }
+    [pscustomobject]@{ Label = 'TomcatUpgrade';   RelPath = 'TomcatUpgrade';        Type = 'Folder' }
+)
 
-    # --- MSI install parameters ---
-    MsiInstallDir = 'E:\Customers\Shared\DACS\SystemCenter'
-    ServerName    = 'patch.dacs.dla.mil'
-    HttpPort      = '443'
-
-    # --- Config files to restore/copy ---
-    RestoreFile   = 'configuration.conf.ini'   # restored from backup zip to install root
-    CopyFile      = 'conf.ini'                 # copied from localhost\configuration\ dir to install root
-
-    # --- Service stop order (restart is reversed automatically) ---
-    # {INSTANCE} and {TOMCAT} are resolved dynamically at runtime
-    ServiceOrder  = @('OTSystemCenterAgent', '{TOMCAT}', '{INSTANCE}Admin', '{INSTANCE}')
-
-    # --- Timeouts ---
-    StopTimeoutSec  = 60
-    StartTimeoutSec = 60
+$ScriptDefs = [ordered]@{
+    'Backup'        = [pscustomobject]@{ SubFolder = 'Backup';        FileName = 'backup.ps1' }
+    'SystemCenter'  = [pscustomobject]@{ SubFolder = 'SystemCenter';  FileName = 'systemcenteragent_update.ps1' }
+    'TomcatUpgrade' = [pscustomobject]@{ SubFolder = 'TomcatUpgrade'; FileName = 'tomcatupgrade.ps1' }
 }
+
+$ScriptDescriptions = [ordered]@{
+    'Backup'        = 'Content Server Backup  — stops services, compresses CS directory, rotates old backups, restarts services'
+    'SystemCenter'  = 'System Center Update   — manages OTSystemCenterAgent alongside CS/Tomcat service lifecycle'
+    'TomcatUpgrade' = 'Tomcat Upgrade         — pre-flight checks, parallel deployment, version verification, rollback support'
+}
+
+$LogDir = "C:\Logs"
 #endregion
 
-#region Logging
-if (-not (Test-Path $Config.LogDir)) {
-    New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null
+#region Helpers
+function Write-Header {
+    param([string]$Text)
+    $line = '=' * 70
+    Write-Host ""
+    Write-Host $line           -ForegroundColor Cyan
+    Write-Host ("  " + $Text) -ForegroundColor Cyan
+    Write-Host $line           -ForegroundColor Cyan
+    Write-Host ""
 }
-$LogPath = Join-Path $Config.LogDir "SystemCenterAgentUpdate_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
-function Write-Log {
-    param(
-        [string]$Message,
-        [string]$Level = 'INFO',
-        [switch]$Spacer
-    )
-    if ($Spacer) {
-        Add-Content -Path $LogPath -Value ''
-        Write-Host ''
-        return
-    }
+function Write-Status {
+    param([string]$Message, [string]$Level = 'INFO')
+    $ts    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $color = switch ($Level) {
         'OK'    { 'Green'  }
         'WARN'  { 'Yellow' }
         'ERROR' { 'Red'    }
-        'HEAD'  { 'Cyan'   }
         default { 'White'  }
     }
-    $entry = "[$Level] - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
-    Write-Host $entry -ForegroundColor $color
-    Add-Content -Path $LogPath -Value $entry
-}
-#endregion
-
-#region Service Helpers
-function Get-ResolvedServices {
-    # Dynamically resolve {INSTANCE} (Content Server) and {TOMCAT} service names
-    $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
-
-    $csSvc = $allSvcs | Where-Object {
-        $_.Description -like '*Content Server*' -and
-        $_.Description -notlike '*Content Server Admin*'
-    } | Select-Object -First 1
-
-    $tomcatSvc = $allSvcs | Where-Object {
-        $_.DisplayName -like '*Apache*Tomcat*'
-    } | Select-Object -First 1
-
-    $instanceName = if ($csSvc)     { $csSvc.Name }     else { $null }
-    $tomcatName   = if ($tomcatSvc) { $tomcatSvc.Name } else { $null }
-
-    if (-not $instanceName) { Write-Log "Content Server service not found — {INSTANCE} entries will be skipped." 'WARN' }
-    if (-not $tomcatName)   { Write-Log "Tomcat service not found — {TOMCAT} entry will be skipped."            'WARN' }
-
-    $resolved = $Config.ServiceOrder | ForEach-Object {
-        switch ($_) {
-            '{TOMCAT}'   { if ($tomcatName)   { $tomcatName } }
-            '{INSTANCE}' { if ($instanceName) { $instanceName } }
-            default      {
-                $_ -replace [regex]::Escape('{INSTANCE}'), ($instanceName ?? '')
-            }
-        }
-    } | Where-Object { $_ -and $_.Trim() -ne '' }
-
-    return $resolved
+    Write-Host "  [$Level] $ts - $Message" -ForegroundColor $color
 }
 
-function Wait-ServiceState {
-    param([string]$Name, [string]$TargetState, [int]$TimeoutSec, [string]$ActionLabel)
-    $svc     = Get-Service -Name $Name -ErrorAction Stop
-    $timeout = [TimeSpan]::FromSeconds($TimeoutSec)
-    try {
-        $svc.WaitForStatus($TargetState, $timeout)
-        Write-Log "Service '$Name' $ActionLabel." 'OK'
+function Resolve-ScriptPath {
+    param([string]$Key)
+    $def      = $ScriptDefs[$Key]
+    $fullPath = Join-Path $RootDir (Join-Path $def.SubFolder $def.FileName)
+    if (Test-Path $fullPath) { return $fullPath }
+    Write-Status "Script not found: $fullPath" 'ERROR'
+    Write-Host   "  Expected: $RootDir\$($def.SubFolder)\$($def.FileName)" -ForegroundColor Yellow
+    return $null
+}
+
+function Get-ServerList {
+    # Returns a flat list of FQDNs from servers.txt, stripping zone headers and comments
+    $serversFile = Join-Path $RootDir "servers.txt"
+    if (-not (Test-Path $serversFile)) {
+        Write-Status "servers.txt not found at: $serversFile" 'ERROR'
+        return $null
     }
-    catch [System.ServiceProcess.TimeoutException] {
-        throw "Timed out waiting for '$Name' to reach '$TargetState' after ${TimeoutSec}s."
+    $servers = Get-Content $serversFile | ForEach-Object { $_.Trim() } |
+               Where-Object { $_ -ne '' -and $_ -notmatch '^\s*#' -and $_ -notmatch '^\[' }
+    if ($servers.Count -eq 0) {
+        Write-Status "No server entries found in servers.txt." 'ERROR'
+        return $null
     }
+    return $servers
 }
 
-function Stop-Services {
-    param([string[]]$Names)
-    $stopped = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in $Names) {
-        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
-        if (-not $svc) {
-            Write-Log "Service '$name' not found — skipping." 'WARN'
-            continue
-        }
-        if ($svc.Status -eq 'Running') {
-            Write-Log "Stopping '$name'..."
-            Stop-Service -Name $name -Force -ErrorAction Stop
-            Wait-ServiceState -Name $name -TargetState 'Stopped' `
-                -TimeoutSec $Config.StopTimeoutSec -ActionLabel 'stopped'
-            $stopped.Add($name)
+function Show-Menu {
+    Write-Header "CNA-DACS Script Launcher  |  $RootDir"
+
+    Write-Host "  Available scripts:" -ForegroundColor White
+    Write-Host ""
+
+    $keys = @($ScriptDefs.Keys)
+    for ($i = 0; $i -lt $keys.Count; $i++) {
+        $key      = $keys[$i]
+        $def      = $ScriptDefs[$key]
+        $fullPath = Join-Path $RootDir (Join-Path $def.SubFolder $def.FileName)
+        $status   = if (Test-Path $fullPath) { "[READY]  " } else { "[MISSING]" }
+        $color    = if (Test-Path $fullPath) { "Yellow"    } else { "DarkGray"  }
+        Write-Host ("  [{0}] {1}  {2}" -f ($i + 1), $status, $ScriptDescriptions[$key]) -ForegroundColor $color
+    }
+
+    Write-Host ""
+
+    # Stage option — show what will be copied and to where
+    $stageReady = $true
+    foreach ($item in $StageItems) {
+        $src = Join-Path $RootDir $item.RelPath
+        if (-not (Test-Path $src)) { $stageReady = $false; break }
+    }
+    $stageStatus = if ($stageReady) { "[READY]  " } else { "[PARTIAL]" }
+    $stageColor  = if ($stageReady) { "Cyan"      } else { "Yellow"    }
+    Write-Host ("  [S] {0}  Stage software to all servers in servers.txt" -f $stageStatus) -ForegroundColor $stageColor
+    Write-Host "         Copies: Launch-CNA-DACS.ps1  +  TomcatUpgrade\" -ForegroundColor DarkGray
+    Write-Host "         Dest  : \\<server>\e`$\DLA-failsafe\patching\"   -ForegroundColor DarkGray
+
+    Write-Host ""
+    Write-Host "  [A]  Run ALL available scripts in sequence" -ForegroundColor Magenta
+    Write-Host "  [Q]  Quit"                                  -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Enter a number, or any combination separated by commas or spaces:" -ForegroundColor White
+    Write-Host "    1        Backup only"                     -ForegroundColor DarkGray
+    Write-Host "    2,3      SystemCenter then TomcatUpgrade" -ForegroundColor DarkGray
+    Write-Host "    1 3      Backup then TomcatUpgrade"       -ForegroundColor DarkGray
+    Write-Host "    1,2,3    All three in sequence"           -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+function Resolve-SelectionTokens {
+    param([string]$RawInput)
+    $keys   = @($ScriptDefs.Keys)
+    $tokens = $RawInput -split '[,\s]+' | Where-Object { $_ -ne '' }
+    $chosen = [System.Collections.Generic.List[string]]::new()
+    $bad    = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($token in $tokens) {
+        $index = 0
+        if ([int]::TryParse($token, [ref]$index) -and $index -ge 1 -and $index -le $keys.Count) {
+            $key = $keys[$index - 1]
+            if (-not $chosen.Contains($key)) { $chosen.Add($key) }
         } else {
-            Write-Log "Service '$name' already stopped." 'WARN'
+            $bad.Add($token)
         }
     }
-    return ,$stopped   # return as array
+
+    if ($bad.Count -gt 0) {
+        Write-Host ""
+        Write-Host ("  Invalid entry: '{0}'  — use numbers 1-{1}, A, S, or Q." -f ($bad -join ', '), $keys.Count) -ForegroundColor Red
+        return $null
+    }
+    return ,$chosen
 }
 
-function Start-Services {
-    param([string[]]$Names)
-    # Restart in reverse order
-    $reversed = [System.Linq.Enumerable]::Reverse($Names)
-    foreach ($name in $reversed) {
-        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
-        if (-not $svc) {
-            Write-Log "Service '$name' not found during restart — skipping." 'WARN'
-            continue
-        }
-        try {
-            Write-Log "Starting '$name'..."
-            Start-Service -Name $name -ErrorAction Stop
-            Wait-ServiceState -Name $name -TargetState 'Running' `
-                -TimeoutSec $Config.StartTimeoutSec -ActionLabel 'started'
-        }
-        catch {
-            Write-Log "ERROR starting '$name': $_" 'ERROR'
-        }
+function Invoke-SelectedScript {
+    param([string]$Key)
+
+    $scriptPath = Resolve-ScriptPath -Key $Key
+    if (-not $scriptPath) {
+        Write-Host ""
+        Write-Host "  Press any key to continue..." -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        return
     }
-}
-#endregion
 
-#region Main
-$startTime = Get-Date
-Write-Log "================ SYSTEM CENTER AGENT UPDATE STARTED ================" 'HEAD'
-Write-Log "Host      : $env:COMPUTERNAME"
-Write-Log "Started   : $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))"
-Write-Log "Log       : $LogPath"
-Write-Log -Spacer
+    $scriptDir = Split-Path $scriptPath -Parent
+    Write-Header "Running: $Key"
+    Write-Status "Script : $scriptPath" 'INFO'
+    Write-Status "WorkDir: $scriptDir"  'INFO'
+    Write-Host ""
 
-$stoppedServices = @()
-
-try {
-
-    # -------------------------------------------------------------------------
-    # Pre-flight: verify install directory exists
-    # -------------------------------------------------------------------------
-    if (-not (Test-Path $Config.InstallDir)) {
-        throw "Install directory not found: $($Config.InstallDir)"
-    }
-    Write-Log "Install dir found: $($Config.InstallDir)" 'OK'
-    Write-Log -Spacer
-
-    # -------------------------------------------------------------------------
-    # Pre-flight: download MSI from internal patch server
-    # -------------------------------------------------------------------------
-    Write-Log "Pre-flight: Downloading MSI from internal patch server..." 'HEAD'
-    $msiTemp = Join-Path $env:TEMP "SCA_download_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-    New-Item -ItemType Directory -Path $msiTemp -Force | Out-Null
-    $msiPath = Join-Path $msiTemp $Config.MsiName
-
-    Write-Log "Source : $($Config.MsiUrl)"
-    Write-Log "Dest   : $msiPath"
     try {
-        (New-Object System.Net.WebClient).DownloadFile($Config.MsiUrl, $msiPath)
+        Push-Location $scriptDir
+        & $scriptPath
+        Write-Host ""
+        Write-Status "$Key completed." 'OK'
     }
     catch {
-        throw "MSI download failed: $_"
-    }
-    if (-not (Test-Path $msiPath) -or (Get-Item $msiPath).Length -eq 0) {
-        throw "Downloaded MSI is missing or empty: $msiPath"
-    }
-    Write-Log "MSI downloaded successfully ($([math]::Round((Get-Item $msiPath).Length / 1MB, 2)) MB)." 'OK'
-    Write-Log -Spacer
-
-    # -------------------------------------------------------------------------
-    # Phase 1 — Discover and stop services
-    # -------------------------------------------------------------------------
-    Write-Log "Phase 1: Stopping services..." 'HEAD'
-    $serviceNames    = Get-ResolvedServices
-    Write-Log "Service order: $($serviceNames -join ' -> ')"
-    $stoppedServices = Stop-Services -Names $serviceNames
-    Write-Log "All target services stopped." 'OK'
-    Write-Log -Spacer
-
-    # -------------------------------------------------------------------------
-    # Phase 2 — Backup install directory
-    # -------------------------------------------------------------------------
-    Write-Log "Phase 2: Backing up install directory..." 'HEAD'
-    $backupDir  = Split-Path $Config.InstallDir -Parent
-    $backupName = "$(Split-Path $Config.InstallDir -Leaf)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
-    $backupPath = Join-Path $backupDir $backupName
-
-    Write-Log "Compressing '$($Config.InstallDir)' -> '$backupPath'..."
-    Compress-Archive -Path $Config.InstallDir -DestinationPath $backupPath -Force
-    Write-Log "Backup created: $backupPath" 'OK'
-    Write-Log -Spacer
-
-    # -------------------------------------------------------------------------
-    # Phase 3 — Uninstall current agent
-    # -------------------------------------------------------------------------
-    Write-Log "Phase 3: Uninstalling current agent..." 'HEAD'
-
-    # Find the installed product by name to get its ProductCode
-    $installed = Get-CimInstance -ClassName Win32_Product |
-                 Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
-                 Select-Object -First 1
-
-    if ($installed) {
-        Write-Log "Found installed product: '$($installed.Name)'  Code: $($installed.IdentifyingNumber)"
-        $uninstallLog = Join-Path $Config.LogDir "sc_agent_uninstall_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-        $uninstallArgs = "/qn /l*vx `"$uninstallLog`" /x `"$($installed.IdentifyingNumber)`""
-        Write-Log "Running: msiexec.exe $uninstallArgs"
-        $proc = Start-Process 'msiexec.exe' -ArgumentList $uninstallArgs -Wait -PassThru
-        if ($proc.ExitCode -ne 0) {
-            throw "Uninstall failed with exit code $($proc.ExitCode). See: $uninstallLog"
-        }
-        Write-Log "Uninstall completed (exit 0)." 'OK'
-    } else {
-        Write-Log "No matching installed product found via Win32_Product — skipping MSI uninstall." 'WARN'
-        Write-Log "If the agent was installed another way, manual uninstall may be required." 'WARN'
-    }
-    Write-Log -Spacer
-
-    # -------------------------------------------------------------------------
-    # Phase 4 — Empty the install directory
-    # -------------------------------------------------------------------------
-    Write-Log "Phase 4: Emptying install directory..." 'HEAD'
-    Get-ChildItem -Path $Config.InstallDir -Force -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop
-            Write-Log "  Removed: $($_.Name)"
-        }
-    Write-Log "Install directory emptied." 'OK'
-    Write-Log -Spacer
-
-    # -------------------------------------------------------------------------
-    # Phase 5 — Install new agent from staged MSI
-    # -------------------------------------------------------------------------
-    Write-Log "Phase 5: Installing new agent..." 'HEAD'
-    $installLog  = Join-Path $Config.LogDir "sc_agent_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-    $installArgs = "/qn /l*vx `"$installLog`" /i `"$msiPath`" " +
-                   "HTTP_PORT_NUMBER=`"$($Config.HttpPort)`" " +
-                   "SERVER_NAME=`"$($Config.ServerName)`" " +
-                   "INSTALLDIR=`"$($Config.MsiInstallDir)`""
-
-    Write-Log "Running: msiexec.exe $installArgs"
-    $proc = Start-Process 'msiexec.exe' -ArgumentList $installArgs -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        throw "Install failed with exit code $($proc.ExitCode). See: $installLog"
-    }
-    Write-Log "Install completed (exit 0)." 'OK'
-    Write-Log "Install log: $installLog"
-    Write-Log -Spacer
-
-    # -------------------------------------------------------------------------
-    # Phase 6 — Restore configuration.conf.ini from backup zip
-    # -------------------------------------------------------------------------
-    Write-Log "Phase 6: Restoring '$($Config.RestoreFile)' from backup..." 'HEAD'
-
-    # Extract only the target file from the zip into a temp folder, then move it
-    $tempExtract = Join-Path $env:TEMP "SCA_restore_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-    New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
-
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [System.IO.Compression.ZipFile]::OpenRead($backupPath)
-    try {
-        # Match the file anywhere inside the zip (handles nested paths)
-        $entry = $zip.Entries | Where-Object {
-            $_.Name -ieq $Config.RestoreFile
-        } | Select-Object -First 1
-
-        if (-not $entry) {
-            throw "'$($Config.RestoreFile)' not found inside backup zip: $backupPath"
-        }
-
-        $extractDest = Join-Path $tempExtract $Config.RestoreFile
-        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $extractDest, $true)
+        Write-Host ""
+        Write-Status "$Key encountered an unhandled error: $_" 'ERROR'
     }
     finally {
-        $zip.Dispose()
+        Pop-Location
     }
 
-    $restoreDest = Join-Path $Config.InstallDir $Config.RestoreFile
-    Move-Item -Path (Join-Path $tempExtract $Config.RestoreFile) -Destination $restoreDest -Force
-    Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
-
-    Write-Log "Restored '$($Config.RestoreFile)' -> '$restoreDest'" 'OK'
-    Write-Log -Spacer
-
-    # -------------------------------------------------------------------------
-    # Phase 7 — Copy conf.ini from localhost folder to install root
-    # -------------------------------------------------------------------------
-    Write-Log "Phase 7: Copying '$($Config.CopyFile)' from localhost folder..." 'HEAD'
-
-    $confSource = Join-Path $Config.LocalhostDir "configuration\$($Config.CopyFile)"
-    $confDest   = Join-Path $Config.InstallDir   $Config.CopyFile
-
-    if (-not (Test-Path $confSource)) {
-        throw "'$($Config.CopyFile)' not found at expected source: $confSource"
-    }
-
-    Copy-Item -Path $confSource -Destination $confDest -Force
-    Write-Log "Copied '$confSource' -> '$confDest'" 'OK'
-    Write-Log -Spacer
-
+    Write-Host ""
+    Write-Host "  Press any key to return to the menu..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 }
-catch {
-    Write-Log "FATAL ERROR: $_" 'ERROR'
-    Write-Log "Update aborted. Services will still be restarted if they were stopped." 'ERROR'
-    Write-Log -Spacer
+
+function Invoke-StageSoftware {
+    Write-Header "Stage Software to Servers"
+
+    # Validate source items exist before touching any server
+    $missing = $StageItems | Where-Object { -not (Test-Path (Join-Path $RootDir $_.RelPath)) }
+    if ($missing) {
+        foreach ($m in $missing) {
+            Write-Status "Source not found: $(Join-Path $RootDir $m.RelPath)" 'ERROR'
+        }
+        Write-Host ""
+        Write-Host "  Staging aborted — fix missing source items and retry." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  Press any key to return to the menu..." -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        return
+    }
+
+    $servers = Get-ServerList
+    if (-not $servers) {
+        Write-Host ""
+        Write-Host "  Press any key to return to the menu..." -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        return
+    }
+
+    Write-Status "Servers  : $($servers.Count) target(s) from servers.txt" 'INFO'
+    Write-Status "Source   : $RootDir" 'INFO'
+    Write-Status "Dest     : \\<server>\$RemoteBase" 'INFO'
+    Write-Host ""
+    Write-Host "  Items to copy:" -ForegroundColor White
+    foreach ($item in $StageItems) {
+        Write-Host ("    {0,-20} {1}" -f $item.Type, $item.RelPath) -ForegroundColor DarkGray
+    }
+    Write-Host ""
+
+    $pass = 0
+    $fail = 0
+
+    foreach ($server in $servers) {
+        $remoteDest = "\\$server\$RemoteBase"
+        Write-Status "[$server] Connecting to $remoteDest ..." 'INFO'
+
+        # Test admin share reachability
+        if (-not (Test-Path "\\$server\e$")) {
+            Write-Status "[$server] Cannot reach \\$server\e$ — skipping." 'ERROR'
+            $fail++
+            continue
+        }
+
+        # Ensure destination folder exists
+        try {
+            if (-not (Test-Path $remoteDest)) {
+                New-Item -ItemType Directory -Path $remoteDest -Force | Out-Null
+                Write-Status "[$server] Created destination folder." 'OK'
+            }
+        }
+        catch {
+            Write-Status "[$server] Failed to create destination folder: $_" 'ERROR'
+            $fail++
+            continue
+        }
+
+        # Copy each staged item
+        $serverOk = $true
+        foreach ($item in $StageItems) {
+            $src  = Join-Path $RootDir $item.RelPath
+            $dest = Join-Path $remoteDest $item.RelPath
+
+            try {
+                if ($item.Type -eq 'File') {
+                    Copy-Item -Path $src -Destination $dest -Force
+                    Write-Status "[$server] Copied file : $($item.RelPath)" 'OK'
+                }
+                elseif ($item.Type -eq 'Folder') {
+                    # Ensure destination subfolder exists then mirror contents
+                    if (-not (Test-Path $dest)) {
+                        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                    }
+                    Copy-Item -Path "$src\*" -Destination $dest -Recurse -Force
+                    Write-Status "[$server] Copied folder: $($item.RelPath)" 'OK'
+                }
+            }
+            catch {
+                Write-Status "[$server] Failed to copy $($item.RelPath): $_" 'ERROR'
+                $serverOk = $false
+            }
+        }
+
+        if ($serverOk) { $pass++ } else { $fail++ }
+    }
+
+    Write-Host ""
+    Write-Host ("  ----------------------------------------") -ForegroundColor Cyan
+    Write-Host ("  Staging complete — Success: {0}   Failed: {1}   Total: {2}" -f $pass, $fail, ($pass + $fail)) -ForegroundColor Cyan
+    Write-Host ("  ----------------------------------------") -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Press any key to return to the menu..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 }
-finally {
+#endregion
 
-    # -------------------------------------------------------------------------
-    # Phase 8 — Restart services (always runs, even on error)
-    # -------------------------------------------------------------------------
-    Write-Log "Phase 8: Restarting services..." 'HEAD'
-    if ($stoppedServices.Count -gt 0) {
-        Start-Services -Names $stoppedServices
-    } else {
-        Write-Log "No services were recorded as stopped — nothing to restart." 'WARN'
+#region Startup checks
+if (-not (Test-Path $RootDir)) {
+    Write-Host ""
+    Write-Host "  [ERROR] Root directory not found: $RootDir" -ForegroundColor Red
+    Write-Host "  This launcher must be run from C:\DLA-failsafe\patching\" -ForegroundColor Yellow
+    Write-Host ""
+    pause
+    exit 1
+}
+
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+$serversFile = Join-Path $RootDir "servers.txt"
+if (-not (Test-Path $serversFile)) {
+    Write-Host ""
+    Write-Host "  [WARN] servers.txt not found at: $serversFile" -ForegroundColor Yellow
+    Write-Host "  Required by Backup and Stage operations (one FQDN per line)." -ForegroundColor Yellow
+    Write-Host ""
+    Start-Sleep -Seconds 2
+}
+#endregion
+
+#region Main Loop
+:MainLoop while ($true) {
+    Clear-Host
+    Show-Menu
+
+    $raw = (Read-Host "  Enter selection").Trim().ToUpper()
+
+    switch ($raw) {
+
+        'Q' {
+            Write-Host ""
+            Write-Host "  Exiting launcher." -ForegroundColor Gray
+            Write-Host ""
+            break MainLoop
+        }
+
+        'A' {
+            foreach ($key in $ScriptDefs.Keys) {
+                if (Resolve-ScriptPath -Key $key) {
+                    Invoke-SelectedScript -Key $key
+                } else {
+                    Write-Status "Skipping $key — script file not found." 'WARN'
+                }
+            }
+        }
+
+        'S' {
+            Invoke-StageSoftware
+        }
+
+        default {
+            $selected = Resolve-SelectionTokens -RawInput $raw
+
+            if ($null -eq $selected) {
+                Start-Sleep -Seconds 2
+            } elseif ($selected.Count -eq 0) {
+                Write-Host ""
+                Write-Host "  No valid selection. Enter numbers 1-3, a combination, A, S, or Q." -ForegroundColor Red
+                Start-Sleep -Seconds 2
+            } else {
+                foreach ($key in $selected) {
+                    Invoke-SelectedScript -Key $key
+                }
+            }
+        }
     }
-
-    # Clean up downloaded MSI temp folder
-    if ($msiTemp -and (Test-Path $msiTemp)) {
-        Remove-Item $msiTemp -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Log "Temp MSI folder removed." 'OK'
-    }
-
-    $endTime = Get-Date
-    $dur     = $endTime - $startTime
-    Write-Log -Spacer
-    Write-Log "========================================" 'HEAD'
-    Write-Log "Completed : $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" 'HEAD'
-    Write-Log "Duration  : $($dur.ToString('mm\:ss'))" 'HEAD'
-    Write-Log "========================================" 'HEAD'
-    Write-Log "Log saved : $LogPath" 'OK'
-    Write-Log "================ SYSTEM CENTER AGENT UPDATE FINISHED ================" 'HEAD'
 }
 #endregion
