@@ -1,267 +1,404 @@
-#Requires -RunAsAdministrator
-<#
-.SYNOPSIS
-    Stops, backs up, uninstalls, reinstalls, and restarts the OTSystemCenterAgent service.
+#==================================================================================
+#
+#   SCRIPT: systemcenteragent_update.ps1
+#
+#   DESCRIPTION:
+#   Local upgrade procedure for the OpenText System Center Agent.
+#
+#   SEQUENCE:
+#     1.  Stop dependent services (OTSystemCenterAgent, Tomcat, CS Admin, CS)
+#     2.  Compress install directory to a timestamped backup zip
+#     3.  Uninstall current agent via msiexec
+#     4.  Empty the install directory
+#     5.  Install new agent from locally staged MSI
+#     6.  Restore configuration.conf.ini from backup zip to install root
+#     7.  Copy conf.ini from localhost subfolder to install root
+#     8.  Start services in reverse stop order
+#
+#   EXPECTED FOLDER LAYOUT:
+#     C:\DLA-failsafe\SystemCenter\
+#     └── systemcenteragent_update.ps1    <- this file (no pre-staged MSI needed)
+#
+#   PATHS (edit $Config below if your environment differs):
+#     Install dir  : E:\Customers\dacs\shared\systemcenteragent
+#     Localhost dir: E:\Customers\dacs\shared\systemcenteragent\localhost
+#     Backup dir   : E:\Customers\dacs\shared\   (parent of install dir)
+#     Log dir      : C:\Logs
+#
+#   REQUIREMENTS:
+#     - PowerShell 5.1 or later
+#     - Run as Administrator
+#     - Network access to patch.dacs.dla.mil (internal patch server)
+#
+#==================================================================================
 
-.DESCRIPTION
-    1.  Stops the OTSystemCenterAgent service
-    2.  Reads the service's installation directory
-    3.  Creates a timestamped backup of that directory
-    4.  Keeps only the 2 most recent backups, deleting older ones
-    5.  Uninstalls the current agent (via msiexec)
-    6.  Clears all contents from the install directory
-    7.  Downloads and installs the latest agent to the same directory
-    8.  Restores the localcerts directory from the backup into the new install root
-    9.  Backs up the new installation's configuration\config.ini
-    10. Copies localcerts\config.ini into the configuration directory
-    11. Starts the service
-
-    Directory layout expected under the install root:
-        <InstallDir>\
-            configuration\     <- contains config.ini
-            localcerts\        <- contains config.ini to promote
-
-.NOTES
-    Must be run as Administrator.
-    Tested against PowerShell 5.1.
-#>
-
-# ─── Configuration ────────────────────────────────────────────────────────────
-$ServiceName       = "OTSystemCenterAgent"
-$ServerName        = "patch.dacs.dla.mil"
-$HttpPort          = "443"
-$InstallerUrl      = "https://" + $ServerName + ":/downloadAgent/?ostype=win&filetype=installer"
-$InstallerName     = "OpenText_SystemCenter_Agent.msi"
-$LogName           = "sc_agent_install.log"
-$MaxBackups        = 2
-$LocalCertsDirName = "localcerts"
-$ConfigDirName     = "configuration"
-$ConfigFileName    = "config.ini"
-$WorkDir           = "C:\DLA-Failsafe\"
-# ──────────────────────────────────────────────────────────────────────────────
-
-# ─── Validate working directory ──────────────────────────────────────────────
-if (-not (Test-Path -Path $WorkDir)) {
-    Write-Host ("[ERROR] Working directory '" + $WorkDir + "' does not exist. Create it and re-run.")
+#region Bootstrap
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "[ERROR] Must be run as Administrator." -ForegroundColor Red
     exit 1
 }
+#endregion
+
+#region Configuration
+$Config = [pscustomobject]@{
+
+    # --- Paths ---
+    InstallDir    = 'E:\Customers\dacs\shared\systemcenteragent'
+    LocalhostDir  = 'E:\Customers\dacs\shared\systemcenteragent\localhost'
+    LogDir        = 'C:\Logs'
+
+    # --- MSI download from internal patch server ---
+    MsiUrl        = 'https://patch.dacs.dla.mil/downloadAgent/?ostype=win&filetype=installer'
+    MsiName       = 'OpenText_SystemCenter_Agent.msi'
+    # MSI is downloaded to a temp folder at runtime — no pre-staging required
+
+    # --- MSI install parameters ---
+    MsiInstallDir = 'E:\Customers\Shared\DACS\SystemCenter'
+    ServerName    = 'patch.dacs.dla.mil'
+    HttpPort      = '443'
+
+    # --- Config files to restore/copy ---
+    RestoreFile   = 'configuration.conf.ini'   # restored from backup zip to install root
+    CopyFile      = 'conf.ini'                 # copied from localhost\configuration\ dir to install root
+
+    # --- Service stop order (restart is reversed automatically) ---
+    # {INSTANCE} and {TOMCAT} are resolved dynamically at runtime
+    ServiceOrder  = @('OTSystemCenterAgent', '{TOMCAT}', '{INSTANCE}Admin', '{INSTANCE}')
+
+    # --- Timeouts ---
+    StopTimeoutSec  = 60
+    StartTimeoutSec = 60
+}
+#endregion
+
+#region Logging
+if (-not (Test-Path $Config.LogDir)) {
+    New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null
+}
+$LogPath = Join-Path $Config.LogDir "SystemCenterAgentUpdate_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
 function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $ts    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $entry = "[" + $ts + "] [" + $Level + "] " + $Message
-    Write-Host $entry
-    Add-Content -Path (Join-Path $PSScriptRoot "OTSystemCenterAgent_Update.log") -Value $entry
-}
-
-# ─── Step 1: Get service and resolve install directory ────────────────────────
-Write-Log "Looking up service: $ServiceName"
-
-$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if (-not $svc) {
-    Write-Log ("Service '" + $ServiceName + "' not found. Aborting.") "ERROR"
-    exit 1
-}
-
-# Pull the binary path from WMI to find the install directory
-$wmiSvc = Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + $ServiceName + "'")
-if (-not $wmiSvc) {
-    Write-Log ("Could not query WMI for service '" + $ServiceName + "'. Aborting.") "ERROR"
-    exit 1
-}
-
-# PathName may look like: "C:\Program Files\OpenText\SystemCenter\Agent\OTAgent.exe" -args
-$rawPath    = $wmiSvc.PathName -replace '^"([^"]+)".*$', '$1'   # strip quotes & args
-$rawPath    = $rawPath -replace '^([^ ]+).*$', '$1'              # handle unquoted path
-$InstallDir = Split-Path -Parent $rawPath
-
-if (-not (Test-Path -Path $InstallDir)) {
-    Write-Log ("Resolved install directory '" + $InstallDir + "' does not exist. Aborting.") "ERROR"
-    exit 1
-}
-
-Write-Log ("Install directory resolved to: " + $InstallDir)
-
-# Derive key paths from the install directory
-$LocalCertsDir    = Join-Path $InstallDir $LocalCertsDirName
-$ConfigDir        = Join-Path $InstallDir $ConfigDirName
-$ConfigFile       = Join-Path $ConfigDir $ConfigFileName
-$LocalCertsConfig = Join-Path $LocalCertsDir $ConfigFileName
-
-Write-Log ("Configuration directory : " + $ConfigDir)
-Write-Log ("localcerts directory    : " + $LocalCertsDir)
-
-# ─── Step 2: Stop the service ─────────────────────────────────────────────────
-Write-Log "Stopping service: $ServiceName"
-try {
-    Stop-Service -Name $ServiceName -Force -ErrorAction Stop
-    Write-Log "Service stopped successfully."
-} catch {
-    Write-Log ("Failed to stop service: " + $_.Exception.Message) "ERROR"
-    exit 1
-}
-
-# ─── Step 3: Back up the install directory ────────────────────────────────────
-$dirName    = Split-Path -Leaf $InstallDir
-$parentDir  = Split-Path -Parent $InstallDir
-$timestamp  = Get-Date -Format "yyyyMMdd_HHmmss"
-$backupName = $dirName + "_" + $timestamp
-$backupPath = Join-Path $parentDir $backupName
-
-Write-Log ("Creating backup: " + $backupPath)
-try {
-    Copy-Item -Path $InstallDir -Destination $backupPath -Recurse -Force -ErrorAction Stop
-    Write-Log "Backup created successfully."
-} catch {
-    Write-Log ("Backup failed: " + $_.Exception.Message) "ERROR"
-    Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    exit 1
-}
-
-# ─── Step 4: Prune old backups (keep only the 2 most recent) ─────────────────
-Write-Log ("Pruning old backups (keeping " + $MaxBackups + " most recent)...")
-$escapedDirName  = [regex]::Escape($dirName)
-$backupPattern   = "^" + $escapedDirName + "_\d{8}_\d{6}$"
-$existingBackups = Get-ChildItem -Path $parentDir -Directory |
-    Where-Object { $_.Name -match $backupPattern } |
-    Sort-Object -Property Name -Descending
-
-if ($existingBackups.Count -gt $MaxBackups) {
-    $toDelete = $existingBackups | Select-Object -Skip $MaxBackups
-    foreach ($old in $toDelete) {
-        Write-Log ("Deleting old backup: " + $old.FullName)
-        Remove-Item -Path $old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    param(
+        [string]$Message,
+        [string]$Level = 'INFO',
+        [switch]$Spacer
+    )
+    if ($Spacer) {
+        Add-Content -Path $LogPath -Value ''
+        Write-Host ''
+        return
     }
-}
-
-# ─── Step 5: Uninstall current agent ─────────────────────────────────────────
-Write-Log "Uninstalling current OTSystemCenterAgent..."
-
-$uninstallRoots = @(
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-)
-
-$productCode = $null
-foreach ($root in $uninstallRoots) {
-    $found = Get-ChildItem -Path $root -ErrorAction SilentlyContinue |
-        Get-ItemProperty -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -match "OpenText.*SystemCenter.*Agent|OTSystemCenter" } |
-        Select-Object -First 1
-    if ($found) {
-        $productCode = $found.PSChildName
-        break
+    $color = switch ($Level) {
+        'OK'    { 'Green'  }
+        'WARN'  { 'Yellow' }
+        'ERROR' { 'Red'    }
+        'HEAD'  { 'Cyan'   }
+        default { 'White'  }
     }
+    $entry = "[$Level] - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+    Write-Host $entry -ForegroundColor $color
+    Add-Content -Path $LogPath -Value $entry
 }
+#endregion
 
-if ($productCode) {
-    Write-Log ("Found product code: " + $productCode + " - running uninstall...")
-    $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList ("/qn /x " + $productCode) -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        Write-Log ("Uninstall returned exit code " + $proc.ExitCode + ". Continuing anyway.") "WARN"
-    } else {
-        Write-Log "Uninstall completed successfully."
-    }
-} else {
-    Write-Log "No matching product found in registry. Skipping uninstall step." "WARN"
-}
+#region Service Helpers
+function Get-ResolvedServices {
+    # Dynamically resolve {INSTANCE} (Content Server) and {TOMCAT} service names
+    $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
 
-# ─── Step 6: Clear the install directory contents ────────────────────────────
-# The directory itself is preserved so INSTALLDIR points to the same path.
-# All files and subfolders inside are removed for a clean install.
-Write-Log ("Clearing install directory contents: " + $InstallDir)
-try {
-    Get-ChildItem -Path $InstallDir -Force |
-        Remove-Item -Recurse -Force -ErrorAction Stop
-    Write-Log "Install directory cleared successfully."
-} catch {
-    Write-Log ("Failed to clear install directory: " + $_.Exception.Message) "ERROR"
-    exit 1
-}
+    $csSvc = $allSvcs | Where-Object {
+        $_.Description -like '*Content Server*' -and
+        $_.Description -notlike '*Content Server Admin*'
+    } | Select-Object -First 1
 
-# ─── Step 7: Download and install the new agent ───────────────────────────────
-$installerPath = Join-Path $WorkDir $InstallerName
-$logPath       = Join-Path $WorkDir $LogName
+    $tomcatSvc = $allSvcs | Where-Object {
+        $_.DisplayName -like '*Apache*Tomcat*'
+    } | Select-Object -First 1
 
-Write-Log ("Downloading installer from " + $InstallerUrl + " ...")
-try {
-    $webClient = New-Object System.Net.WebClient
-    $webClient.DownloadFile($InstallerUrl, $installerPath)
-    Write-Log ("Download complete: " + $installerPath)
-} catch {
-    Write-Log ("Download failed: " + $_.Exception.Message) "ERROR"
-    exit 1
-}
+    $instanceName = if ($csSvc)     { $csSvc.Name }     else { $null }
+    $tomcatName   = if ($tomcatSvc) { $tomcatSvc.Name } else { $null }
 
-Write-Log ("Installing agent to: " + $InstallDir + " (log: " + $logPath + ") ...")
-$installArgs = "/qn /l*vx `"" + $logPath + "`" /i `"" + $installerPath + "`" INSTALLDIR=`"" + $InstallDir + "`" HTTP_PORT_NUMBER=`"" + $HttpPort + "`" SERVER_NAME=`"" + $ServerName + "`""
-$proc = Start-Process -FilePath "msiexec.exe" -ArgumentList $installArgs -WorkingDirectory $WorkDir -Wait -PassThru
+    if (-not $instanceName) { Write-Log "Content Server service not found — {INSTANCE} entries will be skipped." 'WARN' }
+    if (-not $tomcatName)   { Write-Log "Tomcat service not found — {TOMCAT} entry will be skipped."            'WARN' }
 
-if ($proc.ExitCode -ne 0) {
-    Write-Log ("Installation failed with exit code " + $proc.ExitCode + ". Check log: " + $logPath) "ERROR"
-    exit 1
-}
-Write-Log "Installation completed successfully."
-
-# ─── Step 8: Restore localcerts from backup ───────────────────────────────────
-# Source is the backup copy taken in Step 3, guaranteeing the pre-wipe content.
-$localCertsBackup = Join-Path $backupPath $LocalCertsDirName
-
-if (Test-Path -Path $localCertsBackup) {
-    Write-Log ("Restoring '" + $LocalCertsDirName + "' from backup to: " + $LocalCertsDir)
-    try {
-        Copy-Item -Path $localCertsBackup -Destination $LocalCertsDir -Recurse -Force -ErrorAction Stop
-        Write-Log ("'" + $LocalCertsDirName + "' restored successfully.")
-    } catch {
-        Write-Log ("Failed to restore '" + $LocalCertsDirName + "': " + $_.Exception.Message) "WARN"
-    }
-} else {
-    Write-Log ("'" + $LocalCertsDirName + "' not found in backup (" + $localCertsBackup + "). Skipping restore.") "WARN"
-}
-
-# ─── Step 9: Back up new install config.ini, then apply localcerts config.ini ─
-# The restored localcerts\config.ini is the authoritative config for this host.
-# Before overwriting, the installer-generated config.ini is preserved with a
-# timestamp so it can be referenced if needed.
-
-if (-not (Test-Path -Path $LocalCertsConfig)) {
-    Write-Log ("'" + $LocalCertsDirName + "\" + $ConfigFileName + "' not found at '" + $LocalCertsConfig + "'. Skipping config replacement.") "WARN"
-} elseif (-not (Test-Path -Path $ConfigDir)) {
-    Write-Log ("Configuration directory '" + $ConfigDir + "' does not exist in new install. Skipping config replacement.") "WARN"
-} else {
-    # Back up the installer-generated config.ini before overwriting
-    if (Test-Path -Path $ConfigFile) {
-        $configBackup = $ConfigFile + "_" + $timestamp + ".bak"
-        Write-Log ("Backing up new install " + $ConfigFileName + " to: " + $configBackup)
-        try {
-            Copy-Item -Path $ConfigFile -Destination $configBackup -Force -ErrorAction Stop
-            Write-Log ($ConfigFileName + " backed up successfully.")
-        } catch {
-            Write-Log ("Failed to back up " + $ConfigFileName + ": " + $_.Exception.Message) "WARN"
+    $resolved = $Config.ServiceOrder | ForEach-Object {
+        switch ($_) {
+            '{TOMCAT}'   { if ($tomcatName)   { $tomcatName } }
+            '{INSTANCE}' { if ($instanceName) { $instanceName } }
+            default      {
+                $_ -replace [regex]::Escape('{INSTANCE}'), ($instanceName ?? '')
+            }
         }
-    } else {
-        Write-Log ("No " + $ConfigFileName + " found in '" + $ConfigDir + "' - skipping backup, copying anyway.") "WARN"
-    }
+    } | Where-Object { $_ -and $_.Trim() -ne '' }
 
-    # Copy localcerts\config.ini into the configuration directory
-    Write-Log ("Copying '" + $LocalCertsDirName + "\" + $ConfigFileName + "' to: " + $ConfigFile)
+    return $resolved
+}
+
+function Wait-ServiceState {
+    param([string]$Name, [string]$TargetState, [int]$TimeoutSec, [string]$ActionLabel)
+    $svc     = Get-Service -Name $Name -ErrorAction Stop
+    $timeout = [TimeSpan]::FromSeconds($TimeoutSec)
     try {
-        Copy-Item -Path $LocalCertsConfig -Destination $ConfigFile -Force -ErrorAction Stop
-        Write-Log ($ConfigFileName + " replaced successfully.")
-    } catch {
-        Write-Log ("Failed to copy " + $ConfigFileName + " from '" + $LocalCertsDirName + "': " + $_.Exception.Message) "ERROR"
-        exit 1
+        $svc.WaitForStatus($TargetState, $timeout)
+        Write-Log "Service '$Name' $ActionLabel." 'OK'
+    }
+    catch [System.ServiceProcess.TimeoutException] {
+        throw "Timed out waiting for '$Name' to reach '$TargetState' after ${TimeoutSec}s."
     }
 }
 
-# ─── Step 10: Start the service ──────────────────────────────────────────────
-Write-Log "Starting service: $ServiceName"
-try {
-    Start-Service -Name $ServiceName -ErrorAction Stop
-    Write-Log "Service started successfully."
-} catch {
-    Write-Log ("Failed to start service: " + $_.Exception.Message) "ERROR"
-    exit 1
+function Stop-Services {
+    param([string[]]$Names)
+    $stopped = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in $Names) {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Write-Log "Service '$name' not found — skipping." 'WARN'
+            continue
+        }
+        if ($svc.Status -eq 'Running') {
+            Write-Log "Stopping '$name'..."
+            Stop-Service -Name $name -Force -ErrorAction Stop
+            Wait-ServiceState -Name $name -TargetState 'Stopped' `
+                -TimeoutSec $Config.StopTimeoutSec -ActionLabel 'stopped'
+            $stopped.Add($name)
+        } else {
+            Write-Log "Service '$name' already stopped." 'WARN'
+        }
+    }
+    return ,$stopped   # return as array
 }
 
-Write-Log "OTSystemCenterAgent update complete."
+function Start-Services {
+    param([string[]]$Names)
+    # Restart in reverse order
+    $reversed = [System.Linq.Enumerable]::Reverse($Names)
+    foreach ($name in $reversed) {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Write-Log "Service '$name' not found during restart — skipping." 'WARN'
+            continue
+        }
+        try {
+            Write-Log "Starting '$name'..."
+            Start-Service -Name $name -ErrorAction Stop
+            Wait-ServiceState -Name $name -TargetState 'Running' `
+                -TimeoutSec $Config.StartTimeoutSec -ActionLabel 'started'
+        }
+        catch {
+            Write-Log "ERROR starting '$name': $_" 'ERROR'
+        }
+    }
+}
+#endregion
+
+#region Main
+$startTime = Get-Date
+Write-Log "================ SYSTEM CENTER AGENT UPDATE STARTED ================" 'HEAD'
+Write-Log "Host      : $env:COMPUTERNAME"
+Write-Log "Started   : $($startTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-Log "Log       : $LogPath"
+Write-Log -Spacer
+
+$stoppedServices = @()
+
+try {
+
+    # -------------------------------------------------------------------------
+    # Pre-flight: verify install directory exists
+    # -------------------------------------------------------------------------
+    if (-not (Test-Path $Config.InstallDir)) {
+        throw "Install directory not found: $($Config.InstallDir)"
+    }
+    Write-Log "Install dir found: $($Config.InstallDir)" 'OK'
+    Write-Log -Spacer
+
+    # -------------------------------------------------------------------------
+    # Pre-flight: download MSI from internal patch server
+    # -------------------------------------------------------------------------
+    Write-Log "Pre-flight: Downloading MSI from internal patch server..." 'HEAD'
+    $msiTemp = Join-Path $env:TEMP "SCA_download_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    New-Item -ItemType Directory -Path $msiTemp -Force | Out-Null
+    $msiPath = Join-Path $msiTemp $Config.MsiName
+
+    Write-Log "Source : $($Config.MsiUrl)"
+    Write-Log "Dest   : $msiPath"
+    try {
+        (New-Object System.Net.WebClient).DownloadFile($Config.MsiUrl, $msiPath)
+    }
+    catch {
+        throw "MSI download failed: $_"
+    }
+    if (-not (Test-Path $msiPath) -or (Get-Item $msiPath).Length -eq 0) {
+        throw "Downloaded MSI is missing or empty: $msiPath"
+    }
+    Write-Log "MSI downloaded successfully ($([math]::Round((Get-Item $msiPath).Length / 1MB, 2)) MB)." 'OK'
+    Write-Log -Spacer
+
+    # -------------------------------------------------------------------------
+    # Phase 1 — Discover and stop services
+    # -------------------------------------------------------------------------
+    Write-Log "Phase 1: Stopping services..." 'HEAD'
+    $serviceNames    = Get-ResolvedServices
+    Write-Log "Service order: $($serviceNames -join ' -> ')"
+    $stoppedServices = Stop-Services -Names $serviceNames
+    Write-Log "All target services stopped." 'OK'
+    Write-Log -Spacer
+
+    # -------------------------------------------------------------------------
+    # Phase 2 — Backup install directory
+    # -------------------------------------------------------------------------
+    Write-Log "Phase 2: Backing up install directory..." 'HEAD'
+    $backupDir  = Split-Path $Config.InstallDir -Parent
+    $backupName = "$(Split-Path $Config.InstallDir -Leaf)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+    $backupPath = Join-Path $backupDir $backupName
+
+    Write-Log "Compressing '$($Config.InstallDir)' -> '$backupPath'..."
+    Compress-Archive -Path $Config.InstallDir -DestinationPath $backupPath -Force
+    Write-Log "Backup created: $backupPath" 'OK'
+    Write-Log -Spacer
+
+    # -------------------------------------------------------------------------
+    # Phase 3 — Uninstall current agent
+    # -------------------------------------------------------------------------
+    Write-Log "Phase 3: Uninstalling current agent..." 'HEAD'
+
+    # Find the installed product by name to get its ProductCode
+    $installed = Get-CimInstance -ClassName Win32_Product |
+                 Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
+                 Select-Object -First 1
+
+    if ($installed) {
+        Write-Log "Found installed product: '$($installed.Name)'  Code: $($installed.IdentifyingNumber)"
+        $uninstallLog = Join-Path $Config.LogDir "sc_agent_uninstall_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+        $uninstallArgs = "/qn /l*vx `"$uninstallLog`" /x `"$($installed.IdentifyingNumber)`""
+        Write-Log "Running: msiexec.exe $uninstallArgs"
+        $proc = Start-Process 'msiexec.exe' -ArgumentList $uninstallArgs -Wait -PassThru
+        if ($proc.ExitCode -ne 0) {
+            throw "Uninstall failed with exit code $($proc.ExitCode). See: $uninstallLog"
+        }
+        Write-Log "Uninstall completed (exit 0)." 'OK'
+    } else {
+        Write-Log "No matching installed product found via Win32_Product — skipping MSI uninstall." 'WARN'
+        Write-Log "If the agent was installed another way, manual uninstall may be required." 'WARN'
+    }
+    Write-Log -Spacer
+
+    # -------------------------------------------------------------------------
+    # Phase 4 — Empty the install directory
+    # -------------------------------------------------------------------------
+    Write-Log "Phase 4: Emptying install directory..." 'HEAD'
+    Get-ChildItem -Path $Config.InstallDir -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop
+            Write-Log "  Removed: $($_.Name)"
+        }
+    Write-Log "Install directory emptied." 'OK'
+    Write-Log -Spacer
+
+    # -------------------------------------------------------------------------
+    # Phase 5 — Install new agent from staged MSI
+    # -------------------------------------------------------------------------
+    Write-Log "Phase 5: Installing new agent..." 'HEAD'
+    $installLog  = Join-Path $Config.LogDir "sc_agent_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    $installArgs = "/qn /l*vx `"$installLog`" /i `"$msiPath`" " +
+                   "HTTP_PORT_NUMBER=`"$($Config.HttpPort)`" " +
+                   "SERVER_NAME=`"$($Config.ServerName)`" " +
+                   "INSTALLDIR=`"$($Config.MsiInstallDir)`""
+
+    Write-Log "Running: msiexec.exe $installArgs"
+    $proc = Start-Process 'msiexec.exe' -ArgumentList $installArgs -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+        throw "Install failed with exit code $($proc.ExitCode). See: $installLog"
+    }
+    Write-Log "Install completed (exit 0)." 'OK'
+    Write-Log "Install log: $installLog"
+    Write-Log -Spacer
+
+    # -------------------------------------------------------------------------
+    # Phase 6 — Restore configuration.conf.ini from backup zip
+    # -------------------------------------------------------------------------
+    Write-Log "Phase 6: Restoring '$($Config.RestoreFile)' from backup..." 'HEAD'
+
+    # Extract only the target file from the zip into a temp folder, then move it
+    $tempExtract = Join-Path $env:TEMP "SCA_restore_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($backupPath)
+    try {
+        # Match the file anywhere inside the zip (handles nested paths)
+        $entry = $zip.Entries | Where-Object {
+            $_.Name -ieq $Config.RestoreFile
+        } | Select-Object -First 1
+
+        if (-not $entry) {
+            throw "'$($Config.RestoreFile)' not found inside backup zip: $backupPath"
+        }
+
+        $extractDest = Join-Path $tempExtract $Config.RestoreFile
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $extractDest, $true)
+    }
+    finally {
+        $zip.Dispose()
+    }
+
+    $restoreDest = Join-Path $Config.InstallDir $Config.RestoreFile
+    Move-Item -Path (Join-Path $tempExtract $Config.RestoreFile) -Destination $restoreDest -Force
+    Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+
+    Write-Log "Restored '$($Config.RestoreFile)' -> '$restoreDest'" 'OK'
+    Write-Log -Spacer
+
+    # -------------------------------------------------------------------------
+    # Phase 7 — Copy conf.ini from localhost folder to install root
+    # -------------------------------------------------------------------------
+    Write-Log "Phase 7: Copying '$($Config.CopyFile)' from localhost folder..." 'HEAD'
+
+    $confSource = Join-Path $Config.LocalhostDir "configuration\$($Config.CopyFile)"
+    $confDest   = Join-Path $Config.InstallDir   $Config.CopyFile
+
+    if (-not (Test-Path $confSource)) {
+        throw "'$($Config.CopyFile)' not found at expected source: $confSource"
+    }
+
+    Copy-Item -Path $confSource -Destination $confDest -Force
+    Write-Log "Copied '$confSource' -> '$confDest'" 'OK'
+    Write-Log -Spacer
+
+}
+catch {
+    Write-Log "FATAL ERROR: $_" 'ERROR'
+    Write-Log "Update aborted. Services will still be restarted if they were stopped." 'ERROR'
+    Write-Log -Spacer
+}
+finally {
+
+    # -------------------------------------------------------------------------
+    # Phase 8 — Restart services (always runs, even on error)
+    # -------------------------------------------------------------------------
+    Write-Log "Phase 8: Restarting services..." 'HEAD'
+    if ($stoppedServices.Count -gt 0) {
+        Start-Services -Names $stoppedServices
+    } else {
+        Write-Log "No services were recorded as stopped — nothing to restart." 'WARN'
+    }
+
+    # Clean up downloaded MSI temp folder
+    if ($msiTemp -and (Test-Path $msiTemp)) {
+        Remove-Item $msiTemp -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "Temp MSI folder removed." 'OK'
+    }
+
+    $endTime = Get-Date
+    $dur     = $endTime - $startTime
+    Write-Log -Spacer
+    Write-Log "========================================" 'HEAD'
+    Write-Log "Completed : $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))" 'HEAD'
+    Write-Log "Duration  : $($dur.ToString('mm\:ss'))" 'HEAD'
+    Write-Log "========================================" 'HEAD'
+    Write-Log "Log saved : $LogPath" 'OK'
+    Write-Log "================ SYSTEM CENTER AGENT UPDATE FINISHED ================" 'HEAD'
+}
+#endregion
