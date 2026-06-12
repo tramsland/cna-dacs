@@ -22,7 +22,7 @@
 #     ├── servers.txt          <- one FQDN per line; [Zone Name] headers optional
 #     └── NewVersion\          <- new Tomcat build files staged here
 #
-#   STAGE operation copies to \\server\e$\DLA-failsafe\patching\ on each server:
+#   STAGE operation copies to \\server\c$\DLA-failsafe\patching\ on each server:
 #     - CNA-DACS.ps1
 #     - NewVersion\  (full folder, overwrite)
 #
@@ -30,7 +30,7 @@
 #     - PowerShell 5.1
 #     - Run as Administrator
 #     - Network access to patch.dacs.dla.mil (System Center agent download)
-#     - Admin share access (\\server\e$) for Stage operation
+#     - Admin share access (\\server\c$) for Stage operation
 #
 #==================================================================================
 
@@ -87,7 +87,7 @@ $TomcatConfig = [pscustomobject]@{
 
 # ---- Stage ----
 $StageConfig = [pscustomobject]@{
-    RemoteBase = "e$\DLA-failsafe\patching"
+    RemoteBase = "c$\DLA-failsafe\patching"
     Items      = @(
         [pscustomobject]@{ Label = 'Launcher script';  RelPath = $ScriptName;   Type = 'File'   }
         [pscustomobject]@{ Label = 'NewVersion folder'; RelPath = 'NewVersion'; Type = 'Folder' }
@@ -1166,16 +1166,16 @@ function Invoke-StageSoftware {
 
         # Reachability check (admin share)
         try {
-            if (-not (Test-Path "\\$server\e$" -ErrorAction Stop)) {
-                Write-StageError -Server $server -Item 'e$ share' `
-                    -Message "Cannot reach \\$server\e$ - server skipped."
+            if (-not (Test-Path "\\$server\c$" -ErrorAction Stop)) {
+                Write-StageError -Server $server -Item 'c$ share' `
+                    -Message "Cannot reach \\$server\c$ - server skipped."
                 $fail++
                 continue
             }
         }
         catch {
-            Write-StageError -Server $server -Item 'e$ share' `
-                -Message "Access error on \\$server\e$ : $($_.Exception.Message)"
+            Write-StageError -Server $server -Item 'c$ share' `
+                -Message "Access error on \\$server\c$ : $($_.Exception.Message)"
             $fail++
             continue
         }
@@ -1379,7 +1379,7 @@ function Show-Menu {
     $stageStatus = if ($nvReady -and $svReady) { '[READY]   ' } else { '[PARTIAL] ' }
     $stageColor  = if ($nvReady -and $svReady) { 'Cyan'       } else { 'Yellow'     }
     Write-Host ("  [S] {0}  Stage software to all servers  (copies: {1} + NewVersion\)" -f $stageStatus, $ScriptName) -ForegroundColor $stageColor
-    Write-Host "         Dest: \\<FQDN from servers.txt>\e`$\DLA-failsafe\patching\" -ForegroundColor DarkGray
+    Write-Host "         Dest: \\<FQDN from servers.txt>\c`$\DLA-failsafe\patching\" -ForegroundColor DarkGray
 
     Write-Host ''
     Write-Host '  [A]  Run ALL (1, 2, 3) in sequence' -ForegroundColor Magenta
