@@ -418,6 +418,38 @@ function Invoke-SystemCenterUpdate {
     Write-Header "Operation 2: System Center Agent Update"
     Write-Log "Log: $($script:_ActiveLog)" 'INFO' 'Gray'
 
+    function Get-SCAgentInstallDir {
+        # Resolve the agent install directory from the service's executable path.
+        # Falls back to $SCConfig.InstallDir if the service is missing or its path is invalid.
+        $svc = Get-CimInstance -ClassName Win32_Service `
+               -Filter "Name='OTSystemCenterAgent'" -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            # Broader match in case the service name differs slightly between versions
+            $svc = Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -like '*SystemCenterAgent*' -or
+                                  $_.DisplayName -like '*System Center*Agent*' } |
+                   Select-Object -First 1
+        }
+        if ($svc -and $svc.PathName) {
+            # Strip quotes and arguments to get the bare exe path
+            $exe = $svc.PathName -replace '^"([^"]+)".*$','$1' `
+                                 -replace '^([^\s]+\.exe).*$','$1'
+            $dir = Split-Path $exe -Parent
+            # If the exe lives in a bin\ subfolder, the install root is one level up
+            if ((Split-Path $dir -Leaf) -ieq 'bin') { $dir = Split-Path $dir -Parent }
+            if (Test-Path $dir -PathType Container) {
+                Write-Log "Resolved agent install dir from service '$($svc.Name)': $dir" 'OK' 'Green'
+                return $dir
+            }
+            Write-Log "Service path '$dir' does not exist on disk — using configured fallback." 'WARN' 'Yellow'
+        }
+        else {
+            Write-Log "SC Agent service not found — using configured fallback path." 'WARN' 'Yellow'
+        }
+        Write-Log "Fallback install dir: $($SCConfig.InstallDir)" 'INFO' 'Gray'
+        return $SCConfig.InstallDir
+    }
+
     function Get-ResolvedSCServices {
         $allSvcs   = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
         $csSvc     = $allSvcs | Where-Object {
@@ -481,8 +513,13 @@ function Invoke-SystemCenterUpdate {
         }
     }
 
-    if (-not (Test-Path $SCConfig.InstallDir)) {
-        Write-Log "Install directory not found: $($SCConfig.InstallDir)" 'ERROR' 'Red'
+    # Resolve install path from the running service (must happen BEFORE services are stopped,
+    # while the service registration is guaranteed present)
+    $agentDir     = Get-SCAgentInstallDir
+    $localhostDir = Join-Path $agentDir 'localhost'
+
+    if (-not (Test-Path $agentDir)) {
+        Write-Log "Install directory not found: $agentDir" 'ERROR' 'Red'
         return
     }
 
@@ -500,10 +537,10 @@ function Invoke-SystemCenterUpdate {
 
         # Phase 2 — Backup install directory
         Write-Log "Phase 2: Backing up install directory..." 'INFO' 'Yellow'
-        $backupDir  = Split-Path $SCConfig.InstallDir -Parent
-        $backupName = "$(Split-Path $SCConfig.InstallDir -Leaf)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+        $backupDir  = Split-Path $agentDir -Parent
+        $backupName = "$(Split-Path $agentDir -Leaf)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
         $backupPath = Join-Path $backupDir $backupName
-        Compress-Archive -Path $SCConfig.InstallDir -DestinationPath $backupPath -Force
+        Compress-Archive -Path $agentDir -DestinationPath $backupPath -Force
         Write-Log "Backup created: $backupPath" 'OK' 'Green'
         Write-Log -Spacer
 
@@ -545,7 +582,7 @@ function Invoke-SystemCenterUpdate {
 
         # Phase 5 — Empty install directory
         Write-Log "Phase 5: Emptying install directory..." 'INFO' 'Yellow'
-        Get-ChildItem -Path $SCConfig.InstallDir -Force -ErrorAction SilentlyContinue |
+        Get-ChildItem -Path $agentDir -Force -ErrorAction SilentlyContinue |
             ForEach-Object {
                 Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop
                 Write-Log "  Removed: $($_.Name)" 'INFO' 'Gray'
@@ -559,7 +596,7 @@ function Invoke-SystemCenterUpdate {
         $installArgs = "/qn /l*vx `"$installLog`" /i `"$msiPath`" " +
                        "HTTP_PORT_NUMBER=`"$($SCConfig.HttpPort)`" " +
                        "SERVER_NAME=`"$($SCConfig.ServerName)`" " +
-                       "INSTALLDIR=`"$($SCConfig.MsiInstallDir)`""
+                       "INSTALLDIR=`"$agentDir`""
         $proc = Start-Process 'msiexec.exe' -ArgumentList $installArgs -Wait -PassThru
         if ($proc.ExitCode -ne 0) { throw "Install failed (exit $($proc.ExitCode)). See: $installLog" }
         Write-Log "Install complete. Log: $installLog" 'OK' 'Green'
@@ -583,15 +620,15 @@ function Invoke-SystemCenterUpdate {
         }
         finally { $zip.Dispose() }
         Move-Item -Path (Join-Path $tempExtract $SCConfig.RestoreFile) `
-                  -Destination (Join-Path $SCConfig.InstallDir $SCConfig.RestoreFile) -Force
+                  -Destination (Join-Path $agentDir $SCConfig.RestoreFile) -Force
         Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
         Write-Log "Restored '$($SCConfig.RestoreFile)' to install root." 'OK' 'Green'
         Write-Log -Spacer
 
         # Phase 8 — Copy conf.ini from localhost\configuration\
         Write-Log "Phase 8: Copying '$($SCConfig.CopyFile)' from localhost folder..." 'INFO' 'Yellow'
-        $confSource = Join-Path $SCConfig.LocalhostDir "configuration\$($SCConfig.CopyFile)"
-        $confDest   = Join-Path $SCConfig.InstallDir $SCConfig.CopyFile
+        $confSource = Join-Path $localhostDir "configuration\$($SCConfig.CopyFile)"
+        $confDest   = Join-Path $agentDir $SCConfig.CopyFile
         if (-not (Test-Path $confSource)) { throw "'$($SCConfig.CopyFile)' not found at: $confSource" }
         Copy-Item -Path $confSource -Destination $confDest -Force
         Write-Log "Copied '$confSource' -> '$confDest'" 'OK' 'Green'
