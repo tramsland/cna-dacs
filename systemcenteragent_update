@@ -64,12 +64,10 @@ $BackupConfig = [pscustomobject]@{
 $SCConfig = [pscustomobject]@{
     InstallDir      = 'E:\Customers\dacs\shared\systemcenteragent'
     LocalhostDir    = 'E:\Customers\dacs\shared\systemcenteragent\localhost'
-    MsiInstallDir   = 'E:\Customers\Shared\DACS\SystemCenter'
     ServerName      = 'patch.dacs.dla.mil'
     HttpPort        = '443'
     MsiUrl          = 'https://patch.dacs.dla.mil/downloadAgent/?ostype=win&filetype=installer'
     MsiName         = 'OpenText_SystemCenter_Agent.msi'
-    RestoreFile     = 'configuration.conf.ini'
     CopyFile        = 'conf.ini'
     StopTimeoutSec  = 60
     StartTimeoutSec = 60
@@ -602,34 +600,35 @@ function Invoke-SystemCenterUpdate {
         Write-Log "Install complete. Log: $installLog" 'OK' 'Green'
         Write-Log -Spacer
 
-        # Phase 7 — Restore configuration.conf.ini from backup zip
-        Write-Log "Phase 7: Restoring '$($SCConfig.RestoreFile)' from backup..." 'INFO' 'Yellow'
+        # Phase 7 — Restore the 'localhost' folder from the backup zip
+        Write-Log "Phase 7: Restoring 'localhost' folder from backup..." 'INFO' 'Yellow'
         $tempExtract = Join-Path $env:TEMP "SCA_restore_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($backupPath)
-        try {
-            $zipEntry = $zip.Entries | Where-Object { $_.Name -ieq $SCConfig.RestoreFile } |
-                        Select-Object -First 1
-            if (-not $zipEntry) { throw "'$($SCConfig.RestoreFile)' not found in backup zip." }
-            [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
-                $zipEntry,
-                (Join-Path $tempExtract $SCConfig.RestoreFile),
-                $true
-            )
+        Expand-Archive -Path $backupPath -DestinationPath $tempExtract -Force
+
+        # The backup roots the archive at the install-dir leaf (e.g. systemcenteragent\localhost),
+        # so locate the 'localhost' folder wherever it sits in the extracted tree.
+        $restoredLocalhost = Get-ChildItem -Path $tempExtract -Directory -Recurse -Filter 'localhost' |
+                             Select-Object -First 1
+        if (-not $restoredLocalhost) {
+            throw "'localhost' folder not found in backup zip: $backupPath"
         }
-        finally { $zip.Dispose() }
-        Move-Item -Path (Join-Path $tempExtract $SCConfig.RestoreFile) `
-                  -Destination (Join-Path $agentDir $SCConfig.RestoreFile) -Force
+        if (Test-Path $localhostDir) { Remove-Item $localhostDir -Recurse -Force }
+        Copy-Item -Path $restoredLocalhost.FullName -Destination $agentDir -Recurse -Force
         Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Log "Restored '$($SCConfig.RestoreFile)' to install root." 'OK' 'Green'
+        Write-Log "Restored 'localhost' folder to: $localhostDir" 'OK' 'Green'
         Write-Log -Spacer
 
-        # Phase 8 — Copy conf.ini from localhost\configuration\
-        Write-Log "Phase 8: Copying '$($SCConfig.CopyFile)' from localhost folder..." 'INFO' 'Yellow'
-        $confSource = Join-Path $localhostDir "configuration\$($SCConfig.CopyFile)"
-        $confDest   = Join-Path $agentDir $SCConfig.CopyFile
+        # Phase 8 — Copy localhost\conf.ini into the configuration directory
+        Write-Log "Phase 8: Copying '$($SCConfig.CopyFile)' into configuration directory..." 'INFO' 'Yellow'
+        $confSource  = Join-Path $localhostDir $SCConfig.CopyFile
+        $confDestDir = Join-Path $agentDir 'configuration'
+        $confDest    = Join-Path $confDestDir $SCConfig.CopyFile
         if (-not (Test-Path $confSource)) { throw "'$($SCConfig.CopyFile)' not found at: $confSource" }
+        if (-not (Test-Path $confDestDir)) {
+            New-Item -ItemType Directory -Path $confDestDir -Force | Out-Null
+            Write-Log "Created configuration directory: $confDestDir" 'INFO' 'Gray'
+        }
         Copy-Item -Path $confSource -Destination $confDest -Force
         Write-Log "Copied '$confSource' -> '$confDest'" 'OK' 'Green'
         Write-Log -Spacer
@@ -1275,14 +1274,21 @@ function Get-InstalledVersions {
         if (Test-Path $versionBat) {
             try {
                 $output = & cmd.exe /c "`"$versionBat`" 2>&1"
-                $vLine  = $output | Select-String -Pattern 'Server version\s*:\s*Apache Tomcat/(\S+)' |
+                # Preferred: "Server version: Apache Tomcat/10.1.34"
+                $vLine  = $output | Select-String -Pattern 'Server version\s*:\s*Apache Tomcat/(\d+\.\d+\.\d+)' |
                           Select-Object -First 1
                 if ($vLine) {
                     $script:TomcatInstalledVersion = $vLine.Matches[0].Groups[1].Value
                 } else {
-                    # Fallback: any version pattern in output
-                    $vLine2 = $output | Select-String -Pattern '(\d+\.\d+\.\d+)' | Select-Object -First 1
-                    if ($vLine2) { $script:TomcatInstalledVersion = $vLine2.Matches[0].Groups[1].Value }
+                    # Fallback: "Server number: 10.1.34.0" — capture only the 3-part release,
+                    # dropping the trailing build segment so we don't report the build number.
+                    $vLine2 = $output | Select-String -Pattern 'Server number\s*:\s*(\d+\.\d+\.\d+)' |
+                              Select-Object -First 1
+                    if ($vLine2) {
+                        $script:TomcatInstalledVersion = $vLine2.Matches[0].Groups[1].Value
+                    } else {
+                        $script:TomcatInstalledVersion = 'Detected (version unparsed)'
+                    }
                 }
                 $script:TomcatInstallPath = $candidate
                 break
