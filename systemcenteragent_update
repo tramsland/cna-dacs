@@ -207,9 +207,10 @@ function Invoke-Backup {
 
     # Discovery scriptblock — runs remotely; no closures over local vars
     # Returns one result object per Content Server instance found on the host.
+    # Uses plain PS arrays (not generic Lists) so WinRM serialization round-trips cleanly.
     $discoverScript = {
-        $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
-        $errors  = New-Object 'System.Collections.Generic.List[string]'
+        $results = @()
+        $errors  = @()
         try {
             $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
 
@@ -220,17 +221,17 @@ function Invoke-Backup {
             })
 
             if ($csSvcs.Count -eq 0) {
-                $errors.Add("WARNING: No Content Server services found.")
+                $errors += "WARNING: No Content Server services found."
             }
 
             $tomcatSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } |
                          Select-Object -First 1
             $tomcatName = if ($tomcatSvc) { $tomcatSvc.Name } else { $null }
-            if (-not $tomcatName) { $errors.Add("WARNING: No Tomcat service found.") }
+            if (-not $tomcatName) { $errors += "WARNING: No Tomcat service found." }
 
             foreach ($csSvc in $csSvcs) {
-                $csDir = $null
-                $instErrors = New-Object 'System.Collections.Generic.List[string]'
+                $csDir      = $null
+                $instErrors = @()
                 if ($csSvc.PathName) {
                     $exePath = $csSvc.PathName -replace '^"([^"]+)".*$','$1' `
                                                -replace '^([^\s]+\.exe).*$','$1'
@@ -243,24 +244,26 @@ function Invoke-Backup {
                         if ($parent -eq $dir) { break }
                         $dir = $parent
                     }
-                    if (-not $csDir) { $instErrors.Add("WARNING: Could not locate 'contentserver' directory for '$($csSvc.Name)'.") }
-                } else { $instErrors.Add("WARNING: Service '$($csSvc.Name)' has no PathName.") }
+                    if (-not $csDir) { $instErrors += "WARNING: Could not locate 'contentserver' directory for '$($csSvc.Name)'." }
+                } else { $instErrors += "WARNING: Service '$($csSvc.Name)' has no PathName." }
 
-                $results.Add([pscustomobject]@{
+                $results += [pscustomobject]@{
                     InstanceName      = $csSvc.Name
                     TomcatServiceName = $tomcatName
                     ContentServerDir  = $csDir
                     Errors            = $instErrors
-                })
+                }
             }
         }
-        catch { $errors.Add("ERROR during discovery: $_") }
+        catch { $errors += "ERROR during discovery: $_" }
 
-        # Return a wrapper so the caller can read both the instance list and any server-level errors
-        return [pscustomobject]@{
+        # Force return as a single object — the comma operator prevents PS from enumerating
+        # the Instances array onto the pipeline, which would break the caller's .Instances access.
+        $wrapper = [pscustomobject]@{
             Instances = $results
             Errors    = $errors
         }
+        return ,$wrapper
     }
 
     # Compression scriptblock — runs remotely
@@ -352,11 +355,9 @@ function Invoke-Backup {
             }
             catch {
                 Write-Log "  ${fqdn}: Discovery FAILED - $_" 'ERROR' 'Red'
-                $errList  = New-Object 'System.Collections.Generic.List[string]'
-                $errList.Add("Discovery failed: $_")
                 $discoveryResults[$fqdn] = [pscustomobject]@{
-                    Instances = (New-Object 'System.Collections.Generic.List[pscustomobject]')
-                    Errors    = $errList
+                    Instances = @()
+                    Errors    = @("Discovery failed: $_")
                 }
             }
         }
