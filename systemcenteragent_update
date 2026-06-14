@@ -62,16 +62,21 @@ $BackupConfig = [pscustomobject]@{
 
 # ---- System Center Agent ----
 $SCConfig = [pscustomobject]@{
-    InstallDir      = 'E:\Customers\dacs\shared\systemcenteragent'
-    LocalhostDir    = 'E:\Customers\dacs\shared\systemcenteragent\localhost'
+    InstallDir      = 'E:\Customers\Shared\DACS\SystemCenter'
+    LocalcertsDir   = 'E:\Customers\Shared\DACS\SystemCenter\localcerts'
     ServerName      = 'patch.dacs.dla.mil'
     HttpPort        = '443'
     MsiUrl          = 'https://patch.dacs.dla.mil/downloadAgent/?ostype=win&filetype=installer'
     MsiName         = 'OpenText_SystemCenter_Agent.msi'
-    CopyFile        = 'conf.ini'
     StopTimeoutSec  = 60
     StartTimeoutSec = 60
     ServiceOrder    = @('OTSystemCenterAgent', '{TOMCAT}', '{INSTANCE}Admin', '{INSTANCE}')
+    ConfIniContent  = @'
+log.level=INFO
+com.opentext.sc.agent.server_uri=patch.dacs.dla.mil:443/otsc-server/v1/agentwebsocket
+javax.net.ssl.trustStore=E:/Customers/Shared/DACS/SystemCenter/localcerts/cacerts
+log.file=E:/Customers/Shared/DACS/SystemCenter/logs/otsc.log
+'@
 }
 
 # ---- Tomcat Upgrade ----
@@ -201,27 +206,35 @@ function Invoke-Backup {
     Write-Log "Servers: $totalEntries across $($serverGroups.Keys.Count) zone(s)" 'INFO' 'Gray'
 
     # Discovery scriptblock — runs remotely; no closures over local vars
+    # Returns one result object per Content Server instance found on the host.
     $discoverScript = {
-        $result = [pscustomobject]@{
-            InstanceName      = $null
-            TomcatServiceName = $null
-            ContentServerDir  = $null
-            Errors            = New-Object 'System.Collections.Generic.List[string]'
-        }
+        $results = New-Object 'System.Collections.Generic.List[pscustomobject]'
+        $errors  = New-Object 'System.Collections.Generic.List[string]'
         try {
             $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
-            $csSvc   = $allSvcs | Where-Object {
+
+            # Collect ALL Content Server services (exclude Admin helpers)
+            $csSvcs = @($allSvcs | Where-Object {
                 $_.Description -like '*Content Server*' -and
                 $_.Description -notlike '*Content Server Admin*'
-            } | Select-Object -First 1
+            })
 
-            if ($csSvc) {
-                $result.InstanceName = $csSvc.Name
+            if ($csSvcs.Count -eq 0) {
+                $errors.Add("WARNING: No Content Server services found.")
+            }
+
+            $tomcatSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } |
+                         Select-Object -First 1
+            $tomcatName = if ($tomcatSvc) { $tomcatSvc.Name } else { $null }
+            if (-not $tomcatName) { $errors.Add("WARNING: No Tomcat service found.") }
+
+            foreach ($csSvc in $csSvcs) {
+                $csDir = $null
+                $instErrors = New-Object 'System.Collections.Generic.List[string]'
                 if ($csSvc.PathName) {
                     $exePath = $csSvc.PathName -replace '^"([^"]+)".*$','$1' `
                                                -replace '^([^\s]+\.exe).*$','$1'
-                    $dir   = Split-Path $exePath -Parent
-                    $csDir = $null
+                    $dir = Split-Path $exePath -Parent
                     for ($i = 0; $i -lt 6; $i++) {
                         if ([IO.Path]::GetFileName($dir) -ieq 'contentserver') { $csDir = $dir; break }
                         $candidate = Join-Path $dir 'contentserver'
@@ -230,18 +243,24 @@ function Invoke-Backup {
                         if ($parent -eq $dir) { break }
                         $dir = $parent
                     }
-                    if ($csDir) { $result.ContentServerDir = $csDir }
-                    else { $result.Errors.Add("WARNING: Could not locate 'contentserver' directory.") }
-                } else { $result.Errors.Add("WARNING: Content Server service has no PathName.") }
-            } else { $result.Errors.Add("WARNING: No Content Server service found.") }
+                    if (-not $csDir) { $instErrors.Add("WARNING: Could not locate 'contentserver' directory for '$($csSvc.Name)'.") }
+                } else { $instErrors.Add("WARNING: Service '$($csSvc.Name)' has no PathName.") }
 
-            $tomcatSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } |
-                         Select-Object -First 1
-            if ($tomcatSvc) { $result.TomcatServiceName = $tomcatSvc.Name }
-            else { $result.Errors.Add("WARNING: No Tomcat service found.") }
+                $results.Add([pscustomobject]@{
+                    InstanceName      = $csSvc.Name
+                    TomcatServiceName = $tomcatName
+                    ContentServerDir  = $csDir
+                    Errors            = $instErrors
+                })
+            }
         }
-        catch { $result.Errors.Add("ERROR during discovery: $_") }
-        return $result
+        catch { $errors.Add("ERROR during discovery: $_") }
+
+        # Return a wrapper so the caller can read both the instance list and any server-level errors
+        return [pscustomobject]@{
+            Instances = $results
+            Errors    = $errors
+        }
     }
 
     # Compression scriptblock — runs remotely
@@ -322,15 +341,22 @@ function Invoke-Backup {
                 $disc = Invoke-Command -ComputerName $fqdn -ScriptBlock $discoverScript -ErrorAction Stop
                 $discoveryResults[$fqdn] = $disc
                 $disc.Errors | ForEach-Object { Write-Log "  ${fqdn}: $_" 'WARN' 'Yellow' }
-                Write-Log "  ${fqdn}: Instance='$($disc.InstanceName)' Tomcat='$($disc.TomcatServiceName)' CSDir='$($disc.ContentServerDir)'" 'INFO' 'Gray'
+                if ($disc.Instances.Count -eq 0) {
+                    Write-Log "  ${fqdn}: No Content Server instances found." 'WARN' 'Yellow'
+                } else {
+                    foreach ($inst in $disc.Instances) {
+                        $inst.Errors | ForEach-Object { Write-Log "  ${fqdn}: $_" 'WARN' 'Yellow' }
+                        Write-Log "  ${fqdn}: Instance='$($inst.InstanceName)' Tomcat='$($inst.TomcatServiceName)' CSDir='$($inst.ContentServerDir)'" 'INFO' 'Gray'
+                    }
+                }
             }
             catch {
                 Write-Log "  ${fqdn}: Discovery FAILED - $_" 'ERROR' 'Red'
-                $errList = New-Object 'System.Collections.Generic.List[string]'
+                $errList  = New-Object 'System.Collections.Generic.List[string]'
                 $errList.Add("Discovery failed: $_")
                 $discoveryResults[$fqdn] = [pscustomobject]@{
-                    InstanceName=$null; TomcatServiceName=$null; ContentServerDir=$null
-                    Errors=$errList
+                    Instances = (New-Object 'System.Collections.Generic.List[pscustomobject]')
+                    Errors    = $errList
                 }
             }
         }
@@ -343,34 +369,42 @@ function Invoke-Backup {
     foreach ($group in $serverGroups.Keys) {
         foreach ($fqdn in $serverGroups[$group]) {
             $disc = $discoveryResults[$fqdn]
-            if (-not $disc.InstanceName -or -not $disc.ContentServerDir) {
-                Write-Log "SKIPPING $fqdn — incomplete discovery." 'WARN' 'Yellow'
+            if (-not $disc.Instances -or $disc.Instances.Count -eq 0) {
+                Write-Log "SKIPPING $fqdn — no instances discovered." 'WARN' 'Yellow'
                 continue
             }
-            $inst     = $disc.InstanceName
-            $svcNames = @($BackupConfig.StaticServices | ForEach-Object {
-                if ($_ -eq '{TOMCAT}') {
-                    if ($disc.TomcatServiceName) { $disc.TomcatServiceName }
+
+            foreach ($instDisc in $disc.Instances) {
+                if (-not $instDisc.InstanceName -or -not $instDisc.ContentServerDir) {
+                    Write-Log "SKIPPING $fqdn / '$($instDisc.InstanceName)' — incomplete discovery." 'WARN' 'Yellow'
+                    continue
                 }
-                elseif ($_ -eq '{INSTANCE}') { $inst }
-                else { $_ -replace [regex]::Escape('{INSTANCE}'), $inst }
-            } | Where-Object { $_ })
 
-            $srcPath    = $disc.ContentServerDir
-            $destFolder = Split-Path $srcPath -Parent
-            $srcName    = Split-Path $srcPath -Leaf
-            $destPath   = Join-Path $destFolder "${srcName}_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').zip"
+                $inst     = $instDisc.InstanceName
+                $svcNames = @($BackupConfig.StaticServices | ForEach-Object {
+                    if ($_ -eq '{TOMCAT}') {
+                        if ($instDisc.TomcatServiceName) { $instDisc.TomcatServiceName }
+                    }
+                    elseif ($_ -eq '{INSTANCE}') { $inst }
+                    else { $_ -replace [regex]::Escape('{INSTANCE}'), $inst }
+                } | Where-Object { $_ })
 
-            while ((Get-Job -State Running).Count -ge $BackupConfig.MaxParallelJobs) {
-                Start-Sleep -Milliseconds 500
+                $srcPath    = $instDisc.ContentServerDir
+                $destFolder = Split-Path $srcPath -Parent
+                $srcName    = Split-Path $srcPath -Leaf
+                $destPath   = Join-Path $destFolder "${srcName}_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').zip"
+
+                while ((Get-Job -State Running).Count -ge $BackupConfig.MaxParallelJobs) {
+                    Start-Sleep -Milliseconds 500
+                }
+
+                $job = Invoke-Command -ComputerName $fqdn -ScriptBlock $compressScript `
+                    -ArgumentList $svcNames,$srcPath,$destPath,$destFolder,$srcName, `
+                                  $BackupConfig.MaxBackups,$BackupConfig.StopTimeoutSec,$BackupConfig.StartTimeoutSec `
+                    -AsJob
+                $job.Name = "${fqdn}::${inst}"
+                $jobs.Add([pscustomobject]@{ Job=$job; ComputerName=$fqdn; GroupName=$group; InstanceName=$inst })
             }
-
-            $job = Invoke-Command -ComputerName $fqdn -ScriptBlock $compressScript `
-                -ArgumentList $svcNames,$srcPath,$destPath,$destFolder,$srcName, `
-                              $BackupConfig.MaxBackups,$BackupConfig.StopTimeoutSec,$BackupConfig.StartTimeoutSec `
-                -AsJob
-            $job.Name = $fqdn
-            $jobs.Add([pscustomobject]@{ Job=$job; ComputerName=$fqdn; GroupName=$group; InstanceName=$inst })
         }
     }
 
@@ -514,8 +548,6 @@ function Invoke-SystemCenterUpdate {
     # Resolve install path from the running service (must happen BEFORE services are stopped,
     # while the service registration is guaranteed present)
     $agentDir     = Get-SCAgentInstallDir
-    $localhostDir = Join-Path $agentDir 'localhost'
-
     if (-not (Test-Path $agentDir)) {
         Write-Log "Install directory not found: $agentDir" 'ERROR' 'Red'
         return
@@ -578,14 +610,23 @@ function Invoke-SystemCenterUpdate {
         }
         Write-Log -Spacer
 
-        # Phase 5 — Empty install directory
-        Write-Log "Phase 5: Emptying install directory..." 'INFO' 'Yellow'
+        # Phase 5 — Preserve localcerts, then empty install directory
+        Write-Log "Phase 5: Preserving localcerts and emptying install directory..." 'INFO' 'Yellow'
+        $localcertsSrc  = $SCConfig.LocalcertsDir
+        $localcertsTemp = Join-Path $env:TEMP "SCA_localcerts_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        if (Test-Path $localcertsSrc) {
+            Copy-Item -Path $localcertsSrc -Destination $localcertsTemp -Recurse -Force
+            Write-Log "  Preserved localcerts to: $localcertsTemp" 'OK' 'Green'
+        } else {
+            Write-Log "  WARNING: localcerts not found at '$localcertsSrc' — will not be restored." 'WARN' 'Yellow'
+            $localcertsTemp = $null
+        }
         Get-ChildItem -Path $agentDir -Force -ErrorAction SilentlyContinue |
             ForEach-Object {
                 Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop
                 Write-Log "  Removed: $($_.Name)" 'INFO' 'Gray'
             }
-    Write-Log "Install directory emptied." 'OK' 'Green'
+        Write-Log "Install directory emptied." 'OK' 'Green'
         Write-Log -Spacer
 
         # Phase 6 — Install new agent
@@ -600,37 +641,27 @@ function Invoke-SystemCenterUpdate {
         Write-Log "Install complete. Log: $installLog" 'OK' 'Green'
         Write-Log -Spacer
 
-        # Phase 7 — Restore the 'localhost' folder from the backup zip
-        Write-Log "Phase 7: Restoring 'localhost' folder from backup..." 'INFO' 'Yellow'
-        $tempExtract = Join-Path $env:TEMP "SCA_restore_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-        New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
-        Expand-Archive -Path $backupPath -DestinationPath $tempExtract -Force
-
-        # The backup roots the archive at the install-dir leaf (e.g. systemcenteragent\localhost),
-        # so locate the 'localhost' folder wherever it sits in the extracted tree.
-        $restoredLocalhost = Get-ChildItem -Path $tempExtract -Directory -Recurse -Filter 'localhost' |
-                             Select-Object -First 1
-        if (-not $restoredLocalhost) {
-            throw "'localhost' folder not found in backup zip: $backupPath"
+        # Phase 7 — Restore localcerts folder
+        Write-Log "Phase 7: Restoring localcerts folder..." 'INFO' 'Yellow'
+        if ($localcertsTemp -and (Test-Path $localcertsTemp)) {
+            Copy-Item -Path $localcertsTemp -Destination $SCConfig.LocalcertsDir -Recurse -Force
+            Remove-Item $localcertsTemp -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Restored localcerts to: $($SCConfig.LocalcertsDir)" 'OK' 'Green'
+        } else {
+            Write-Log "localcerts was not preserved — skipping restore." 'WARN' 'Yellow'
         }
-        if (Test-Path $localhostDir) { Remove-Item $localhostDir -Recurse -Force }
-        Copy-Item -Path $restoredLocalhost.FullName -Destination $agentDir -Recurse -Force
-        Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Log "Restored 'localhost' folder to: $localhostDir" 'OK' 'Green'
         Write-Log -Spacer
 
-        # Phase 8 — Copy localhost\conf.ini into the configuration directory
-        Write-Log "Phase 8: Copying '$($SCConfig.CopyFile)' into configuration directory..." 'INFO' 'Yellow'
-        $confSource  = Join-Path $localhostDir $SCConfig.CopyFile
+        # Phase 8 — Write fixed conf.ini into configuration directory
+        Write-Log "Phase 8: Writing conf.ini to configuration directory..." 'INFO' 'Yellow'
         $confDestDir = Join-Path $agentDir 'configuration'
-        $confDest    = Join-Path $confDestDir $SCConfig.CopyFile
-        if (-not (Test-Path $confSource)) { throw "'$($SCConfig.CopyFile)' not found at: $confSource" }
+        $confDest    = Join-Path $confDestDir 'conf.ini'
         if (-not (Test-Path $confDestDir)) {
             New-Item -ItemType Directory -Path $confDestDir -Force | Out-Null
             Write-Log "Created configuration directory: $confDestDir" 'INFO' 'Gray'
         }
-        Copy-Item -Path $confSource -Destination $confDest -Force
-        Write-Log "Copied '$confSource' -> '$confDest'" 'OK' 'Green'
+        Set-Content -Path $confDest -Value $SCConfig.ConfIniContent -Encoding UTF8 -Force
+        Write-Log "conf.ini written to: $confDest" 'OK' 'Green'
         Write-Log -Spacer
     }
     catch {
@@ -644,6 +675,10 @@ function Invoke-SystemCenterUpdate {
         if ($msiTemp -and (Test-Path $msiTemp)) {
             Remove-Item $msiTemp -Recurse -Force -ErrorAction SilentlyContinue
             Write-Log "Temp MSI folder cleaned up." 'OK' 'Green'
+        }
+        if ($localcertsTemp -and (Test-Path $localcertsTemp)) {
+            Remove-Item $localcertsTemp -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Temp localcerts folder cleaned up." 'OK' 'Green'
         }
     }
 
