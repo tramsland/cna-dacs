@@ -1447,6 +1447,7 @@ function Invoke-Operation {
         '2' { Invoke-SystemCenterUpdate }
         '3' { Invoke-TomcatUpgrade }
     }
+    Get-InstalledVersions
     Write-Host ''
     Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
     $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
