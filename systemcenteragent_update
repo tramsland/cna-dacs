@@ -1315,23 +1315,29 @@ function Get-InstalledVersions {
     }
 
     foreach ($candidate in $candidates) {
-        $versionBat = Join-Path $candidate 'bin\version.bat'
-        if (Test-Path $versionBat) {
+        $catJar = Join-Path $candidate 'lib\catalina.jar'
+        if (Test-Path $catJar) {
             try {
-                $output = & cmd.exe /c "`"$versionBat`" 2>&1" | Out-String
-                $output = $output -split "`r?`n"
-                $vLine  = $output | Select-String -Pattern 'Server version\s*:\s*(.+)' |
-                          Select-Object -First 1
-                if ($vLine) {
-                    $script:TomcatInstalledVersion = $vLine.Matches[0].Groups[1].Value.Trim() -replace '/', ' '
-                } else {
-                    $script:TomcatInstalledVersion = 'Detected (version unparsed)'
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $z  = [System.IO.Compression.ZipFile]::OpenRead($catJar)
+                $mf = $z.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' }
+                if ($mf) {
+                    $r  = New-Object System.IO.StreamReader($mf.Open())
+                    $ct = $r.ReadToEnd()
+                    $r.Close()
+                    $mm = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
+                    if ($mm.Success) {
+                        $script:TomcatInstalledVersion = 'Apache Tomcat ' + $mm.Groups[1].Value
+                    } else {
+                        $script:TomcatInstalledVersion = 'Detected (version unparsed)'
+                    }
                 }
+                $z.Dispose()
                 $script:TomcatInstallPath = $candidate
                 break
             }
             catch {
-                $script:TomcatInstalledVersion = 'Error running version.bat'
+                $script:TomcatInstalledVersion = 'Error reading catalina.jar'
             }
         }
     }
