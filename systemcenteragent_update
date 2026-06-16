@@ -653,16 +653,16 @@ function Invoke-SystemCenterUpdate {
         }
         Write-Log -Spacer
 
-        # Phase 8 — Write fixed conf.ini into configuration directory
-        Write-Log "Phase 8: Writing conf.ini to configuration directory..." 'INFO' 'Yellow'
+        # Phase 8 — Write fixed config.ini into configuration directory
+        Write-Log "Phase 8: Writing config.ini to configuration directory..." 'INFO' 'Yellow'
         $confDestDir = Join-Path $agentDir 'configuration'
-        $confDest    = Join-Path $confDestDir 'conf.ini'
+        $confDest    = Join-Path $confDestDir 'config.ini'
         if (-not (Test-Path $confDestDir)) {
             New-Item -ItemType Directory -Path $confDestDir -Force | Out-Null
             Write-Log "Created configuration directory: $confDestDir" 'INFO' 'Gray'
         }
         Set-Content -Path $confDest -Value $SCConfig.ConfIniContent -Encoding UTF8 -Force
-        Write-Log "conf.ini written to: $confDest" 'OK' 'Green'
+        Write-Log "config.ini written to: $confDest" 'OK' 'Green'
         Write-Log -Spacer
     }
     catch {
