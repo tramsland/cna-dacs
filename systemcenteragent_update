@@ -1328,7 +1328,7 @@ function Get-InstalledVersions {
                 } else {
                     # Fallback: "Server number: 10.1.34.0" — capture only the 3-part release,
                     # dropping the trailing build segment so we don't report the build number.
-                    $vLine2 = $output | Select-String -Pattern 'Server number\s*:\s*(\d+\.\d+\.\d+)' |
+                    $vLine2 = $output | Select-String -Pattern 'Server number\s*:\s*(\d+\.\d+\.\d+)\.\d+' |
                               Select-Object -First 1
                     if ($vLine2) {
                         $script:TomcatInstalledVersion = $vLine2.Matches[0].Groups[1].Value
