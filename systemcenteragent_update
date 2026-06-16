@@ -1296,9 +1296,18 @@ function Get-InstalledVersions {
         $rp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)" `
                -ErrorAction SilentlyContinue).ImagePath
         if ($rp) {
-            $ex   = $rp.Trim('"').Split(' ')[0]
-            $root = Split-Path (Split-Path $ex -Parent) -Parent
-            if ((Test-Path "$root\bin") -and (Test-Path "$root\lib")) {
+            # Strip quotes then take only the exe path before any arguments
+            $ex  = ($rp.Trim('"') -replace '^"?([^"]+)"?.*$', '$1').Split(' ')[0].Trim('"')
+            # Walk up from the exe location until we find a dir with both bin\ and lib\
+            $dir  = Split-Path $ex -Parent
+            $root = $null
+            for ($i = 0; $i -lt 5; $i++) {
+                if ((Test-Path "$dir\bin") -and (Test-Path "$dir\lib")) { $root = $dir; break }
+                $parent = Split-Path $dir -Parent
+                if ($parent -eq $dir) { break }
+                $dir = $parent
+            }
+            if ($root) {
                 # Prepend service-resolved path so it is tried first
                 $candidates = @($root) + $candidates
             }
