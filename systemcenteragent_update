@@ -1318,26 +1318,31 @@ function Get-InstalledVersions {
         $catJar = Join-Path $candidate 'lib\catalina.jar'
         if (Test-Path $catJar) {
             try {
+                Add-Type -AssemblyName System.IO.Compression
                 Add-Type -AssemblyName System.IO.Compression.FileSystem
-                $z  = [System.IO.Compression.ZipFile]::OpenRead($catJar)
-                $mf = $z.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' }
+                $fs  = [System.IO.File]::OpenRead($catJar)
+                $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
+                $mf  = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' } | Select-Object -First 1
                 if ($mf) {
-                    $r  = New-Object System.IO.StreamReader($mf.Open())
-                    $ct = $r.ReadToEnd()
-                    $r.Close()
-                    $mm = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
+                    $sr  = New-Object System.IO.StreamReader($mf.Open())
+                    $ct  = $sr.ReadToEnd()
+                    $sr.Close()
+                    $mm  = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
                     if ($mm.Success) {
-                        $script:TomcatInstalledVersion = 'Apache Tomcat ' + $mm.Groups[1].Value
+                        $script:TomcatInstalledVersion = 'Apache Tomcat ' + $mm.Groups[1].Value.Trim()
                     } else {
                         $script:TomcatInstalledVersion = 'Detected (version unparsed)'
                     }
+                } else {
+                    $script:TomcatInstalledVersion = 'Detected (manifest not found)'
                 }
-                $z.Dispose()
+                $zip.Dispose()
+                $fs.Close()
                 $script:TomcatInstallPath = $candidate
                 break
             }
             catch {
-                $script:TomcatInstalledVersion = 'Error reading catalina.jar'
+                $script:TomcatInstalledVersion = "Error: $_"
             }
         }
     }
