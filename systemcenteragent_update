@@ -1331,8 +1331,7 @@ function Get-InstalledVersions {
                     if ($mm.Success) {
                         $script:TomcatInstalledVersion = 'Apache Tomcat ' + $mm.Groups[1].Value.Trim()
                     } else {
-                        # DEBUG: show first 300 chars of manifest so we can see the actual field names
-                        $script:TomcatInstalledVersion = 'DBG:' + ($ct -replace '\r|\n',' ').Substring(0, [Math]::Min(300, $ct.Length))
+                        $script:TomcatInstalledVersion = 'Detected (version unparsed)'
                     }
                 } else {
                     $script:TomcatInstalledVersion = 'Detected (manifest not found)'
