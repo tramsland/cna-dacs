@@ -1391,17 +1391,16 @@ function Get-InstalledVersions {
         if ($vContent) { $script:SCAgentInstalledVersion = $vContent.Matches[0].Groups[1].Value }
     }
 
-    # Detect Java version — check Tomcat service JVM, then JAVA_HOME, then PATH
-    $script:JavaVersion    = 'Not detected'
-    $script:JavaDoDApproved = $false
+    # Detect Java version — check Tomcat service JVM, then JAVA_HOME, then known paths, then PATH
+    $script:JavaVersion   = 'Not detected'
+    $script:JavaDoDStatus = ''
     $javaExe = $null
 
-    # Method 1: JVM path from Tomcat service registry (Options\JvmMs or ImagePath alongside jvm.dll)
+    # Method 1: JVM path from Tomcat service registry
     foreach ($svc in $svcs) {
-        $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)\Parameters"
+        $svcKey  = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)\Parameters"
         $jvmPath = (Get-ItemProperty $svcKey -ErrorAction SilentlyContinue).Jvm
         if ($jvmPath -and (Test-Path $jvmPath)) {
-            # jvm.dll lives at <java_home>\bin\server\jvm.dll or <java_home>\jre\bin\server\jvm.dll
             $javaHome = $jvmPath
             for ($i = 0; $i -lt 5; $i++) {
                 $javaHome = Split-Path $javaHome -Parent
@@ -1421,7 +1420,18 @@ function Get-InstalledVersions {
         }
     }
 
-    # Method 3: java.exe on system PATH
+    # Method 3: Known DACS paths — JRE first (runtime), then JDK
+    if (-not $javaExe) {
+        $knownPaths = @(
+            'E:\Customers\Shared\DACS\Java\JRE\bin\java.exe',
+            'E:\Customers\Shared\DACS\Java\bin\java.exe'
+        )
+        foreach ($p in $knownPaths) {
+            if (Test-Path $p) { $javaExe = $p; break }
+        }
+    }
+
+    # Method 4: java.exe on system PATH
     if (-not $javaExe) {
         $jCmd = Get-Command java.exe -ErrorAction SilentlyContinue
         if ($jCmd) { $javaExe = $jCmd.Source }
