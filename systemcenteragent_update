@@ -1835,12 +1835,14 @@ function Show-RemoteSCMenu {
             $tcVer       = 'N/A'
         } else {
             $scriptLabel = if ($s.ScriptCurrent) { '[Current]' } else { '[OUTDATED]' }
-            $scVer       = $s.SCVersion
-            $tcVer       = $s.TomcatVersion
+            $scVer       = $s.SCVersion.Trim()
+            $tcVer       = $s.TomcatVersion.Trim()
+            $localSCVer  = $script:SCAgentInstalledVersion.Trim()
+            $localTCVer  = $nvTcVer.Trim()
 
-            # Color: red if either version needs update, yellow if script outdated, green if all current
-            $scNeedsUpdate = ($scVer -ne 'Unknown' -and $script:SCAgentInstalledVersion -ne 'Not detected' -and $scVer -ne $script:SCAgentInstalledVersion)
-            $tcNeedsUpdate = ($tcVer -ne 'Unknown' -and $nvTcVer -ne 'Not staged' -and $nvTcVer -ne 'Unknown' -and $tcVer -ne $nvTcVer)
+            # Color: yellow if any version needs update or script outdated, green if all current
+            $scNeedsUpdate = ($scVer -ne 'Unknown' -and $localSCVer -ne 'Not detected' -and $scVer -ne $localSCVer)
+            $tcNeedsUpdate = ($tcVer -ne 'Unknown' -and $localTCVer -ne 'Not staged'   -and $localTCVer -ne 'Unknown' -and $tcVer -ne $localTCVer)
             $rowColor      = if ($scNeedsUpdate -or $tcNeedsUpdate) { 'Yellow' }
                              elseif (-not $s.ScriptCurrent)         { 'Yellow' }
                              else                                    { 'Green'  }
@@ -1884,10 +1886,10 @@ function Show-RemoteSCMenu {
     Write-Host ''
     Write-Host '  Targets:' -ForegroundColor White
     foreach ($t in $targets) {
-        $isCurrent = ($t.SCVersion -ne 'Unknown' -and
-                      $t.SCVersion -ne 'Unreachable' -and
-                      $script:SCAgentInstalledVersion -ne 'Not detected' -and
-                      $t.SCVersion -eq $script:SCAgentInstalledVersion)
+        $isCurrent = ($t.SCVersion.Trim() -ne 'Unknown' -and
+                      $t.SCVersion.Trim() -ne 'Unreachable' -and
+                      $script:SCAgentInstalledVersion.Trim() -ne 'Not detected' -and
+                      $t.SCVersion.Trim() -eq $script:SCAgentInstalledVersion.Trim())
         $stageNote   = if (-not $t.ScriptCurrent) { ' [will stage first]' } else { '' }
         $currentNote = if ($isCurrent)             { ' [already current — will skip]' } else { '' }
         $noteColor   = if ($isCurrent)             { 'Green' } else { 'Cyan' }
@@ -1911,12 +1913,12 @@ function Show-RemoteSCMenu {
         Write-Host ("  ── [{0}] {1} ({2}) ──" -f $t.Index, $t.Server, $t.InstanceName) -ForegroundColor Cyan
 
         # Skip if already on the same version as local
-        if ($t.SCVersion -ne 'Unknown' -and
-            $t.SCVersion -ne 'Unreachable' -and
-            $script:SCAgentInstalledVersion -ne 'Not detected' -and
-            $t.SCVersion -eq $script:SCAgentInstalledVersion) {
-            Write-Log ("[$($t.Server)] Version is current ($($t.SCVersion)) — skipping.") 'OK' 'Green'
-            Write-Host ("  Version is current: {0}" -f $t.SCVersion) -ForegroundColor Green
+        if ($t.SCVersion.Trim() -ne 'Unknown' -and
+            $t.SCVersion.Trim() -ne 'Unreachable' -and
+            $script:SCAgentInstalledVersion.Trim() -ne 'Not detected' -and
+            $t.SCVersion.Trim() -eq $script:SCAgentInstalledVersion.Trim()) {
+            Write-Log ("[$($t.Server)] Version is current ($($t.SCVersion.Trim())) — skipping.") 'OK' 'Green'
+            Write-Host ("  Version is current: {0}" -f $t.SCVersion.Trim()) -ForegroundColor Green
             continue
         }
 
