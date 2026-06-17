@@ -35,6 +35,10 @@
 #==================================================================================
 
 #region Bootstrap
+param(
+    [int]$RunOperation = 0   # When set (1/2/3), run that operation non-interactively and exit
+)
+
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host ""
@@ -1543,15 +1547,189 @@ function Show-Menu {
     Write-Host "         Dest: \\<FQDN from servers.txt>\c`$\DLA-failsafe\patching\" -ForegroundColor DarkGray
 
     Write-Host ''
-    Write-Host '  [A]  Run ALL (1, 2, 3) in sequence' -ForegroundColor Magenta
-    Write-Host '  [J]  Java environment variables (JAVA_HOME / JRE_HOME)' -ForegroundColor Cyan
-    Write-Host '  [Q]  Quit'                           -ForegroundColor Gray
+    Write-Host '  [A]  Run ALL (1, 2, 3) in sequence'                              -ForegroundColor Magenta
+    Write-Host '  [R]  Remote SC Agent Update  (per server from servers.txt)'       -ForegroundColor Cyan
+    Write-Host '  [J]  Java environment variables (JAVA_HOME / JRE_HOME)'           -ForegroundColor Cyan
+    Write-Host '  [Q]  Quit'                                                         -ForegroundColor Gray
     Write-Host ''
     Write-Host '  Enter a number or any combination (commas or spaces):' -ForegroundColor White
     Write-Host '    1        Backup only'              -ForegroundColor DarkGray
     Write-Host '    2,3      SystemCenter then Tomcat' -ForegroundColor DarkGray
     Write-Host '    1 2 3    All three in sequence'    -ForegroundColor DarkGray
     Write-Host ''
+}
+
+function Get-RemoteSCVersion {
+    param([string]$Server)
+    try {
+        $ver = Invoke-Command -ComputerName $Server -ScriptBlock {
+            # Method 1: Win32_Product
+            $p = Get-CimInstance -ClassName Win32_Product -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
+                 Select-Object -First 1
+            if ($p) { return $p.Version }
+            # Method 2: Uninstall registry
+            $paths = @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+            )
+            foreach ($rp in $paths) {
+                $keys = Get-ChildItem $rp -ErrorAction SilentlyContinue
+                foreach ($k in $keys) {
+                    $props = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+                    if ($props.DisplayName -like '*System Center*' -or $props.DisplayName -like '*OTS*') {
+                        if ($props.DisplayVersion) { return $props.DisplayVersion }
+                    }
+                }
+            }
+            return 'Unknown'
+        } -ErrorAction Stop
+        return $ver
+    }
+    catch {
+        return "Unreachable: $_"
+    }
+}
+
+function Invoke-RemoteSCUpdate {
+    param([string]$Server)
+    $remotePath = "\\$Server\c$\DLA-failsafe\patching\$ScriptName"
+    if (-not (Test-Path $remotePath)) {
+        Write-Log "Script not staged on $Server — run [S] Stage first." 'ERROR' 'Red'
+        return $false
+    }
+    try {
+        Write-Log "Connecting to $Server..." 'INFO' 'Gray'
+        Invoke-Command -ComputerName $Server -ScriptBlock {
+            param($scriptFile)
+            $logDir = 'C:\Logs'
+            if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+            & powershell.exe -NonInteractive -ExecutionPolicy Bypass `
+                -File $scriptFile -RunOperation 2 2>&1
+        } -ArgumentList "C:\DLA-failsafe\patching\$ScriptName" -ErrorAction Stop
+        Write-Log "Remote update complete on $Server." 'OK' 'Green'
+        return $true
+    }
+    catch {
+        Write-Log "Remote update failed on ${Server}: $_" 'ERROR' 'Red'
+        return $false
+    }
+}
+
+function Show-RemoteSCMenu {
+    $serversFile = Join-Path $RootDir 'servers.txt'
+    if (-not (Test-Path $serversFile)) {
+        Write-Host ''
+        Write-Host '  [ERROR] servers.txt not found.' -ForegroundColor Red
+        Write-Host ''
+        Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        return
+    }
+
+    $servers = @(Get-ServerList -Path $serversFile)
+    if (-not $servers -or $servers.Count -eq 0) { return }
+
+    # Build server status table
+    Clear-Host
+    Write-Header 'Remote System Center Agent Update'
+    Write-Host '  Querying SC Agent versions on all servers...' -ForegroundColor Gray
+    Write-Host ''
+
+    $serverStatus = New-Object 'System.Collections.Generic.List[pscustomobject]'
+    $idx = 1
+    foreach ($srv in $servers) {
+        Write-Host ("  Checking {0}..." -f $srv) -ForegroundColor Gray
+        $ver = Get-RemoteSCVersion -Server $srv
+        $serverStatus.Add([pscustomobject]@{
+            Index   = $idx
+            Server  = $srv
+            Version = $ver
+            Failed  = $ver -like 'Unreachable*'
+        })
+        $idx++
+    }
+
+    # Display table
+    Clear-Host
+    Write-Header 'Remote System Center Agent Update'
+    Write-Host ''
+    Write-Host ('  {0,-4} {1,-45} {2}' -f '#', 'Server', 'SC Agent Version') -ForegroundColor White
+    Write-Host ('  {0,-4} {1,-45} {2}' -f '----', '--------------------------------------------', '----------------') -ForegroundColor DarkGray
+
+    foreach ($s in $serverStatus) {
+        $color = if ($s.Failed)                        { 'Red'   }
+                 elseif ($s.Version -eq 'Unknown')     { 'Yellow'}
+                 else                                  { 'Green' }
+        Write-Host ('  [{0,-2}] {1,-45} {2}' -f $s.Index, $s.Server, $s.Version) -ForegroundColor $color
+    }
+
+    Write-Host ''
+    Write-Host '  [A]  Update ALL servers' -ForegroundColor Cyan
+    Write-Host '  [X]  Back to menu'       -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  Enter server number(s) to update, [A] for all, or [X] to cancel:' -ForegroundColor White
+    $sel = (Read-Host '  Selection').Trim().ToUpper()
+
+    if ($sel -eq 'X') { return }
+
+    # Determine targets
+    $targets = New-Object 'System.Collections.Generic.List[pscustomobject]'
+    if ($sel -eq 'A') {
+        foreach ($s in $serverStatus) {
+            if (-not $s.Failed) { $targets.Add($s) }
+        }
+    } else {
+        $tokens = @($sel -split '[,\s]+' | Where-Object { $_ -ne '' })
+        foreach ($t in $tokens) {
+            if ($t -match '^\d+$') {
+                $match = $serverStatus | Where-Object { $_.Index -eq [int]$t } | Select-Object -First 1
+                if ($match -and -not $match.Failed) { $targets.Add($match) }
+                elseif ($match -and $match.Failed)  { Write-Host ("  Skipping {0} — unreachable." -f $match.Server) -ForegroundColor Yellow }
+                else                                { Write-Host ("  No server with index {0}." -f $t) -ForegroundColor Red }
+            }
+        }
+    }
+
+    if ($targets.Count -eq 0) {
+        Write-Host '  No valid targets selected.' -ForegroundColor Red
+        Start-Sleep -Seconds 2
+        return
+    }
+
+    # Confirm
+    Write-Host ''
+    Write-Host '  Targets:' -ForegroundColor White
+    foreach ($t in $targets) {
+        Write-Host ("    {0}  ({1})" -f $t.Server, $t.Version) -ForegroundColor Cyan
+    }
+    Write-Host ''
+    $confirm = (Read-Host '  Proceed? (Y/N)').Trim().ToUpper()
+    if ($confirm -ne 'Y') {
+        Write-Host '  Cancelled.' -ForegroundColor Gray
+        Start-Sleep -Seconds 1
+        return
+    }
+
+    # Run updates
+    Write-Host ''
+    $script:_ActiveLog = New-LogPath 'RemoteSCUpdate'
+    Write-Log "Starting remote SC Agent update on $($targets.Count) server(s)." 'INFO' 'White'
+
+    foreach ($t in $targets) {
+        Write-Host ''
+        Write-Host ("  ── {0} ──" -f $t.Server) -ForegroundColor Cyan
+        $ok = Invoke-RemoteSCUpdate -Server $t.Server
+        if ($ok) {
+            $newVer = Get-RemoteSCVersion -Server $t.Server
+            Write-Host ("  Version after update: {0}" -f $newVer) -ForegroundColor Green
+        }
+    }
+
+    Write-Log "Remote SC Agent update complete. Log: $($script:_ActiveLog)" 'OK' 'Green'
+    Write-Host ''
+    Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 }
 
 function Set-JavaEnvironment {
@@ -1702,6 +1880,16 @@ if (-not (Test-Path $serversFile)) {
 Write-Host ''
 Write-Host '  Detecting installed software versions...' -ForegroundColor Gray
 Get-InstalledVersions
+
+# Non-interactive mode — invoked remotely with -RunOperation
+if ($RunOperation -gt 0) {
+    switch ($RunOperation) {
+        1 { Invoke-Backup }
+        2 { Invoke-SystemCenterUpdate }
+        3 { Invoke-TomcatUpgrade }
+    }
+    exit 0
+}
 #endregion
 
 #region Main Loop
@@ -1723,6 +1911,11 @@ Get-InstalledVersions
 
         'J' { Set-JavaEnvironment }
 
+        'R' {
+            Show-RemoteSCMenu
+            Get-InstalledVersions
+        }
+
         'A' { '1','2','3' | ForEach-Object { Invoke-Operation -Key $_ } }
 
         default {
@@ -1732,7 +1925,7 @@ Get-InstalledVersions
 
             if ($bad.Count -gt 0) {
                 Write-Host ''
-                Write-Host ("  Invalid entry: '{0}' - use 1, 2, 3, S, A, J, or Q." -f ($bad -join ',')) -ForegroundColor Red
+                Write-Host ("  Invalid entry: '{0}' - use 1, 2, 3, S, A, R, J, or Q." -f ($bad -join ',')) -ForegroundColor Red
                 Start-Sleep -Seconds 2
                 continue
             }
