@@ -1554,7 +1554,43 @@ function Set-JavaEnvironment {
     Write-Host ("    JAVA_HOME  : {0}" -f $jhDisplay) -ForegroundColor $jhColor
     Write-Host ("    JRE_HOME   : {0}" -f $jrDisplay) -ForegroundColor $jrColor
     Write-Host ''
-    Write-Host '  Known DACS Java paths:' -ForegroundColor White
+    Write-Host '  Tomcat JRE Resolution:' -ForegroundColor White
+    Write-Host ''
+
+    # Check setenv.bat
+    $setenvPath = if ($script:TomcatInstallPath) { Join-Path $script:TomcatInstallPath 'bin\setenv.bat' } else { $null }
+    if ($setenvPath -and (Test-Path $setenvPath)) {
+        $setenvContent = Get-Content $setenvPath -ErrorAction SilentlyContinue
+        $setenvJava = $setenvContent | Select-String -Pattern 'JAVA_HOME|JRE_HOME' | Select-Object -First 3
+        if ($setenvJava) {
+            Write-Host '    setenv.bat overrides:' -ForegroundColor Cyan
+            foreach ($line in $setenvJava) {
+                Write-Host ("      {0}" -f $line.Line.Trim()) -ForegroundColor Cyan
+            }
+        } else {
+            Write-Host '    setenv.bat         : exists but no JAVA_HOME/JRE_HOME override' -ForegroundColor Gray
+        }
+    } else {
+        Write-Host '    setenv.bat         : not present' -ForegroundColor Gray
+    }
+
+    # Check Tomcat service registry Parameters\Java and Parameters\Jvm
+    $svcs = @(Get-Service -Name '*Tomcat*' -ErrorAction SilentlyContinue)
+    if ($svcs.Count -eq 0) { $svcs = @(Get-Service -DisplayName '*Apache Tomcat*' -ErrorAction SilentlyContinue) }
+    foreach ($svc in $svcs) {
+        $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)\Parameters"
+        $params = Get-ItemProperty $svcKey -ErrorAction SilentlyContinue
+        if ($params) {
+            $jvmVal  = if ($params.Jvm)  { $params.Jvm  } else { '(not set)' }
+            $javaVal = if ($params.Java) { $params.Java } else { '(not set)' }
+            $jvmColor  = if ($params.Jvm)  { 'Green' } else { 'Gray' }
+            $javaColor = if ($params.Java) { 'Green' } else { 'Gray' }
+            Write-Host ("    Service [{0}]" -f $svc.Name) -ForegroundColor White
+            Write-Host ("      Parameters\Jvm   : {0}" -f $jvmVal)  -ForegroundColor $jvmColor
+            Write-Host ("      Parameters\Java  : {0}" -f $javaVal) -ForegroundColor $javaColor
+        }
+    }
+    Write-Host ''
     Write-Host ''
 
     $knownJava = 'E:\Customers\Shared\DACS\Java'
