@@ -1394,7 +1394,7 @@ function Get-InstalledVersions {
     # Detect Java version — check Tomcat service JVM, then JAVA_HOME, then known paths, then PATH
     $script:JavaVersion   = 'Not detected'
     $script:JavaDoDStatus = ''
-    $javaExe = $null
+    $script:JavaExePath   = ''
 
     # Method 1: JVM path from Tomcat service registry
     foreach ($svc in $svcs) {
@@ -1438,6 +1438,7 @@ function Get-InstalledVersions {
     }
 
     if ($javaExe) {
+        $script:JavaExePath = $javaExe
         try {
             $jOutput = & $javaExe -version 2>&1 | Out-String
             $jMatch  = [regex]::Match($jOutput, '(?:java|openjdk) version "([^"]+)"')
@@ -1476,6 +1477,7 @@ function Show-Menu {
 
     $jVer    = $script:JavaVersion
     $jStatus = $script:JavaDoDStatus
+    $jPath   = if ($script:JavaExePath) { $script:JavaExePath } else { 'path not found' }
     $jLabel  = if ($jStatus) { "[$jStatus]" } else { '' }
     $jColor  = switch ($jStatus) {
         'DoD Approved'       { 'Green'  }
@@ -1488,7 +1490,7 @@ function Show-Menu {
     Write-Host '  Installed Software Versions:' -ForegroundColor White
     Write-Host ("    Tomcat         : {0}  ({1})" -f $tcVer, $tcPath) -ForegroundColor $tcColor
     Write-Host ("    SC Agent       : {0}" -f $scVer)                  -ForegroundColor $scColor
-    Write-Host ("    Java           : {0}  {1}" -f $jVer, $jLabel)     -ForegroundColor $jColor
+    Write-Host ("    Java           : {0}  {1}  ({2})" -f $jVer, $jLabel, $jPath) -ForegroundColor $jColor
     Write-Host ''
     Write-Host '  Operations:' -ForegroundColor White
     Write-Host ''
