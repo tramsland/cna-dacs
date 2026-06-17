@@ -1696,9 +1696,24 @@ function Show-RemoteSCMenu {
     $servers = @(Get-ServerList -Path $serversFile)
     if (-not $servers -or $servers.Count -eq 0) { return }
 
+    # Exclude this host from the list to prevent updating ourselves while running
+    $localName = $env:COMPUTERNAME.ToUpper()
+    $servers = @($servers | Where-Object {
+        $_.ToUpper() -notmatch "^$localName(\.|$)"
+    })
+    if ($servers.Count -eq 0) {
+        Write-Host ''
+        Write-Host '  No remote servers to update (only this host is listed in servers.txt).' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        return
+    }
+
     # Query all servers
     Clear-Host
     Write-Header 'Remote System Center Agent Update'
+    Write-Host ("  Local host: {0}  (excluded from remote list)" -f $env:COMPUTERNAME) -ForegroundColor DarkGray
     Write-Host '  Querying servers...' -ForegroundColor Gray
     Write-Host ''
 
@@ -1715,6 +1730,7 @@ function Show-RemoteSCMenu {
     # Display table
     Clear-Host
     Write-Header 'Remote System Center Agent Update'
+    Write-Host ("  Local host: {0}  (excluded)" -f $env:COMPUTERNAME) -ForegroundColor DarkGray
     Write-Host ''
     Write-Host ('  {0,-4} {1,-38} {2,-22} {3,-18} {4}' -f '#', 'Server', 'Instance', 'SC Version', 'Script') -ForegroundColor White
     Write-Host ('  {0,-4} {1,-38} {2,-22} {3,-18} {4}' -f '----', '-------------------------------------', '---------------------', '-----------------', '-------') -ForegroundColor DarkGray
