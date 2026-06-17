@@ -1559,15 +1559,42 @@ function Show-Menu {
     Write-Host ''
 }
 
+function Get-NewVersionTomcatVersion {
+    # Read the staged NewVersion catalina.jar to get the target Tomcat version
+    $catJar = Join-Path $RootDir "NewVersion\lib\catalina.jar"
+    if (-not (Test-Path $catJar)) { return 'Not staged' }
+    try {
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $fs  = [System.IO.File]::OpenRead($catJar)
+        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
+        $mf  = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' } | Select-Object -First 1
+        if ($mf) {
+            $sr  = New-Object System.IO.StreamReader($mf.Open())
+            $ct  = $sr.ReadToEnd()
+            $sr.Close()
+            $mm  = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
+            if ($mm.Success) {
+                $zip.Dispose(); $fs.Close()
+                return $mm.Groups[1].Value.Trim()
+            }
+        }
+        $zip.Dispose(); $fs.Close()
+        return 'Unknown'
+    }
+    catch { return 'Error reading jar' }
+}
+
 function Get-RemoteServerInfo {
     param([string]$Server)
     $result = [pscustomobject]@{
-        Server        = $Server
-        InstanceName  = 'Unknown'
-        SCVersion     = 'Unknown'
-        ScriptCurrent = $false
-        Reachable     = $false
-        Error         = ''
+        Server         = $Server
+        InstanceName   = 'Unknown'
+        SCVersion      = 'Unknown'
+        TomcatVersion  = 'Unknown'
+        ScriptCurrent  = $false
+        Reachable      = $false
+        Error          = ''
     }
 
     # Check admin share reachability first
@@ -1633,11 +1660,72 @@ function Get-RemoteServerInfo {
             } | Select-Object -First 1
             if ($csSvc) { $instanceName = $csSvc.Name }
 
-            return [pscustomobject]@{ SCVersion = $scVer; InstanceName = $instanceName }
+            # Tomcat version via catalina.jar
+            $tcVer = 'Unknown'
+            $tcSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } | Select-Object -First 1
+            if ($tcSvc) {
+                $imgPath = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($tcSvc.Name)" -ErrorAction SilentlyContinue).ImagePath
+                if ($imgPath) {
+                    $exe = ($imgPath.Trim('"') -replace '^"?([^"]+)"?.*$','$1').Split(' ')[0].Trim('"')
+                    $dir = Split-Path $exe -Parent
+                    for ($i = 0; $i -lt 5; $i++) {
+                        $catJar = Join-Path $dir 'lib\catalina.jar'
+                        if (Test-Path $catJar) {
+                            try {
+                                Add-Type -AssemblyName System.IO.Compression
+                                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                                $fs  = [System.IO.File]::OpenRead($catJar)
+                                $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
+                                $mf  = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' } | Select-Object -First 1
+                                if ($mf) {
+                                    $sr = New-Object System.IO.StreamReader($mf.Open())
+                                    $ct = $sr.ReadToEnd(); $sr.Close()
+                                    $mm = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
+                                    if ($mm.Success) { $tcVer = $mm.Groups[1].Value.Trim() }
+                                }
+                                $zip.Dispose(); $fs.Close()
+                            } catch {}
+                            break
+                        }
+                        $parent = Split-Path $dir -Parent
+                        if ($parent -eq $dir) { break }
+                        $dir = $parent
+                    }
+                }
+            }
+            # Fallback: check known DACS paths
+            if ($tcVer -eq 'Unknown') {
+                $knownCats = @(
+                    'E:\Customers\Shared\DACS\tomcat10\lib\catalina.jar',
+                    'E:\Customers\Shared\DACS\tomcat\lib\catalina.jar'
+                )
+                foreach ($kc in $knownCats) {
+                    if (Test-Path $kc) {
+                        try {
+                            Add-Type -AssemblyName System.IO.Compression
+                            Add-Type -AssemblyName System.IO.Compression.FileSystem
+                            $fs  = [System.IO.File]::OpenRead($kc)
+                            $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
+                            $mf  = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' } | Select-Object -First 1
+                            if ($mf) {
+                                $sr = New-Object System.IO.StreamReader($mf.Open())
+                                $ct = $sr.ReadToEnd(); $sr.Close()
+                                $mm = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
+                                if ($mm.Success) { $tcVer = $mm.Groups[1].Value.Trim() }
+                            }
+                            $zip.Dispose(); $fs.Close()
+                        } catch {}
+                        break
+                    }
+                }
+            }
+
+            return [pscustomobject]@{ SCVersion = $scVer; InstanceName = $instanceName; TomcatVersion = $tcVer }
         } -ErrorAction Stop
 
-        $result.SCVersion    = $info.SCVersion
-        $result.InstanceName = $info.InstanceName
+        $result.SCVersion     = $info.SCVersion
+        $result.InstanceName  = $info.InstanceName
+        $result.TomcatVersion = $info.TomcatVersion
     }
     catch {
         $result.Error = "WinRM: $($_.Exception.Message)"
@@ -1730,28 +1818,34 @@ function Show-RemoteSCMenu {
     # Display table
     Clear-Host
     Write-Header 'Remote System Center Agent Update'
-    Write-Host ("  Local host: {0}  (excluded)" -f $env:COMPUTERNAME) -ForegroundColor DarkGray
+    Write-Host ("  Local host    : {0}  (excluded)" -f $env:COMPUTERNAME) -ForegroundColor DarkGray
+    $nvTcVer = Get-NewVersionTomcatVersion
+    $nvTcColor = if ($nvTcVer -eq 'Not staged') { 'Yellow' } else { 'Cyan' }
+    Write-Host ("  NewVersion TC : {0}" -f $nvTcVer) -ForegroundColor $nvTcColor
+    Write-Host ("  Local SC Agent: {0}" -f $script:SCAgentInstalledVersion) -ForegroundColor Cyan
     Write-Host ''
-    Write-Host ('  {0,-4} {1,-38} {2,-22} {3,-18} {4}' -f '#', 'Server', 'Instance', 'SC Version', 'Script') -ForegroundColor White
-    Write-Host ('  {0,-4} {1,-38} {2,-22} {3,-18} {4}' -f '----', '-------------------------------------', '---------------------', '-----------------', '-------') -ForegroundColor DarkGray
+    Write-Host ('  {0,-4} {1,-35} {2,-20} {3,-16} {4,-16} {5}' -f '#', 'Server', 'Instance', 'SC Version', 'Tomcat', 'Script') -ForegroundColor White
+    Write-Host ('  {0,-4} {1,-35} {2,-20} {3,-16} {4,-16} {5}' -f '----', '----------------------------------', '-------------------', '---------------', '---------------', '-------') -ForegroundColor DarkGray
 
     foreach ($s in $serverInfo) {
         if (-not $s.Reachable) {
-            $rowColor = 'Red'
+            $rowColor    = 'Red'
             $scriptLabel = 'N/A'
-        } elseif (-not $s.ScriptCurrent) {
-            $rowColor = 'Yellow'
-            $scriptLabel = '[OUTDATED]'
+            $scVer       = 'Unreachable'
+            $tcVer       = 'N/A'
         } else {
-            $rowColor = 'Green'
-            $scriptLabel = '[Current]'
+            $scriptLabel = if ($s.ScriptCurrent) { '[Current]' } else { '[OUTDATED]' }
+            $scVer       = $s.SCVersion
+            $tcVer       = $s.TomcatVersion
+
+            # Color: red if either version needs update, yellow if script outdated, green if all current
+            $scNeedsUpdate = ($scVer -ne 'Unknown' -and $script:SCAgentInstalledVersion -ne 'Not detected' -and $scVer -ne $script:SCAgentInstalledVersion)
+            $tcNeedsUpdate = ($tcVer -ne 'Unknown' -and $nvTcVer -ne 'Not staged' -and $nvTcVer -ne 'Unknown' -and $tcVer -ne $nvTcVer)
+            $rowColor      = if ($scNeedsUpdate -or $tcNeedsUpdate) { 'Yellow' }
+                             elseif (-not $s.ScriptCurrent)         { 'Yellow' }
+                             else                                    { 'Green'  }
         }
-        if ($s.Error -and -not $s.Reachable) {
-            $scVer = 'Unreachable'
-        } else {
-            $scVer = $s.SCVersion
-        }
-        Write-Host ('  [{0,-2}] {1,-38} {2,-22} {3,-18} {4}' -f $s.Index, $s.Server, $s.InstanceName, $scVer, $scriptLabel) -ForegroundColor $rowColor
+        Write-Host ('  [{0,-2}] {1,-35} {2,-20} {3,-16} {4,-16} {5}' -f $s.Index, $s.Server, $s.InstanceName, $scVer, $tcVer, $scriptLabel) -ForegroundColor $rowColor
     }
 
     Write-Host ''
