@@ -1160,7 +1160,7 @@ function Invoke-StageSoftware {
         Write-Host '  Staging aborted - fix missing source items and retry.' -ForegroundColor Red
         Write-Host ''
         Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
         return
     }
 
@@ -1170,7 +1170,7 @@ function Invoke-StageSoftware {
         Write-StageError -Server 'LOCAL' -Item 'servers.txt' -Message 'Server list missing or empty.'
         Write-Host ''
         Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
         return
     }
 
@@ -1777,7 +1777,7 @@ function Show-RemoteSCMenu {
         Write-Host '  [ERROR] servers.txt not found.' -ForegroundColor Red
         Write-Host ''
         Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
         return
     }
 
@@ -1794,7 +1794,7 @@ function Show-RemoteSCMenu {
         Write-Host '  No remote servers to update (only this host is listed in servers.txt).' -ForegroundColor Yellow
         Write-Host ''
         Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
         return
     }
 
@@ -1944,7 +1944,7 @@ function Show-RemoteSCMenu {
     Write-Log "Remote SC Agent update complete." 'OK' 'Green'
     Write-Host ''
     Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
 }
 
 function Set-JavaEnvironment {
@@ -2055,7 +2055,7 @@ function Set-JavaEnvironment {
 
     Write-Host ''
     Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
 }
 
 function Invoke-Operation {
@@ -2068,7 +2068,7 @@ function Invoke-Operation {
     Get-InstalledVersions
     Write-Host ''
     Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
 }
 #endregion
 
