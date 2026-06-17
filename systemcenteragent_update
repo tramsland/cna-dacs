@@ -1423,7 +1423,8 @@ function Get-InstalledVersions {
 
     # Method 3: java.exe on system PATH
     if (-not $javaExe) {
-        $javaExe = (Get-Command java.exe -ErrorAction SilentlyContinue)?.Source
+        $jCmd = Get-Command java.exe -ErrorAction SilentlyContinue
+        if ($jCmd) { $javaExe = $jCmd.Source }
     }
 
     if ($javaExe) {
