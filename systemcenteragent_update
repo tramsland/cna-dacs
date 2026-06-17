@@ -1283,7 +1283,7 @@ function Get-InstalledVersions {
     $script:TomcatInstalledVersion = 'Not detected'
     $script:TomcatInstallPath      = $null
     $script:JavaVersion            = 'Not detected'
-    $script:JavaDoDApproved        = $false
+    $script:JavaDoDStatus          = ''
 
     $candidates = @(
         $TomcatConfig.ServiceCandidates | ForEach-Object { $_ }
@@ -1437,8 +1437,14 @@ function Get-InstalledVersions {
                 $major = if ($jVerStr -match '^1\.(\d+)') { [int]$Matches[1] }
                          elseif ($jVerStr -match '^(\d+)')  { [int]$Matches[1] }
                          else                               { 0 }
-                # DoD approved LTS versions: 11, 17, 21
-                $script:JavaDoDApproved = $major -in @(11, 17, 21)
+                # DoD STIG status per active published STIGs
+                $script:JavaDoDStatus = switch ($major) {
+                    11      { 'DoD Approved' }
+                    17      { 'DoD Approved' }
+                    21      { 'LTS - STIG Pending' }
+                    8       { 'STIG Deprecated' }
+                    default { 'NOT DoD Approved' }
+                }
             }
         }
         catch { $script:JavaVersion = "Error: $_" }
@@ -1458,9 +1464,15 @@ function Show-Menu {
     $scColor = if ($scVer -eq 'Not detected') { 'Yellow' } else { 'Green' }
 
     $jVer    = $script:JavaVersion
-    $jApproved = $script:JavaDoDApproved
-    $jLabel  = if ($jApproved) { '[DoD Approved]' } elseif ($jVer -eq 'Not detected') { '' } else { '[NOT DoD Approved]' }
-    $jColor  = if ($jApproved) { 'Green' } elseif ($jVer -eq 'Not detected') { 'Yellow' } else { 'Red' }
+    $jStatus = $script:JavaDoDStatus
+    $jLabel  = if ($jStatus) { "[$jStatus]" } else { '' }
+    $jColor  = switch ($jStatus) {
+        'DoD Approved'       { 'Green'  }
+        'LTS - STIG Pending' { 'Yellow' }
+        'STIG Deprecated'    { 'Yellow' }
+        'NOT DoD Approved'   { 'Red'    }
+        default              { 'Yellow' }
+    }
 
     Write-Host '  Installed Software Versions:' -ForegroundColor White
     Write-Host ("    Tomcat         : {0}  ({1})" -f $tcVer, $tcPath) -ForegroundColor $tcColor
