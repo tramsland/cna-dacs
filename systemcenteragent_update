@@ -1538,8 +1538,11 @@ function Set-JavaEnvironment {
 
     Write-Host '  Current Machine-level environment variables:' -ForegroundColor White
     Write-Host ''
-    Write-Host ("    JAVA_HOME  : {0}" -f $(if ($javaHome) { $javaHome } else { '(not set)' })) -ForegroundColor $jhColor
-    Write-Host ("    JRE_HOME   : {0}" -f $(if ($jreHome)  { $jreHome  } else { '(not set)' })) -ForegroundColor $jrColor
+    $jhDisplay = if ($javaHome) { $javaHome } else { '(not set)' }
+    $jrDisplay = if ($jreHome)  { $jreHome  } else { '(not set)' }
+
+    Write-Host ("    JAVA_HOME  : {0}" -f $jhDisplay) -ForegroundColor $jhColor
+    Write-Host ("    JRE_HOME   : {0}" -f $jrDisplay) -ForegroundColor $jrColor
     Write-Host ''
     Write-Host '  Known DACS Java paths:' -ForegroundColor White
     Write-Host ''
@@ -1550,8 +1553,13 @@ function Set-JavaEnvironment {
     $javaExists = Test-Path (Join-Path $knownJava 'bin\java.exe')
     $jreExists  = Test-Path (Join-Path $knownJRE  'bin\java.exe')
 
-    Write-Host ("    {0}      {1}" -f $knownJava, $(if ($javaExists) { '[Found]' } else { '[Not Found]' })) -ForegroundColor $(if ($javaExists) { 'Green' } else { 'Red' })
-    Write-Host ("    {0}  {1}" -f $knownJRE,  $(if ($jreExists)  { '[Found]' } else { '[Not Found]' })) -ForegroundColor $(if ($jreExists)  { 'Green' } else { 'Red' })
+    $javaFoundLabel = if ($javaExists) { '[Found]'     } else { '[Not Found]' }
+    $jreFoundLabel  = if ($jreExists)  { '[Found]'     } else { '[Not Found]' }
+    $javaFoundColor = if ($javaExists) { 'Green'       } else { 'Red'         }
+    $jreFoundColor  = if ($jreExists)  { 'Green'       } else { 'Red'         }
+
+    Write-Host ("    {0}      {1}" -f $knownJava, $javaFoundLabel) -ForegroundColor $javaFoundColor
+    Write-Host ("    {0}  {1}"     -f $knownJRE,  $jreFoundLabel)  -ForegroundColor $jreFoundColor
     Write-Host ''
 
     if (-not $javaHome -and $javaExists) {
