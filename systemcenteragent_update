@@ -1790,8 +1790,14 @@ function Show-RemoteSCMenu {
     Write-Host ''
     Write-Host '  Targets:' -ForegroundColor White
     foreach ($t in $targets) {
-        $stageNote = if (-not $t.ScriptCurrent) { '  [will stage first]' } else { '' }
-        Write-Host ("    [{0}] {1}  ({2})  {3}" -f $t.Index, $t.Server, $t.SCVersion, $stageNote) -ForegroundColor Cyan
+        $isCurrent = ($t.SCVersion -ne 'Unknown' -and
+                      $t.SCVersion -ne 'Unreachable' -and
+                      $script:SCAgentInstalledVersion -ne 'Not detected' -and
+                      $t.SCVersion -eq $script:SCAgentInstalledVersion)
+        $stageNote   = if (-not $t.ScriptCurrent) { ' [will stage first]' } else { '' }
+        $currentNote = if ($isCurrent)             { ' [already current — will skip]' } else { '' }
+        $noteColor   = if ($isCurrent)             { 'Green' } else { 'Cyan' }
+        Write-Host ("    [{0}] {1}  ({2}){3}{4}" -f $t.Index, $t.Server, $t.SCVersion, $stageNote, $currentNote) -ForegroundColor $noteColor
     }
     Write-Host ''
     $confirm = (Read-Host '  Proceed? (Y/N)').Trim().ToUpper()
@@ -1809,6 +1815,16 @@ function Show-RemoteSCMenu {
     foreach ($t in $targets) {
         Write-Host ''
         Write-Host ("  ── [{0}] {1} ({2}) ──" -f $t.Index, $t.Server, $t.InstanceName) -ForegroundColor Cyan
+
+        # Skip if already on the same version as local
+        if ($t.SCVersion -ne 'Unknown' -and
+            $t.SCVersion -ne 'Unreachable' -and
+            $script:SCAgentInstalledVersion -ne 'Not detected' -and
+            $t.SCVersion -eq $script:SCAgentInstalledVersion) {
+            Write-Log ("[$($t.Server)] Version is current ($($t.SCVersion)) — skipping.") 'OK' 'Green'
+            Write-Host ("  Version is current: {0}" -f $t.SCVersion) -ForegroundColor Green
+            continue
+        }
 
         # Stage if script is outdated or missing
         if (-not $t.ScriptCurrent) {
