@@ -11,7 +11,6 @@
 #     2. System Center   - Stop services, backup, uninstall, reinstall agent, restore config, restart
 #     3. Tomcat Upgrade  - Pre-flight, parallel deploy from NewVersion\, verify, rollback
 #     S. Stage Software  - Copy this script + NewVersion\ to all servers via admin share
-#                          (with destination preview, confirmation, logging + error capture)
 #     A. Run All         - Run operations 1, 2, 3 in sequence
 #     Q. Quit
 #
@@ -22,7 +21,7 @@
 #     ├── servers.txt          <- one FQDN per line; [Zone Name] headers optional
 #     └── NewVersion\          <- new Tomcat build files staged here
 #
-#   STAGE operation copies to \\server\c$\DLA-failsafe\patching\ on each server:
+#   STAGE operation copies to \\server\e$\DLA-failsafe\patching\ on each server:
 #     - CNA-DACS.ps1
 #     - NewVersion\  (full folder, overwrite)
 #
@@ -30,15 +29,16 @@
 #     - PowerShell 5.1
 #     - Run as Administrator
 #     - Network access to patch.dacs.dla.mil (System Center agent download)
-#     - Admin share access (\\server\c$) for Stage operation
+#     - Admin share access (\\server\e$) for Stage operation
+#
+#   CONNECTION FALLBACK ORDER (per server, per operation):
+#     1. WinRM  (Invoke-Command, port 5985) — full scriptblock execution
+#     2. DCOM   (CIM session, RPC port 135) — WMI queries + Win32_Process execution
+#     3. UNC    (admin share \\server\e$)   — file read/write only (no remote execution)
 #
 #==================================================================================
 
 #region Bootstrap
-param(
-    [int]$RunOperation = 0   # When set (1/2/3), run that operation non-interactively and exit
-)
-
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host ""
@@ -66,21 +66,18 @@ $BackupConfig = [pscustomobject]@{
 
 # ---- System Center Agent ----
 $SCConfig = [pscustomobject]@{
-    InstallDir      = 'E:\Customers\Shared\DACS\SystemCenter'
-    LocalcertsDir   = 'E:\Customers\Shared\DACS\SystemCenter\localcerts'
+    InstallDir      = 'E:\Customers\dacs\shared\systemcenteragent'
+    LocalhostDir    = 'E:\Customers\dacs\shared\systemcenteragent\localhost'
+    MsiInstallDir   = 'E:\Customers\Shared\DACS\SystemCenter'
     ServerName      = 'patch.dacs.dla.mil'
     HttpPort        = '443'
     MsiUrl          = 'https://patch.dacs.dla.mil/downloadAgent/?ostype=win&filetype=installer'
     MsiName         = 'OpenText_SystemCenter_Agent.msi'
+    RestoreFile     = 'configuration.conf.ini'
+    CopyFile        = 'conf.ini'
     StopTimeoutSec  = 60
     StartTimeoutSec = 60
-    ServiceOrder    = @('OTSystemCenterAgent')
-    ConfIniContent  = @'
-log.level=INFO
-com.opentext.sc.agent.server_uri=patch.dacs.dla.mil:443/otsc-server/v1/agentwebsocket
-javax.net.ssl.trustStore=E:/Customers/Shared/DACS/SystemCenter/localcerts/cacerts
-log.file=E:/Customers/Shared/DACS/SystemCenter/logs/otsc.log
-'@
+    ServiceOrder    = @('OTSystemCenterAgent', '{TOMCAT}', '{INSTANCE}Admin', '{INSTANCE}')
 }
 
 # ---- Tomcat Upgrade ----
@@ -96,7 +93,7 @@ $TomcatConfig = [pscustomobject]@{
 
 # ---- Stage ----
 $StageConfig = [pscustomobject]@{
-    RemoteBase = "c$\DLA-failsafe\patching"
+    RemoteBase = "e$\DLA-failsafe\patching"
     Items      = @(
         [pscustomobject]@{ Label = 'Launcher script';  RelPath = $ScriptName;   Type = 'File'   }
         [pscustomobject]@{ Label = 'NewVersion folder'; RelPath = 'NewVersion'; Type = 'Folder' }
@@ -189,6 +186,255 @@ function Wait-ServiceState {
 }
 #endregion
 
+#region Remote Connection Layer
+# Provides a three-tier fallback per server:
+#   Tier 1 — WinRM  (Invoke-Command / New-PSSession, port 5985)
+#             Full scriptblock execution. Best option.
+#   Tier 2 — DCOM   (CIM session over RPC, port 135 + dynamic)
+#             WMI queries work. Remote execution via Win32_Process.Create +
+#             poll for completion + read output via UNC temp file.
+#   Tier 3 — UNC    (admin share \\server\e$, SMB port 445)
+#             File read/write only. No remote code execution.
+#             Version detection reads files directly; operations that need
+#             execution are skipped with a clear warning.
+#
+# Usage:
+#   $ctx = Connect-RemoteServer -Hostname $fqdn
+#   if ($ctx) {
+#       $result = Invoke-RCmd -Ctx $ctx -Block { param($x) ... } -Args @($x)
+#       $text   = Read-RFile  -Ctx $ctx -Path 'E:\some\file.txt'
+#       Disconnect-RemoteServer -Ctx $ctx
+#   }
+# -----------------------------------------------------------------------
+
+function Connect-RemoteServer {
+    param([string]$Hostname)
+
+    # --- Tier 1: WinRM ---
+    try {
+        $s = New-PSSession -ComputerName $Hostname -ErrorAction Stop
+        Write-Log "  $Hostname : Connected via WinRM." 'INFO' 'Green'
+        return [pscustomobject]@{ Tier = 'WinRM'; Session = $s; Hostname = $Hostname }
+    }
+    catch {
+        Write-Log "  $Hostname : WinRM failed ($($_.Exception.Message)) — trying DCOM." 'WARN' 'Yellow'
+    }
+
+    # --- Tier 2: DCOM ---
+    try {
+        $opt = New-CimSessionOption -Protocol Dcom
+        $cs  = New-CimSession -ComputerName $Hostname -SessionOption $opt -ErrorAction Stop
+        Write-Log "  $Hostname : Connected via DCOM." 'INFO' 'Yellow'
+        return [pscustomobject]@{ Tier = 'DCOM'; Session = $cs; Hostname = $Hostname }
+    }
+    catch {
+        Write-Log "  $Hostname : DCOM failed ($($_.Exception.Message)) — trying UNC." 'WARN' 'Yellow'
+    }
+
+    # --- Tier 3: UNC admin share ---
+    $unc = "\\$Hostname\e$"
+    if (Test-Path $unc) {
+        Write-Log "  $Hostname : UNC share reachable ($unc). File operations only — no remote execution." 'WARN' 'Yellow'
+        return [pscustomobject]@{ Tier = 'UNC'; Session = $null; Hostname = $Hostname }
+    }
+
+    Write-Log "  $Hostname : All connection methods failed." 'ERROR' 'Red'
+    return $null
+}
+
+function Disconnect-RemoteServer {
+    param([pscustomobject]$Ctx)
+    if (-not $Ctx) { return }
+    try {
+        switch ($Ctx.Tier) {
+            'WinRM' { Remove-PSSession  $Ctx.Session -ErrorAction SilentlyContinue }
+            'DCOM'  { Remove-CimSession $Ctx.Session -ErrorAction SilentlyContinue }
+        }
+    }
+    catch {}
+}
+
+# Invoke-RCmd — run a scriptblock remotely.
+#   WinRM: Invoke-Command with full scriptblock support.
+#   DCOM:  Serialise the block as a string, write a temp .ps1 to UNC,
+#          launch it via Win32_Process, poll for exit, read output via UNC.
+#   UNC:   Cannot execute — returns $null and logs a warning.
+function Invoke-RCmd {
+    param(
+        [pscustomobject]$Ctx,
+        [scriptblock]$Block,
+        [object[]]$Args = @()
+    )
+
+    if (-not $Ctx) { return $null }
+
+    switch ($Ctx.Tier) {
+
+        'WinRM' {
+            return Invoke-Command -Session $Ctx.Session -ScriptBlock $Block -ArgumentList $Args
+        }
+
+        'DCOM' {
+            # Build a self-contained .ps1 that inlines the args as JSON then calls the block
+            $guid    = [guid]::NewGuid().ToString('N')
+            $outFile = "C:\Windows\Temp\rcmd_out_$guid.txt"
+            $ps1File = "C:\Windows\Temp\rcmd_$guid.ps1"
+            $uncOut  = "\\$($Ctx.Hostname)\C`$\Windows\Temp\rcmd_out_$guid.txt"
+            $uncPs1  = "\\$($Ctx.Hostname)\C`$\Windows\Temp\rcmd_$guid.ps1"
+
+            # Serialise arguments via CliXml into the script header
+            $argsXml = ($Args | ForEach-Object { $_ | ConvertTo-Json -Depth 5 -Compress }) -join "`n"
+            $ps1Body = @"
+`$argsRaw = @(
+$(($Args | ForEach-Object { "`$(`$null | Select-Object -InputObject (ConvertFrom-Json '$($_ | ConvertTo-Json -Depth 5 -Compress)')" }) -join "`n")
+)
+& {
+$($Block.ToString())
+} @argsRaw 2>&1 | Out-File -FilePath '$outFile' -Encoding utf8
+"@
+            # Simpler approach: write block + args via param substitution
+            $argLines = for ($i = 0; $i -lt $Args.Count; $i++) {
+                "`$arg$i = $(ConvertTo-Json $Args[$i] -Depth 5 -Compress)"
+            }
+            $argPass = (0..($Args.Count-1) | ForEach-Object { "`$arg$_" }) -join ','
+            $ps1Body = @"
+$(($argLines) -join "`n")
+& {
+$($Block.ToString())
+} $argPass 2>&1 | Out-File -FilePath '$outFile' -Encoding utf8
+"@
+            try {
+                Set-Content -Path $uncPs1 -Value $ps1Body -Encoding UTF8 -ErrorAction Stop
+            }
+            catch {
+                Write-Log "  $($Ctx.Hostname) : DCOM - could not write temp script via UNC: $_" 'ERROR' 'Red'
+                return $null
+            }
+
+            $mc = $null
+            try { $mc = [wmiclass]"\\$($Ctx.Hostname)\root\cimv2:Win32_Process" }
+            catch {
+                Write-Log "  $($Ctx.Hostname) : DCOM - Win32_Process class unavailable: $_" 'ERROR' 'Red'
+                Remove-Item $uncPs1 -Force -ErrorAction SilentlyContinue
+                return $null
+            }
+
+            $r = $mc.Create("powershell.exe -NonInteractive -ExecutionPolicy Bypass -File `"$ps1File`"")
+            if ($r.ReturnValue -ne 0) {
+                Write-Log "  $($Ctx.Hostname) : DCOM - Win32_Process.Create failed (rc=$($r.ReturnValue))." 'ERROR' 'Red'
+                Remove-Item $uncPs1 -Force -ErrorAction SilentlyContinue
+                return $null
+            }
+
+            $pid2    = $r.ProcessId
+            $timeout = 180
+            $elapsed = 0
+            do {
+                Start-Sleep -Seconds 2
+                $elapsed += 2
+                $running = Get-WmiObject -Class Win32_Process -ComputerName $Ctx.Hostname `
+                               -Filter "ProcessId=$pid2" -ErrorAction SilentlyContinue
+            } while ($running -and $elapsed -lt $timeout)
+
+            $output = Get-Content $uncOut -ErrorAction SilentlyContinue
+            Remove-Item $uncOut  -Force -ErrorAction SilentlyContinue
+            Remove-Item $uncPs1  -Force -ErrorAction SilentlyContinue
+            return $output
+        }
+
+        'UNC' {
+            Write-Log "  $($Ctx.Hostname) : UNC-only — cannot execute remote commands." 'WARN' 'Yellow'
+            return $null
+        }
+    }
+}
+
+# Read-RFile — read a remote text file.
+#   WinRM: Invoke-Command Get-Content.
+#   DCOM/UNC: direct UNC path read (no remote execution needed).
+function Read-RFile {
+    param([pscustomobject]$Ctx, [string]$Path)
+    if (-not $Ctx) { return $null }
+    if ($Ctx.Tier -eq 'WinRM') {
+        return Invoke-Command -Session $Ctx.Session -ScriptBlock {
+            param($p) Get-Content -Path $p -Raw -ErrorAction Stop
+        } -ArgumentList $Path
+    }
+    $unc = "\\$($Ctx.Hostname)\$($Path -replace '^([A-Za-z]):\\', '$1$\')"
+    return Get-Content -Path $unc -Raw -ErrorAction Stop
+}
+
+# Write-RFile — write content to a remote path.
+#   WinRM: Invoke-Command Set-Content.
+#   DCOM/UNC: direct UNC write.
+function Write-RFile {
+    param([pscustomobject]$Ctx, [string]$Path, [string]$Content)
+    if (-not $Ctx) { return }
+    if ($Ctx.Tier -eq 'WinRM') {
+        Invoke-Command -Session $Ctx.Session -ScriptBlock {
+            param($p, $c) Set-Content -Path $p -Value $c -Encoding UTF8 -Force
+        } -ArgumentList $Path, $Content
+        return
+    }
+    $unc = "\\$($Ctx.Hostname)\$($Path -replace '^([A-Za-z]):\\', '$1$\')"
+    Set-Content -Path $unc -Value $Content -Encoding UTF8 -Force
+}
+
+# Get-RCimInstances — query WMI/CIM on a remote server.
+#   WinRM: Get-CimInstance via PSSession.
+#   DCOM:  Get-CimInstance via existing CimSession.
+#   UNC:   Get-WmiObject fallback (DCOM-style, no CIM session required).
+function Get-RCimInstances {
+    param([pscustomobject]$Ctx, [string]$ClassName, [string]$Filter = '')
+    if (-not $Ctx) { return $null }
+    $params = @{ ClassName = $ClassName; ErrorAction = 'Stop' }
+    if ($Filter) { $params['Filter'] = $Filter }
+    switch ($Ctx.Tier) {
+        'WinRM' {
+            return Invoke-Command -Session $Ctx.Session -ScriptBlock {
+                param($cn, $f)
+                $p = @{ ClassName = $cn; ErrorAction = 'Stop' }
+                if ($f) { $p['Filter'] = $f }
+                Get-CimInstance @p
+            } -ArgumentList $ClassName, $Filter
+        }
+        'DCOM' {
+            $params['CimSession'] = $Ctx.Session
+            return Get-CimInstance @params
+        }
+        'UNC' {
+            # Fallback to legacy Get-WmiObject (uses DCOM internally, no CIM session)
+            $wparams = @{ Class = $ClassName; ComputerName = $Ctx.Hostname; ErrorAction = 'Stop' }
+            if ($Filter) { $wparams['Filter'] = $Filter }
+            return Get-WmiObject @wparams
+        }
+    }
+}
+
+# Get-RServiceInfo — return service details for a named service.
+function Get-RServiceInfo {
+    param([pscustomobject]$Ctx, [string]$Name)
+    return Get-RCimInstances -Ctx $Ctx -ClassName 'Win32_Service' -Filter "Name='$Name'"
+}
+
+# Test connection tier and log a summary banner.
+function Write-ConnectionBanner {
+    param([pscustomobject]$Ctx)
+    if (-not $Ctx) { return }
+    $tierColor = switch ($Ctx.Tier) {
+        'WinRM' { 'Green'  }
+        'DCOM'  { 'Yellow' }
+        'UNC'   { 'Red'    }
+    }
+    $tierNote = switch ($Ctx.Tier) {
+        'WinRM' { 'Full remote execution available.'                          }
+        'DCOM'  { 'WMI queries + Win32_Process execution. No PS scriptblock.' }
+        'UNC'   { 'File access only. Service ops will be skipped.'            }
+    }
+    Write-Log "  $($Ctx.Hostname) [$($Ctx.Tier)] — $tierNote" 'INFO' $tierColor
+}
+#endregion
+
 #region Operation 1 — Backup
 function Invoke-Backup {
     $script:_ActiveLog = New-LogPath 'Backup'
@@ -209,37 +455,28 @@ function Invoke-Backup {
     }
     Write-Log "Servers: $totalEntries across $($serverGroups.Keys.Count) zone(s)" 'INFO' 'Gray'
 
-    # Discovery scriptblock — runs remotely; no closures over local vars
-    # Returns one result object per Content Server instance found on the host.
-    # Uses plain PS arrays (not generic Lists) so WinRM serialization round-trips cleanly.
+    # Discovery scriptblock — runs via WinRM or DCOM Win32_Process
     $discoverScript = {
-        $results = @()
-        $errors  = @()
+        $result = [pscustomobject]@{
+            InstanceName      = $null
+            TomcatServiceName = $null
+            ContentServerDir  = $null
+            Errors            = New-Object 'System.Collections.Generic.List[string]'
+        }
         try {
             $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
-
-            # Collect ALL Content Server services (exclude Admin helpers)
-            $csSvcs = @($allSvcs | Where-Object {
+            $csSvc   = $allSvcs | Where-Object {
                 $_.Description -like '*Content Server*' -and
                 $_.Description -notlike '*Content Server Admin*'
-            })
+            } | Select-Object -First 1
 
-            if ($csSvcs.Count -eq 0) {
-                $errors += "WARNING: No Content Server services found."
-            }
-
-            $tomcatSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } |
-                         Select-Object -First 1
-            $tomcatName = if ($tomcatSvc) { $tomcatSvc.Name } else { $null }
-            if (-not $tomcatName) { $errors += "WARNING: No Tomcat service found." }
-
-            foreach ($csSvc in $csSvcs) {
-                $csDir      = $null
-                $instErrors = @()
+            if ($csSvc) {
+                $result.InstanceName = $csSvc.Name
                 if ($csSvc.PathName) {
                     $exePath = $csSvc.PathName -replace '^"([^"]+)".*$','$1' `
                                                -replace '^([^\s]+\.exe).*$','$1'
-                    $dir = Split-Path $exePath -Parent
+                    $dir   = Split-Path $exePath -Parent
+                    $csDir = $null
                     for ($i = 0; $i -lt 6; $i++) {
                         if ([IO.Path]::GetFileName($dir) -ieq 'contentserver') { $csDir = $dir; break }
                         $candidate = Join-Path $dir 'contentserver'
@@ -248,29 +485,21 @@ function Invoke-Backup {
                         if ($parent -eq $dir) { break }
                         $dir = $parent
                     }
-                    if (-not $csDir) { $instErrors += "WARNING: Could not locate 'contentserver' directory for '$($csSvc.Name)'." }
-                } else { $instErrors += "WARNING: Service '$($csSvc.Name)' has no PathName." }
+                    if ($csDir) { $result.ContentServerDir = $csDir }
+                    else { $result.Errors.Add("WARNING: Could not locate 'contentserver' directory.") }
+                } else { $result.Errors.Add("WARNING: Content Server service has no PathName.") }
+            } else { $result.Errors.Add("WARNING: No Content Server service found.") }
 
-                $results += [pscustomobject]@{
-                    InstanceName      = $csSvc.Name
-                    TomcatServiceName = $tomcatName
-                    ContentServerDir  = $csDir
-                    Errors            = $instErrors
-                }
-            }
+            $tomcatSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } |
+                         Select-Object -First 1
+            if ($tomcatSvc) { $result.TomcatServiceName = $tomcatSvc.Name }
+            else { $result.Errors.Add("WARNING: No Tomcat service found.") }
         }
-        catch { $errors += "ERROR during discovery: $_" }
-
-        # Force return as a single object — the comma operator prevents PS from enumerating
-        # the Instances array onto the pipeline, which would break the caller's .Instances access.
-        $wrapper = [pscustomobject]@{
-            Instances = $results
-            Errors    = $errors
-        }
-        return ,$wrapper
+        catch { $result.Errors.Add("ERROR during discovery: $_") }
+        return $result
     }
 
-    # Compression scriptblock — runs remotely
+    # Compression scriptblock — runs via WinRM or DCOM Win32_Process
     $compressScript = {
         param(
             [string[]]$SvcNames,
@@ -342,26 +571,80 @@ function Invoke-Backup {
     # Phase 1: Discovery
     Write-Log "Phase 1: Discovery..." 'INFO' 'Yellow'
     $discoveryResults = @{}
+
     foreach ($group in $serverGroups.Keys) {
         foreach ($fqdn in $serverGroups[$group]) {
+            $ctx = Connect-RemoteServer -Hostname $fqdn
+            if (-not $ctx) {
+                Write-Log "  ${fqdn}: All connection methods failed — skipping." 'ERROR' 'Red'
+                $errList = New-Object 'System.Collections.Generic.List[string]'
+                $errList.Add("All connection methods failed.")
+                $discoveryResults[$fqdn] = [pscustomobject]@{
+                    InstanceName=$null; TomcatServiceName=$null; ContentServerDir=$null
+                    Errors=$errList; Ctx=$null
+                }
+                continue
+            }
+            Write-ConnectionBanner -Ctx $ctx
+
+            if ($ctx.Tier -eq 'UNC') {
+                # UNC only — can't run discovery scriptblock; try WMI via legacy Get-WmiObject
+                Write-Log "  ${fqdn}: UNC-only — attempting legacy WMI service discovery..." 'WARN' 'Yellow'
+                $errList = New-Object 'System.Collections.Generic.List[string]'
+                try {
+                    $allSvcs   = Get-WmiObject -Class Win32_Service -ComputerName $fqdn -ErrorAction Stop
+                    $csSvc     = $allSvcs | Where-Object {
+                        $_.Description -like '*Content Server*' -and
+                        $_.Description -notlike '*Content Server Admin*'
+                    } | Select-Object -First 1
+                    $tomcatSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } |
+                                 Select-Object -First 1
+                    $instName  = if ($csSvc)     { $csSvc.Name }     else { $null }
+                    $tomName   = if ($tomcatSvc) { $tomcatSvc.Name } else { $null }
+                    if (-not $instName) { $errList.Add("WARNING: No Content Server service found via WMI.") }
+                    if (-not $tomName)  { $errList.Add("WARNING: No Tomcat service found via WMI.") }
+                    # ContentServerDir — can't resolve path without executing code; skip
+                    $errList.Add("WARNING: ContentServerDir not resolvable via UNC-only — backup skipped.")
+                    $discoveryResults[$fqdn] = [pscustomobject]@{
+                        InstanceName=$instName; TomcatServiceName=$tomName; ContentServerDir=$null
+                        Errors=$errList; Ctx=$ctx
+                    }
+                }
+                catch {
+                    $errList.Add("ERROR: Legacy WMI failed: $_")
+                    $discoveryResults[$fqdn] = [pscustomobject]@{
+                        InstanceName=$null; TomcatServiceName=$null; ContentServerDir=$null
+                        Errors=$errList; Ctx=$ctx
+                    }
+                }
+                continue
+            }
+
+            # WinRM or DCOM — run discovery scriptblock
             try {
-                $disc = Invoke-Command -ComputerName $fqdn -ScriptBlock $discoverScript -ErrorAction Stop
-                $discoveryResults[$fqdn] = $disc
-                $disc.Errors | ForEach-Object { Write-Log "  ${fqdn}: $_" 'WARN' 'Yellow' }
-                if ($disc.Instances.Count -eq 0) {
-                    Write-Log "  ${fqdn}: No Content Server instances found." 'WARN' 'Yellow'
-                } else {
-                    foreach ($inst in $disc.Instances) {
-                        $inst.Errors | ForEach-Object { Write-Log "  ${fqdn}: $_" 'WARN' 'Yellow' }
-                        Write-Log "  ${fqdn}: Instance='$($inst.InstanceName)' Tomcat='$($inst.TomcatServiceName)' CSDir='$($inst.ContentServerDir)'" 'INFO' 'Gray'
+                $disc = Invoke-RCmd -Ctx $ctx -Block $discoverScript
+                if ($disc) {
+                    $disc | Add-Member -NotePropertyName 'Ctx' -NotePropertyValue $ctx -Force
+                    $disc.Errors | ForEach-Object { Write-Log "  ${fqdn}: $_" 'WARN' 'Yellow' }
+                    Write-Log "  ${fqdn}: Instance='$($disc.InstanceName)' Tomcat='$($disc.TomcatServiceName)' CSDir='$($disc.ContentServerDir)'" 'INFO' 'Gray'
+                    $discoveryResults[$fqdn] = $disc
+                }
+                else {
+                    $errList = New-Object 'System.Collections.Generic.List[string]'
+                    $errList.Add("Discovery scriptblock returned null.")
+                    $discoveryResults[$fqdn] = [pscustomobject]@{
+                        InstanceName=$null; TomcatServiceName=$null; ContentServerDir=$null
+                        Errors=$errList; Ctx=$ctx
                     }
                 }
             }
             catch {
                 Write-Log "  ${fqdn}: Discovery FAILED - $_" 'ERROR' 'Red'
+                $errList = New-Object 'System.Collections.Generic.List[string]'
+                $errList.Add("Discovery failed: $_")
                 $discoveryResults[$fqdn] = [pscustomobject]@{
-                    Instances = @()
-                    Errors    = @("Discovery failed: $_")
+                    InstanceName=$null; TomcatServiceName=$null; ContentServerDir=$null
+                    Errors=$errList; Ctx=$ctx
                 }
             }
         }
@@ -374,42 +657,93 @@ function Invoke-Backup {
     foreach ($group in $serverGroups.Keys) {
         foreach ($fqdn in $serverGroups[$group]) {
             $disc = $discoveryResults[$fqdn]
-            if (-not $disc.Instances -or $disc.Instances.Count -eq 0) {
-                Write-Log "SKIPPING $fqdn — no instances discovered." 'WARN' 'Yellow'
+            if (-not $disc.InstanceName -or -not $disc.ContentServerDir) {
+                Write-Log "SKIPPING $fqdn — incomplete discovery (no instance or CS dir)." 'WARN' 'Yellow'
+                if ($disc.Ctx) { Disconnect-RemoteServer -Ctx $disc.Ctx }
+                continue
+            }
+            $ctx = $disc.Ctx
+            if ($ctx.Tier -eq 'UNC') {
+                Write-Log "SKIPPING $fqdn — UNC-only cannot execute backup." 'WARN' 'Yellow'
+                Disconnect-RemoteServer -Ctx $ctx
                 continue
             }
 
-            foreach ($instDisc in $disc.Instances) {
-                if (-not $instDisc.InstanceName -or -not $instDisc.ContentServerDir) {
-                    Write-Log "SKIPPING $fqdn / '$($instDisc.InstanceName)' — incomplete discovery." 'WARN' 'Yellow'
-                    continue
+            $inst     = $disc.InstanceName
+            $svcNames = @($BackupConfig.StaticServices | ForEach-Object {
+                if ($_ -eq '{TOMCAT}') {
+                    if ($disc.TomcatServiceName) { $disc.TomcatServiceName }
                 }
+                elseif ($_ -eq '{INSTANCE}') { $inst }
+                else { $_ -replace [regex]::Escape('{INSTANCE}'), $inst }
+            } | Where-Object { $_ })
 
-                $inst     = $instDisc.InstanceName
-                $svcNames = @($BackupConfig.StaticServices | ForEach-Object {
-                    if ($_ -eq '{TOMCAT}') {
-                        if ($instDisc.TomcatServiceName) { $instDisc.TomcatServiceName }
-                    }
-                    elseif ($_ -eq '{INSTANCE}') { $inst }
-                    else { $_ -replace [regex]::Escape('{INSTANCE}'), $inst }
-                } | Where-Object { $_ })
+            $srcPath    = $disc.ContentServerDir
+            $destFolder = Split-Path $srcPath -Parent
+            $srcName    = Split-Path $srcPath -Leaf
+            $destPath   = Join-Path $destFolder "${srcName}_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').zip"
 
-                $srcPath    = $instDisc.ContentServerDir
-                $destFolder = Split-Path $srcPath -Parent
-                $srcName    = Split-Path $srcPath -Leaf
-                $destPath   = Join-Path $destFolder "${srcName}_$(Get-Date -Format 'yyyy-MM-dd_HHmmss').zip"
+            while ((Get-Job -State Running).Count -ge $BackupConfig.MaxParallelJobs) {
+                Start-Sleep -Milliseconds 500
+            }
 
-                while ((Get-Job -State Running).Count -ge $BackupConfig.MaxParallelJobs) {
-                    Start-Sleep -Milliseconds 500
-                }
-
+            # For WinRM — use Invoke-Command AsJob (original approach)
+            # For DCOM  — use Start-Job that calls Invoke-RCmd (which uses Win32_Process)
+            if ($ctx.Tier -eq 'WinRM') {
                 $job = Invoke-Command -ComputerName $fqdn -ScriptBlock $compressScript `
                     -ArgumentList $svcNames,$srcPath,$destPath,$destFolder,$srcName, `
                                   $BackupConfig.MaxBackups,$BackupConfig.StopTimeoutSec,$BackupConfig.StartTimeoutSec `
                     -AsJob
-                $job.Name = "${fqdn}::${inst}"
-                $jobs.Add([pscustomobject]@{ Job=$job; ComputerName=$fqdn; GroupName=$group; InstanceName=$inst })
+                $job.Name = $fqdn
             }
+            else {
+                # DCOM — wrap in a local job that drives Win32_Process remotely
+                $capturedCtx  = $ctx
+                $capturedArgs = @($svcNames,$srcPath,$destPath,$destFolder,$srcName,
+                                  $BackupConfig.MaxBackups,$BackupConfig.StopTimeoutSec,$BackupConfig.StartTimeoutSec)
+                $job = Start-Job -ScriptBlock {
+                    param($hostname,$blk,$al)
+                    # Re-establish DCOM inside the job
+                    $opt = New-CimSessionOption -Protocol Dcom
+                    $cs  = New-CimSession -ComputerName $hostname -SessionOption $opt -ErrorAction Stop
+                    $innerCtx = [pscustomobject]@{ Tier='DCOM'; Session=$cs; Hostname=$hostname }
+
+                    $guid    = [guid]::NewGuid().ToString('N')
+                    $outFile = "C:\Windows\Temp\rcmd_out_$guid.txt"
+                    $ps1File = "C:\Windows\Temp\rcmd_$guid.ps1"
+                    $uncOut  = "\\$hostname\C`$\Windows\Temp\rcmd_out_$guid.txt"
+                    $uncPs1  = "\\$hostname\C`$\Windows\Temp\rcmd_$guid.ps1"
+
+                    $argLines = for ($i = 0; $i -lt $al.Count; $i++) {
+                        "`$arg$i = $(ConvertTo-Json $al[$i] -Depth 5 -Compress)"
+                    }
+                    $argPass  = (0..($al.Count-1) | ForEach-Object { "`$arg$_" }) -join ','
+                    $ps1Body  = "$(($argLines) -join "`n")`n& {`n$blk`n} $argPass 2>&1 | Out-File '$outFile' -Encoding utf8"
+                    Set-Content -Path $uncPs1 -Value $ps1Body -Encoding UTF8
+
+                    $mc = [wmiclass]"\\$hostname\root\cimv2:Win32_Process"
+                    $r  = $mc.Create("powershell.exe -NonInteractive -ExecutionPolicy Bypass -File `"$ps1File`"")
+                    if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create failed rc=$($r.ReturnValue)" }
+                    $pid2 = $r.ProcessId; $elapsed = 0
+                    do {
+                        Start-Sleep 2; $elapsed += 2
+                        $running = Get-WmiObject -Class Win32_Process -ComputerName $hostname `
+                                       -Filter "ProcessId=$pid2" -ErrorAction SilentlyContinue
+                    } while ($running -and $elapsed -lt 180)
+                    Get-Content $uncOut -ErrorAction SilentlyContinue
+                    Remove-Item $uncOut,$uncPs1 -Force -ErrorAction SilentlyContinue
+                    Remove-CimSession $cs -ErrorAction SilentlyContinue
+                } -ArgumentList $fqdn, $compressScript.ToString(), $capturedArgs
+                $job.Name = $fqdn
+            }
+
+            $jobs.Add([pscustomobject]@{
+                Job          = $job
+                ComputerName = $fqdn
+                GroupName    = $group
+                InstanceName = $inst
+                Tier         = $ctx.Tier
+            })
         }
     }
 
@@ -424,12 +758,12 @@ function Invoke-Backup {
                 Write-Log "# Zone: $($entry.GroupName)" 'INFO' 'Magenta'
                 $prevGroup = $entry.GroupName
             }
-            Write-Log "--- $($entry.ComputerName) ($($entry.InstanceName)) ---" 'INFO' 'Cyan'
+            Write-Log "--- $($entry.ComputerName) ($($entry.InstanceName)) [$($entry.Tier)] ---" 'INFO' 'Cyan'
             $entry.Job | Receive-Job | ForEach-Object {
-                $c = if     ($_ -match 'ERROR|FAILED')               { 'Red'    }
-                     elseif ($_ -match 'WARNING')                    { 'Yellow' }
-                     elseif ($_ -match 'completed|started\.|stopped\.') { 'Green'  }
-                     else                                            { 'Gray'   }
+                $c = if     ($_ -match 'ERROR|FAILED')                   { 'Red'    }
+                     elseif ($_ -match 'WARNING')                        { 'Yellow' }
+                     elseif ($_ -match 'completed|started\.|stopped\.')  { 'Green'  }
+                     else                                                { 'Gray'   }
                 Write-Log $_ 'INFO' $c
             }
             if ($entry.Job.State -eq 'Completed') {
@@ -444,6 +778,13 @@ function Invoke-Backup {
         $jobs | ForEach-Object { $_.Job | Remove-Job -Force }
     }
 
+    # Disconnect all sessions opened during discovery
+    foreach ($fqdn in $discoveryResults.Keys) {
+        if ($discoveryResults[$fqdn].Ctx) {
+            Disconnect-RemoteServer -Ctx $discoveryResults[$fqdn].Ctx
+        }
+    }
+
     Write-Log "Backup operation complete. Log: $($script:_ActiveLog)" 'OK' 'Green'
 }
 #endregion
@@ -454,38 +795,6 @@ function Invoke-SystemCenterUpdate {
 
     Write-Header "Operation 2: System Center Agent Update"
     Write-Log "Log: $($script:_ActiveLog)" 'INFO' 'Gray'
-
-    function Get-SCAgentInstallDir {
-        # Resolve the agent install directory from the service's executable path.
-        # Falls back to $SCConfig.InstallDir if the service is missing or its path is invalid.
-        $svc = Get-CimInstance -ClassName Win32_Service `
-               -Filter "Name='OTSystemCenterAgent'" -ErrorAction SilentlyContinue
-        if (-not $svc) {
-            # Broader match in case the service name differs slightly between versions
-            $svc = Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -like '*SystemCenterAgent*' -or
-                                  $_.DisplayName -like '*System Center*Agent*' } |
-                   Select-Object -First 1
-        }
-        if ($svc -and $svc.PathName) {
-            # Strip quotes and arguments to get the bare exe path
-            $exe = $svc.PathName -replace '^"([^"]+)".*$','$1' `
-                                 -replace '^([^\s]+\.exe).*$','$1'
-            $dir = Split-Path $exe -Parent
-            # If the exe lives in a bin\ subfolder, the install root is one level up
-            if ((Split-Path $dir -Leaf) -ieq 'bin') { $dir = Split-Path $dir -Parent }
-            if (Test-Path $dir -PathType Container) {
-                Write-Log "Resolved agent install dir from service '$($svc.Name)': $dir" 'OK' 'Green'
-                return $dir
-            }
-            Write-Log "Service path '$dir' does not exist on disk — using configured fallback." 'WARN' 'Yellow'
-        }
-        else {
-            Write-Log "SC Agent service not found — using configured fallback path." 'WARN' 'Yellow'
-        }
-        Write-Log "Fallback install dir: $($SCConfig.InstallDir)" 'INFO' 'Gray'
-        return $SCConfig.InstallDir
-    }
 
     function Get-ResolvedSCServices {
         $allSvcs   = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
@@ -550,11 +859,8 @@ function Invoke-SystemCenterUpdate {
         }
     }
 
-    # Resolve install path from the running service (must happen BEFORE services are stopped,
-    # while the service registration is guaranteed present)
-    $agentDir     = Get-SCAgentInstallDir
-    if (-not (Test-Path $agentDir)) {
-        Write-Log "Install directory not found: $agentDir" 'ERROR' 'Red'
+    if (-not (Test-Path $SCConfig.InstallDir)) {
+        Write-Log "Install directory not found: $($SCConfig.InstallDir)" 'ERROR' 'Red'
         return
     }
 
@@ -572,10 +878,10 @@ function Invoke-SystemCenterUpdate {
 
         # Phase 2 — Backup install directory
         Write-Log "Phase 2: Backing up install directory..." 'INFO' 'Yellow'
-        $backupDir  = Split-Path $agentDir -Parent
-        $backupName = "$(Split-Path $agentDir -Leaf)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+        $backupDir  = Split-Path $SCConfig.InstallDir -Parent
+        $backupName = "$(Split-Path $SCConfig.InstallDir -Leaf)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
         $backupPath = Join-Path $backupDir $backupName
-        Compress-Archive -Path $agentDir -DestinationPath $backupPath -Force
+        Compress-Archive -Path $SCConfig.InstallDir -DestinationPath $backupPath -Force
         Write-Log "Backup created: $backupPath" 'OK' 'Green'
         Write-Log -Spacer
 
@@ -615,18 +921,9 @@ function Invoke-SystemCenterUpdate {
         }
         Write-Log -Spacer
 
-        # Phase 5 — Preserve localcerts, then empty install directory
-        Write-Log "Phase 5: Preserving localcerts and emptying install directory..." 'INFO' 'Yellow'
-        $localcertsSrc  = $SCConfig.LocalcertsDir
-        $localcertsTemp = Join-Path $env:TEMP "SCA_localcerts_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-        if (Test-Path $localcertsSrc) {
-            Copy-Item -Path $localcertsSrc -Destination $localcertsTemp -Recurse -Force
-            Write-Log "  Preserved localcerts to: $localcertsTemp" 'OK' 'Green'
-        } else {
-            Write-Log "  WARNING: localcerts not found at '$localcertsSrc' — will not be restored." 'WARN' 'Yellow'
-            $localcertsTemp = $null
-        }
-        Get-ChildItem -Path $agentDir -Force -ErrorAction SilentlyContinue |
+        # Phase 5 — Empty install directory
+        Write-Log "Phase 5: Emptying install directory..." 'INFO' 'Yellow'
+        Get-ChildItem -Path $SCConfig.InstallDir -Force -ErrorAction SilentlyContinue |
             ForEach-Object {
                 Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop
                 Write-Log "  Removed: $($_.Name)" 'INFO' 'Gray'
@@ -640,33 +937,42 @@ function Invoke-SystemCenterUpdate {
         $installArgs = "/qn /l*vx `"$installLog`" /i `"$msiPath`" " +
                        "HTTP_PORT_NUMBER=`"$($SCConfig.HttpPort)`" " +
                        "SERVER_NAME=`"$($SCConfig.ServerName)`" " +
-                       "INSTALLDIR=`"$agentDir`""
+                       "INSTALLDIR=`"$($SCConfig.MsiInstallDir)`""
         $proc = Start-Process 'msiexec.exe' -ArgumentList $installArgs -Wait -PassThru
         if ($proc.ExitCode -ne 0) { throw "Install failed (exit $($proc.ExitCode)). See: $installLog" }
         Write-Log "Install complete. Log: $installLog" 'OK' 'Green'
         Write-Log -Spacer
 
-        # Phase 7 — Restore localcerts folder
-        Write-Log "Phase 7: Restoring localcerts folder..." 'INFO' 'Yellow'
-        if ($localcertsTemp -and (Test-Path $localcertsTemp)) {
-            Copy-Item -Path $localcertsTemp -Destination $SCConfig.LocalcertsDir -Recurse -Force
-            Remove-Item $localcertsTemp -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "Restored localcerts to: $($SCConfig.LocalcertsDir)" 'OK' 'Green'
-        } else {
-            Write-Log "localcerts was not preserved — skipping restore." 'WARN' 'Yellow'
+        # Phase 7 — Restore configuration.conf.ini from backup zip
+        Write-Log "Phase 7: Restoring '$($SCConfig.RestoreFile)' from backup..." 'INFO' 'Yellow'
+        $tempExtract = Join-Path $env:TEMP "SCA_restore_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($backupPath)
+        try {
+            $zipEntry = $zip.Entries | Where-Object { $_.Name -ieq $SCConfig.RestoreFile } |
+                        Select-Object -First 1
+            if (-not $zipEntry) { throw "'$($SCConfig.RestoreFile)' not found in backup zip." }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
+                $zipEntry,
+                (Join-Path $tempExtract $SCConfig.RestoreFile),
+                $true
+            )
         }
+        finally { $zip.Dispose() }
+        Move-Item -Path (Join-Path $tempExtract $SCConfig.RestoreFile) `
+                  -Destination (Join-Path $SCConfig.InstallDir $SCConfig.RestoreFile) -Force
+        Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "Restored '$($SCConfig.RestoreFile)' to install root." 'OK' 'Green'
         Write-Log -Spacer
 
-        # Phase 8 — Write fixed config.ini into configuration directory
-        Write-Log "Phase 8: Writing config.ini to configuration directory..." 'INFO' 'Yellow'
-        $confDestDir = Join-Path $agentDir 'configuration'
-        $confDest    = Join-Path $confDestDir 'config.ini'
-        if (-not (Test-Path $confDestDir)) {
-            New-Item -ItemType Directory -Path $confDestDir -Force | Out-Null
-            Write-Log "Created configuration directory: $confDestDir" 'INFO' 'Gray'
-        }
-        Set-Content -Path $confDest -Value $SCConfig.ConfIniContent -Encoding UTF8 -Force
-        Write-Log "config.ini written to: $confDest" 'OK' 'Green'
+        # Phase 8 — Copy conf.ini from localhost\configuration\
+        Write-Log "Phase 8: Copying '$($SCConfig.CopyFile)' from localhost folder..." 'INFO' 'Yellow'
+        $confSource = Join-Path $SCConfig.LocalhostDir "configuration\$($SCConfig.CopyFile)"
+        $confDest   = Join-Path $SCConfig.InstallDir $SCConfig.CopyFile
+        if (-not (Test-Path $confSource)) { throw "'$($SCConfig.CopyFile)' not found at: $confSource" }
+        Copy-Item -Path $confSource -Destination $confDest -Force
+        Write-Log "Copied '$confSource' -> '$confDest'" 'OK' 'Green'
         Write-Log -Spacer
     }
     catch {
@@ -680,10 +986,6 @@ function Invoke-SystemCenterUpdate {
         if ($msiTemp -and (Test-Path $msiTemp)) {
             Remove-Item $msiTemp -Recurse -Force -ErrorAction SilentlyContinue
             Write-Log "Temp MSI folder cleaned up." 'OK' 'Green'
-        }
-        if ($localcertsTemp -and (Test-Path $localcertsTemp)) {
-            Remove-Item $localcertsTemp -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "Temp localcerts folder cleaned up." 'OK' 'Green'
         }
     }
 
@@ -771,7 +1073,7 @@ function Invoke-TomcatUpgrade {
         }
     }
 
-    # ---- Enumerate Tomcat services scriptblock (runs remotely) ----
+    # ---- Enumerate Tomcat services (runs remotely via Invoke-RCmd or WMI) ----
     $enumSvcsBlock = {
         param($candidates)
         $svcs = @(Get-Service -Name '*Tomcat*' -ErrorAction SilentlyContinue)
@@ -822,11 +1124,14 @@ function Invoke-TomcatUpgrade {
                 }
                 catch { }
             }
+            # Also use DescVersion as fallback if catalina.jar unreadable
             $dv = $null
             if ($description) {
                 $dm = [regex]::Match($description, '(\d+\.\d+\.\d+)')
                 if ($dm.Success) { $dv = $dm.Groups[1].Value }
             }
+            if (-not $iv -and $dv) { $iv = $dv }
+
             $results += [PSCustomObject]@{
                 Name             = $svc.Name
                 DisplayName      = $svc.DisplayName
@@ -841,6 +1146,39 @@ function Invoke-TomcatUpgrade {
         return $results
     }
 
+    # UNC-only version detection — reads catalina.jar via UNC path directly
+    function Get-TomcatVersionViaUnc {
+        param([string]$Hostname, [string[]]$Candidates)
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        foreach ($c in $Candidates) {
+            $unc = "\\$Hostname\$($c -replace '^([A-Za-z]):\\', '$1$\')\lib\catalina.jar"
+            if (Test-Path $unc) {
+                try {
+                    $z  = [System.IO.Compression.ZipFile]::OpenRead($unc)
+                    $mf = $z.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' }
+                    if ($mf) {
+                        $r   = New-Object System.IO.StreamReader($mf.Open())
+                        $ct  = $r.ReadToEnd()
+                        $r.Close()
+                        $z.Dispose()
+                        $mm  = [regex]::Match($ct, 'Implementation-Version:\s*(\d+\.\d+\.\d+)')
+                        if ($mm.Success) {
+                            return [pscustomobject]@{
+                                InstalledVersion = $mm.Groups[1].Value
+                                InstallDir       = $c
+                                NormalizedDir    = $c.TrimEnd('\').ToLower()
+                                Name             = 'Unknown-UNC'
+                            }
+                        }
+                    }
+                    else { $z.Dispose() }
+                }
+                catch { }
+            }
+        }
+        return $null
+    }
+
     # ---- Deploy scriptblock (runs as Start-Job) ----
     $DeployBlock = {
         param(
@@ -850,7 +1188,8 @@ function Invoke-TomcatUpgrade {
             [string]$NewVersionPath,
             [string[]]$ServiceMapCandidates,
             [string]$LogFile,
-            [string]$newVersion
+            [string]$newVersion,
+            [string]$ConnectionTier   # 'WinRM' | 'DCOM' | 'UNC'
         )
 
         $LogLock = New-Object System.Threading.Mutex($false, 'TomcatDeployLog')
@@ -882,7 +1221,13 @@ function Invoke-TomcatUpgrade {
             NeedsRollback = $false
             BackupPath    = $null
             Error         = $null
-            IsLocal       = $false
+            Tier          = $ConnectionTier
+        }
+
+        if ($ConnectionTier -eq 'UNC') {
+            Write-TLog 'UNC-only connection — cannot execute service operations. Skipping.' 'WARN'
+            $result.Error = 'UNC-only: no remote execution'
+            return $result
         }
 
         $localNames = @(
@@ -890,31 +1235,60 @@ function Invoke-TomcatUpgrade {
             $env:COMPUTERNAME,
             (($env:COMPUTERNAME + '.' + $env:USERDNSDOMAIN).TrimEnd('.'))
         )
-        $isLocal        = $localNames -contains $server
-        $result.IsLocal = $isLocal
+        $isLocal = $localNames -contains $server
 
-        if (-not $isLocal) {
-            if (-not (Test-Connection -ComputerName $server -Count 1 -Quiet)) {
-                Write-TLog 'Unreachable.' 'ERROR'
-                $result.Error = 'Unreachable'
-                return $result
-            }
+        # Establish connection
+        $session  = $null
+        $useWinRM = $false
+        if ($ConnectionTier -eq 'WinRM') {
             try {
-                $session = New-PSSession -ComputerName $server -ErrorAction Stop
-                Write-TLog 'Session established.' 'OK'
+                if (-not $isLocal) {
+                    $session  = New-PSSession -ComputerName $server -ErrorAction Stop
+                    $useWinRM = $true
+                    Write-TLog 'WinRM session established.' 'OK'
+                }
+                else { $useWinRM = $true; Write-TLog 'Local machine.' 'OK' }
             }
             catch {
-                Write-TLog "Session failed: $_" 'ERROR'
-                $result.Error = $_
-                return $result
+                Write-TLog "WinRM session failed: $_ — falling back to DCOM." 'WARN'
+                $ConnectionTier = 'DCOM'
             }
         }
-        else { $session = $null; Write-TLog 'Local machine - no remote session.' 'WARN' }
+
+        if ($ConnectionTier -eq 'DCOM') {
+            Write-TLog 'Using DCOM (Win32_Process) for remote execution.' 'WARN'
+        }
 
         function Invoke-Step {
             param([scriptblock]$sb, [object[]]$al = @())
-            if ($isLocal) { & $sb @al }
-            else { Invoke-Command -Session $session -ScriptBlock $sb -ArgumentList $al }
+            if ($useWinRM) {
+                if ($isLocal) { return & $sb @al }
+                return Invoke-Command -Session $session -ScriptBlock $sb -ArgumentList $al
+            }
+            # DCOM path
+            $guid    = [guid]::NewGuid().ToString('N')
+            $outFile = "C:\Windows\Temp\dep_out_$guid.txt"
+            $ps1File = "C:\Windows\Temp\dep_$guid.ps1"
+            $uncOut  = "\\$server\C`$\Windows\Temp\dep_out_$guid.txt"
+            $uncPs1  = "\\$server\C`$\Windows\Temp\dep_$guid.ps1"
+            $argLines = for ($i = 0; $i -lt $al.Count; $i++) {
+                "`$a$i = $(ConvertTo-Json $al[$i] -Depth 5 -Compress)"
+            }
+            $argPass = (0..($al.Count-1) | ForEach-Object { "`$a$_" }) -join ','
+            $body    = "$(($argLines) -join "`n")`n& {`n$($sb.ToString())`n} $argPass 2>&1 | Out-File '$outFile' -Encoding utf8"
+            Set-Content -Path $uncPs1 -Value $body -Encoding UTF8
+            $mc = [wmiclass]"\\$server\root\cimv2:Win32_Process"
+            $r  = $mc.Create("powershell.exe -NonInteractive -ExecutionPolicy Bypass -File `"$ps1File`"")
+            if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create failed rc=$($r.ReturnValue)" }
+            $pid2 = $r.ProcessId; $elapsed = 0
+            do {
+                Start-Sleep 2; $elapsed += 2
+                $running = Get-WmiObject -Class Win32_Process -ComputerName $server `
+                               -Filter "ProcessId=$pid2" -ErrorAction SilentlyContinue
+            } while ($running -and $elapsed -lt 180)
+            $out = Get-Content $uncOut -ErrorAction SilentlyContinue
+            Remove-Item $uncOut,$uncPs1 -Force -ErrorAction SilentlyContinue
+            return $out
         }
 
         try {
@@ -948,8 +1322,14 @@ function Invoke-TomcatUpgrade {
                 New-Item -ItemType Directory -Path $t | Out-Null
             } -al $tmp
 
-            if ($isLocal) { Copy-Item -Path "$NewVersionPath\*" -Destination $tmp -Recurse -Force }
-            else { Copy-Item -Path "$NewVersionPath\*" -Destination $tmp -ToSession $session -Recurse -Force }
+            # Copy new version files — WinRM uses Copy-Item -ToSession; DCOM uses UNC
+            if ($useWinRM -and -not $isLocal) {
+                Copy-Item -Path "$NewVersionPath\*" -Destination $tmp -ToSession $session -Recurse -Force
+            }
+            else {
+                $uncTmp = "\\$server\$($tmp -replace '^([A-Za-z]):\\', '$1$\')"
+                Copy-Item -Path "$NewVersionPath\*" -Destination $uncTmp -Recurse -Force
+            }
             Write-TLog 'Files staged.' 'OK'
 
             Invoke-Step -sb {
@@ -986,8 +1366,9 @@ function Invoke-TomcatUpgrade {
 
     # ---- Pre-flight ----
     Write-Log '========== Pre-flight ==========' 'INFO' 'Yellow'
-    $deployedKeys = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
-    $skipServers  = New-Object 'System.Collections.Generic.List[string]'
+    $deployedKeys   = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::OrdinalIgnoreCase)
+    $skipServers    = New-Object 'System.Collections.Generic.List[string]'
+    $serverTierMap  = @{}   # fqdn -> connection tier string
 
     foreach ($s in ($servers | ForEach-Object { $_.Trim() })) {
         $isLocal = $localNames -contains $s
@@ -995,15 +1376,38 @@ function Invoke-TomcatUpgrade {
             Write-Log "$s - UNREACHABLE - will be skipped." 'WARN' 'Yellow'
             continue
         }
+
+        # Establish connection to determine tier
+        $ctx = if ($isLocal) { [pscustomobject]@{ Tier='WinRM'; Session=$null; Hostname=$s } }
+               else          { Connect-RemoteServer -Hostname $s }
+        if (-not $ctx) { continue }
+        $serverTierMap[$s] = $ctx.Tier
+        Write-ConnectionBanner -Ctx $ctx
+
         $svcList = $null
-        if ($isLocal) { $svcList = & $enumSvcsBlock $ServiceCandidates }
+        if ($ctx.Tier -eq 'UNC') {
+            # UNC-only: read catalina.jar via UNC for version detection
+            Write-Log "$s - UNC-only: reading version via UNC path..." 'WARN' 'Yellow'
+            $vResult = Get-TomcatVersionViaUnc -Hostname $s -Candidates $ServiceCandidates
+            if ($vResult) {
+                $svcList = @($vResult)
+                Write-Log "$s - Detected version $($vResult.InstalledVersion) at $($vResult.InstallDir) via UNC." 'INFO' 'Gray'
+            }
+            else {
+                Write-Log "$s - Could not detect Tomcat version via UNC." 'WARN' 'Yellow'
+            }
+        }
+        elseif ($isLocal) {
+            $svcList = & $enumSvcsBlock $ServiceCandidates
+        }
         else {
             try {
-                $svcList = Invoke-Command -ComputerName $s -ScriptBlock $enumSvcsBlock `
-                           -ArgumentList (,$ServiceCandidates) -ErrorAction Stop
+                $svcList = Invoke-RCmd -Ctx $ctx -Block $enumSvcsBlock -Args @(,$ServiceCandidates)
             }
-            catch { Write-Log "$s - Could not query services: $_" 'WARN' 'Yellow'; continue }
+            catch { Write-Log "$s - Could not query services: $_" 'WARN' 'Yellow' }
         }
+
+        Disconnect-RemoteServer -Ctx $ctx
         $svcList = @($svcList)
         if ($svcList.Count -eq 0) { Write-Log "$s - No Tomcat services found." 'WARN' 'Yellow'; continue }
 
@@ -1011,11 +1415,16 @@ function Invoke-TomcatUpgrade {
             $dk = ($s + '::' + $svcEntry.NormalizedDir).ToLower()
             if ($deployedKeys.Contains($dk)) { continue }
             if ($newVersion -and $svcEntry.InstalledVersion -eq $newVersion) {
-                Write-Log "$s - $($svcEntry.InstallDir) already on $newVersion - skipping." 'WARN' 'Yellow'
+                Write-Log "$s - $($svcEntry.InstallDir) already on $newVersion — skipping." 'WARN' 'Yellow'
                 $skipServers.Add($dk)
                 continue
             }
-            Write-Log "$s - $($svcEntry.Name) at $($svcEntry.InstallDir) queued." 'OK' 'Green'
+            if ($serverTierMap[$s] -eq 'UNC') {
+                Write-Log "$s - $($svcEntry.InstallDir) version=$($svcEntry.InstalledVersion) [UNC-only — deploy will be SKIPPED]." 'WARN' 'Yellow'
+            }
+            else {
+                Write-Log "$s - $($svcEntry.Name) at $($svcEntry.InstallDir) queued [$($serverTierMap[$s])]." 'OK' 'Green'
+            }
             $null = $deployedKeys.Add($dk)
         }
     }
@@ -1026,7 +1435,7 @@ function Invoke-TomcatUpgrade {
     })
 
     if ($deployTargets.Count -eq 0) {
-        Write-Log "All servers already on version $newVersion - nothing to deploy." 'OK' 'Green'
+        Write-Log "All servers already on version $newVersion — nothing to deploy." 'OK' 'Green'
         return
     }
     Write-Log "Deploying to $($deployTargets.Count) target(s)." 'INFO' 'Yellow'
@@ -1052,18 +1461,30 @@ function Invoke-TomcatUpgrade {
 
     $jobs = @()
     foreach ($target in $deployTargets) {
-        $srv           = $target.Server
-        $dir           = $target.NormalizedDir
+        $srv  = $target.Server
+        $dir  = $target.NormalizedDir
+        $tier = if ($serverTierMap.ContainsKey($srv)) { $serverTierMap[$srv] } else { 'WinRM' }
+
+        if ($tier -eq 'UNC') {
+            Write-Log "SKIPPING $srv at $dir — UNC-only, no remote execution." 'WARN' 'Yellow'
+            continue
+        }
+
         $isLocalTarget = $localNames -contains $srv
+        $rsn = $null
         if ($isLocalTarget) { $rsn = & $resolveBlock $dir }
         else {
-            try { $rsn = Invoke-Command -ComputerName $srv -ScriptBlock $resolveBlock -ArgumentList $dir -ErrorAction Stop }
-            catch { $rsn = $null }
+            $ctx2 = Connect-RemoteServer -Hostname $srv
+            if ($ctx2) {
+                try { $rsn = Invoke-RCmd -Ctx $ctx2 -Block $resolveBlock -Args @($dir) }
+                catch { }
+                Disconnect-RemoteServer -Ctx $ctx2
+            }
         }
-        if (-not $rsn) { Write-Log "Could not resolve service for $srv at $dir - skipping." 'ERROR' 'Red'; continue }
-        Write-Log "Queuing $srv - $rsn at $dir..." 'INFO' 'Gray'
+        if (-not $rsn) { Write-Log "Could not resolve service for $srv at $dir — skipping." 'ERROR' 'Red'; continue }
+        Write-Log "Queuing $srv - $rsn at $dir [$tier]..." 'INFO' 'Gray'
         $jobs += Start-Job -ScriptBlock $DeployBlock `
-            -ArgumentList $srv, $dir, $rsn, $NewVersionPath, $ServiceCandidates, $LogFile, $newVersion
+            -ArgumentList $srv, $dir, $rsn, $NewVersionPath, $ServiceCandidates, $LogFile, $newVersion, $tier
         while (@(Get-Job -State Running).Count -ge $ThrottleLimit) { Start-Sleep 1 }
     }
 
@@ -1077,9 +1498,7 @@ function Invoke-TomcatUpgrade {
     if ($failed.Count -gt 0) {
         foreach ($r in $failed) {
             $doRollback = $false
-            if ($script:RollbackAll) {
-                $doRollback = $true
-            }
+            if ($script:RollbackAll) { $doRollback = $true }
             else {
                 Write-Host ''
                 Write-Host "  Deployment FAILED: $($r.Server) - $($r.SvcName)" -ForegroundColor Red
@@ -1093,9 +1512,13 @@ function Invoke-TomcatUpgrade {
                 }
             }
             if ($doRollback) {
+                $rbCtx = Connect-RemoteServer -Hostname $r.Server
+                if (-not $rbCtx) {
+                    Write-Log "ROLLBACK FAILED: $($r.Server) — cannot connect." 'ERROR' 'Red'
+                    continue
+                }
                 try {
-                    $rb = New-PSSession -ComputerName $r.Server -ErrorAction Stop
-                    Invoke-Command -Session $rb -ScriptBlock {
+                    Invoke-RCmd -Ctx $rbCtx -Block {
                         param($svc, $dir, $bak)
                         $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
                         if ($s -and $s.Status -ne 'Stopped') {
@@ -1106,13 +1529,13 @@ function Invoke-TomcatUpgrade {
                         if (Test-Path $dir) { Remove-Item "$dir\*" -Recurse -Force }
                         Expand-Archive -Path $bak -DestinationPath $dir -Force
                         Start-Service -Name $svc -ErrorAction Stop
-                    } -ArgumentList $r.SvcName, $r.InstallDir, $r.BackupPath
+                    } -Args @($r.SvcName, $r.InstallDir, $r.BackupPath)
                     Write-Log "Rollback successful: $($r.Server) $($r.SvcName)" 'OK' 'Green'
-                    Remove-PSSession $rb
                 }
                 catch {
-                    Write-Log "ROLLBACK FAILED: $($r.Server) $($r.SvcName) - $_ - MANUAL INTERVENTION REQUIRED" 'ERROR' 'Red'
+                    Write-Log "ROLLBACK FAILED: $($r.Server) $($r.SvcName) — $_ — MANUAL INTERVENTION REQUIRED" 'ERROR' 'Red'
                 }
+                finally { Disconnect-RemoteServer -Ctx $rbCtx }
             }
         }
     }
@@ -1121,66 +1544,38 @@ function Invoke-TomcatUpgrade {
     Write-Log "Tomcat upgrade complete. Log: $($script:_ActiveLog)" 'OK' 'Green'
 }
 #endregion
-#region Operation S — Stage Software  (drop-in replacement with logging + error capture)
+
+#region Operation S — Stage Software
 function Invoke-StageSoftware {
-
-    # ---- Log setup ----------------------------------------------------------
-    # Main log captures everything; companion _errors.log captures failures only,
-    # so you can spot problems at a glance after a large staging run.
     $script:_ActiveLog = New-LogPath 'Stage'
-    $errorLog          = $script:_ActiveLog -replace '\.log$', '_errors.log'
-    $failures          = New-Object 'System.Collections.Generic.List[pscustomobject]'
-
-    function Write-StageError {
-        param([string]$Server, [string]$Item, [string]$Message)
-        # Goes to console + main log (red) AND the errors-only log + summary table
-        Write-Log "[$Server] $Item :: $Message" 'ERROR' 'Red'
-        $entry = "[ERROR] - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - [$Server] $Item :: $Message"
-        Add-Content -Path $errorLog -Value $entry
-        $failures.Add([pscustomobject]@{
-            Server = $Server
-            Item   = $Item
-            Error  = $Message
-            Time   = Get-Date -Format 'HH:mm:ss'
-        })
-    }
 
     Write-Header "Stage Software to Servers"
-    Write-Log "Log file  : $($script:_ActiveLog)" 'INFO' 'Gray'
-    Write-Log "Error log : $errorLog (created only if errors occur)" 'INFO' 'Gray'
+    Write-Log "Log: $($script:_ActiveLog)" 'INFO' 'Gray'
 
-    # ---- Validate source items ----------------------------------------------
     $missing = @($StageConfig.Items | Where-Object { -not (Test-Path (Join-Path $RootDir $_.RelPath)) })
     if ($missing.Count -gt 0) {
         foreach ($m in $missing) {
-            Write-StageError -Server 'LOCAL' -Item $m.RelPath `
-                -Message "Source not found: $(Join-Path $RootDir $m.RelPath)"
+            Write-Log "Source not found: $(Join-Path $RootDir $m.RelPath)" 'ERROR' 'Red'
         }
         Write-Host ''
         Write-Host '  Staging aborted - fix missing source items and retry.' -ForegroundColor Red
         Write-Host ''
         Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         return
     }
 
-    # ---- Load server list ----------------------------------------------------
     $servers = Get-ServerList -Path (Join-Path $RootDir 'servers.txt')
     if (-not $servers) {
-        Write-StageError -Server 'LOCAL' -Item 'servers.txt' -Message 'Server list missing or empty.'
         Write-Host ''
         Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
         return
     }
 
-    # ---- Preview: actual FQDN destinations -----------------------------------
     Write-Log "Servers : $($servers.Count) target(s)" 'INFO' 'Gray'
     Write-Log "Source  : $RootDir" 'INFO' 'Gray'
-    Write-Log "Destinations:" 'INFO' 'Gray'
-    foreach ($s in $servers) {
-        Write-Log "  \\$s\$($StageConfig.RemoteBase)" 'INFO' 'Gray'
-    }
+    Write-Log "Dest    : \\<server>\$($StageConfig.RemoteBase)" 'INFO' 'Gray'
     Write-Host ''
     Write-Host '  Items to copy:' -ForegroundColor White
     foreach ($item in $StageConfig.Items) {
@@ -1188,15 +1583,6 @@ function Invoke-StageSoftware {
     }
     Write-Host ''
 
-    # ---- Confirmation before copying ------------------------------------------
-    $confirm = Read-Host '  Proceed with staging to the servers listed above? (Y/N)'
-    if ($confirm.Trim().ToUpper() -ne 'Y') {
-        Write-Log 'Staging cancelled by user before any files were copied.' 'WARN' 'Yellow'
-        return
-    }
-    Write-Host ''
-
-    # ---- Copy loop with error capture -----------------------------------------
     $pass = 0
     $fail = 0
 
@@ -1204,96 +1590,63 @@ function Invoke-StageSoftware {
         $remoteDest = "\\$server\$($StageConfig.RemoteBase)"
         Write-Log "[$server] -> $remoteDest" 'INFO' 'White'
 
-        # Reachability check (admin share)
-        try {
-            if (-not (Test-Path "\\$server\c$" -ErrorAction Stop)) {
-                Write-StageError -Server $server -Item 'c$ share' `
-                    -Message "Cannot reach \\$server\c$ - server skipped."
-                $fail++
-                continue
-            }
-        }
-        catch {
-            Write-StageError -Server $server -Item 'c$ share' `
-                -Message "Access error on \\$server\c$ : $($_.Exception.Message)"
+        if (-not (Test-Path "\\$server\e$")) {
+            Write-Log "[$server] Cannot reach \\$server\e$ - skipping." 'ERROR' 'Red'
             $fail++
             continue
         }
-
-        # Ensure destination folder exists
         try {
             if (-not (Test-Path $remoteDest)) {
-                New-Item -ItemType Directory -Path $remoteDest -Force -ErrorAction Stop | Out-Null
+                New-Item -ItemType Directory -Path $remoteDest -Force | Out-Null
                 Write-Log "[$server] Created destination folder." 'OK' 'Green'
             }
         }
         catch {
-            Write-StageError -Server $server -Item 'destination folder' `
-                -Message "Failed to create $remoteDest : $($_.Exception.Message)"
+            Write-Log "[$server] Failed to create destination: $_" 'ERROR' 'Red'
             $fail++
             continue
         }
 
-        # Copy each item, capturing per-item errors
         $serverOk = $true
         foreach ($item in $StageConfig.Items) {
             $src  = Join-Path $RootDir $item.RelPath
             $dest = Join-Path $remoteDest $item.RelPath
             try {
                 if ($item.Type -eq 'File') {
-                    Copy-Item -Path $src -Destination $dest -Force -ErrorAction Stop
+                    Copy-Item -Path $src -Destination $dest -Force
                     Write-Log "[$server] Copied file  : $($item.RelPath)" 'OK' 'Green'
                 }
                 elseif ($item.Type -eq 'Folder') {
                     if (-not (Test-Path $dest)) {
-                        New-Item -ItemType Directory -Path $dest -Force -ErrorAction Stop | Out-Null
+                        New-Item -ItemType Directory -Path $dest -Force | Out-Null
                     }
-                    Copy-Item -Path "$src\*" -Destination $dest -Recurse -Force -ErrorAction Stop
+                    Copy-Item -Path "$src\*" -Destination $dest -Recurse -Force
                     Write-Log "[$server] Copied folder: $($item.RelPath)" 'OK' 'Green'
                 }
             }
             catch {
-                Write-StageError -Server $server -Item $item.RelPath `
-                    -Message $_.Exception.Message
+                Write-Log "[$server] Failed to copy $($item.RelPath): $_" 'ERROR' 'Red'
                 $serverOk = $false
             }
         }
         if ($serverOk) { $pass++ } else { $fail++ }
     }
 
-    # ---- Summary ----------------------------------------------------------------
-    Write-Log -Spacer
-    Write-Log ('=' * 60) 'INFO' 'Cyan'
-    Write-Log ("STAGING SUMMARY - Success: {0}   Failed: {1}   Total: {2}" -f $pass, $fail, ($pass + $fail)) 'INFO' 'Cyan'
-
-    if ($failures.Count -gt 0) {
-        Write-Log "Failures ($($failures.Count)):" 'ERROR' 'Red'
-        foreach ($f in $failures) {
-            Write-Log ("  [{0}] {1,-15} {2,-20} {3}" -f $f.Time, $f.Server, $f.Item, $f.Error) 'ERROR' 'Red'
-        }
-        Write-Log "Error details saved to: $errorLog" 'WARN' 'Yellow'
-    }
-    else {
-        Write-Log 'All servers staged successfully - no errors.' 'OK' 'Green'
-    }
-    Write-Log "Full log: $($script:_ActiveLog)" 'INFO' 'Gray'
+    Write-Host ''
+    Write-Host ("  Staging complete - Success: {0}   Failed: {1}   Total: {2}" -f $pass, $fail, ($pass + $fail)) -ForegroundColor Cyan
+    Write-Host ''
+    Write-Log "Staging complete. Log: $($script:_ActiveLog)" 'OK' 'Green'
 }
 #endregion
 
-
 #region Version Detection
 function Get-InstalledVersions {
-    # Detect locally installed Tomcat version via version.bat
     $script:TomcatInstalledVersion = 'Not detected'
     $script:TomcatInstallPath      = $null
-    $script:JavaVersion            = 'Not detected'
-    $script:JavaDoDStatus          = ''
+    $script:SCAgentInstalledVersion = 'Not detected'
 
-    $candidates = @(
-        $TomcatConfig.ServiceCandidates | ForEach-Object { $_ }
-    )
+    $candidates = @($TomcatConfig.ServiceCandidates)
 
-    # Also try to find path from running service registry (same logic as deploy)
     $svcs = @(Get-Service -Name '*Tomcat*' -ErrorAction SilentlyContinue)
     if ($svcs.Count -eq 0) {
         $svcs = @(Get-Service -DisplayName '*Apache Tomcat*' -ErrorAction SilentlyContinue)
@@ -1302,81 +1655,43 @@ function Get-InstalledVersions {
         $rp = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)" `
                -ErrorAction SilentlyContinue).ImagePath
         if ($rp) {
-            # Strip quotes then take only the exe path before any arguments
-            $ex  = ($rp.Trim('"') -replace '^"?([^"]+)"?.*$', '$1').Split(' ')[0].Trim('"')
-            # Walk up from the exe location until we find a dir with both bin\ and lib\
-            $dir  = Split-Path $ex -Parent
-            $root = $null
-            for ($i = 0; $i -lt 5; $i++) {
-                if ((Test-Path "$dir\bin") -and (Test-Path "$dir\lib")) { $root = $dir; break }
-                $parent = Split-Path $dir -Parent
-                if ($parent -eq $dir) { break }
-                $dir = $parent
-            }
-            if ($root) {
-                # Prepend service-resolved path so it is tried first
+            $ex   = $rp.Trim('"').Split(' ')[0]
+            $root = Split-Path (Split-Path $ex -Parent) -Parent
+            if ((Test-Path "$root\bin") -and (Test-Path "$root\lib")) {
                 $candidates = @($root) + $candidates
             }
         }
     }
 
     foreach ($candidate in $candidates) {
-        $catJar = Join-Path $candidate 'lib\catalina.jar'
-        if (Test-Path $catJar) {
+        $versionBat = Join-Path $candidate 'bin\version.bat'
+        if (Test-Path $versionBat) {
             try {
-                Add-Type -AssemblyName System.IO.Compression
-                Add-Type -AssemblyName System.IO.Compression.FileSystem
-                $fs  = [System.IO.File]::OpenRead($catJar)
-                $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
-                $mf  = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' } | Select-Object -First 1
-                if ($mf) {
-                    $sr  = New-Object System.IO.StreamReader($mf.Open())
-                    $ct  = $sr.ReadToEnd()
-                    $sr.Close()
-                    $mm  = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
-                    if ($mm.Success) {
-                        $script:TomcatInstalledVersion = 'Apache Tomcat ' + $mm.Groups[1].Value.Trim()
-                    } else {
-                        $script:TomcatInstalledVersion = 'Detected (version unparsed)'
-                    }
-                } else {
-                    $script:TomcatInstalledVersion = 'Detected (manifest not found)'
+                $output = & cmd.exe /c "`"$versionBat`" 2>&1"
+                $vLine  = $output | Select-String -Pattern 'Server version\s*:\s*Apache Tomcat/(\S+)' |
+                          Select-Object -First 1
+                if ($vLine) {
+                    $script:TomcatInstalledVersion = $vLine.Matches[0].Groups[1].Value
                 }
-                $zip.Dispose()
-                $fs.Close()
+                else {
+                    $vLine2 = $output | Select-String -Pattern '(\d+\.\d+\.\d+)' | Select-Object -First 1
+                    if ($vLine2) { $script:TomcatInstalledVersion = $vLine2.Matches[0].Groups[1].Value }
+                }
                 $script:TomcatInstallPath = $candidate
                 break
             }
-            catch {
-                $script:TomcatInstalledVersion = "Error: $_"
-            }
+            catch { $script:TomcatInstalledVersion = 'Error running version.bat' }
         }
     }
 
-    # Detect locally installed System Center Agent version
-    $script:SCAgentInstalledVersion = 'Not detected'
-
-    # Method 1: Win32_Product (most reliable, slower)
-    try {
-        $scProd = Get-CimInstance -ClassName Win32_Product -ErrorAction Stop |
-                  Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
-                  Select-Object -First 1
-        if ($scProd) {
-            $script:SCAgentInstalledVersion = $scProd.Version
-            return
-        }
-    }
-    catch { }
-
-    # Method 2: Uninstall registry keys (faster fallback)
+    # Method 1: Registry uninstall keys (fast)
     $regPaths = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
     )
     foreach ($regPath in $regPaths) {
         if (-not (Test-Path $regPath)) { continue }
-        $keys = Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue
-        foreach ($key in $keys) {
+        foreach ($key in (Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue)) {
             $props = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
             if ($props.DisplayName -like '*System Center*' -or $props.DisplayName -like '*OTS*') {
                 if ($props.DisplayVersion) {
@@ -1387,109 +1702,29 @@ function Get-InstalledVersions {
         }
     }
 
-    # Method 3: Check version file in install directory
+    # Method 2: Win32_Product (slower fallback)
+    try {
+        $scProd = Get-CimInstance -ClassName Win32_Product -ErrorAction Stop |
+                  Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
+                  Select-Object -First 1
+        if ($scProd) { $script:SCAgentInstalledVersion = $scProd.Version; return }
+    }
+    catch { }
+
+    # Method 3: version.txt file
     $verFile = Join-Path $SCConfig.InstallDir 'version.txt'
     if (Test-Path $verFile) {
-        $vContent = Get-Content $verFile -TotalCount 5 | Select-String -Pattern '(\d+\.\d+[\.\d]*)' |
-                    Select-Object -First 1
+        $vContent = Get-Content $verFile -TotalCount 5 |
+                    Select-String -Pattern '(\d+\.\d+[\.\d]*)' | Select-Object -First 1
         if ($vContent) { $script:SCAgentInstalledVersion = $vContent.Matches[0].Groups[1].Value }
     }
-
-    # Detect Java version — mirror Tomcat's own resolution order:
-    # 1) setenv.bat JAVA_HOME/JRE_HOME override
-    # 2) JRE_HOME machine env var
-    # 3) JAVA_HOME machine env var
-    # 4) Known DACS paths
-    # 5) System PATH
-    $script:JavaVersion   = 'Not detected'
-    $script:JavaDoDStatus = ''
-    $script:JavaExePath   = ''
-    $javaExe = $null
-
-    # Method 1: setenv.bat in Tomcat bin dir
-    if ($script:TomcatInstallPath) {
-        $setenv = Join-Path $script:TomcatInstallPath 'bin\setenv.bat'
-        if (Test-Path $setenv) {
-            $lines = Get-Content $setenv -ErrorAction SilentlyContinue
-            foreach ($line in $lines) {
-                if ($line -match 'JRE_HOME\s*=\s*"?([^"^\s]+)"?') {
-                    $candidate = Join-Path $Matches[1].TrimEnd('\') 'bin\java.exe'
-                    if (Test-Path $candidate) { $javaExe = $candidate; break }
-                }
-                if ($line -match 'JAVA_HOME\s*=\s*"?([^"^\s]+)"?') {
-                    $candidate = Join-Path $Matches[1].TrimEnd('\') 'bin\java.exe'
-                    if (Test-Path $candidate) { $javaExe = $candidate; break }
-                }
-            }
-        }
-    }
-
-    # Method 2: JRE_HOME machine environment variable
-    if (-not $javaExe) {
-        $jrh = [System.Environment]::GetEnvironmentVariable('JRE_HOME', 'Machine')
-        if ($jrh) {
-            $candidate = Join-Path $jrh 'bin\java.exe'
-            if (Test-Path $candidate) { $javaExe = $candidate }
-        }
-    }
-
-    # Method 3: JAVA_HOME machine environment variable
-    if (-not $javaExe) {
-        $jh = [System.Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine')
-        if ($jh) {
-            $candidate = Join-Path $jh 'bin\java.exe'
-            if (Test-Path $candidate) { $javaExe = $candidate }
-        }
-    }
-
-    # Method 4: Known DACS paths — JRE first (runtime), then JDK
-    if (-not $javaExe) {
-        $knownPaths = @(
-            'E:\Customers\Shared\DACS\Java\JRE\bin\java.exe',
-            'E:\Customers\Shared\DACS\Java\bin\java.exe'
-        )
-        foreach ($p in $knownPaths) {
-            if (Test-Path $p) { $javaExe = $p; break }
-        }
-    }
-
-    # Method 5: java.exe on system PATH
-    if (-not $javaExe) {
-        $jCmd = Get-Command java.exe -ErrorAction SilentlyContinue
-        if ($jCmd) { $javaExe = $jCmd.Source }
-    }
-
-    if ($javaExe) {
-        $script:JavaExePath = $javaExe
-        try {
-            $jOutput = & $javaExe -version 2>&1 | Out-String
-            $jMatch  = [regex]::Match($jOutput, '(?:java|openjdk) version "([^"]+)"')
-            if ($jMatch.Success) {
-                $jVerStr = $jMatch.Groups[1].Value.Trim()
-                $script:JavaVersion = $jVerStr
-                # Extract major version — handles both 1.8.x and 11+ formats
-                $major = if ($jVerStr -match '^1\.(\d+)') { [int]$Matches[1] }
-                         elseif ($jVerStr -match '^(\d+)')  { [int]$Matches[1] }
-                         else                               { 0 }
-                # DoD STIG status per active published STIGs
-                $script:JavaDoDStatus = switch ($major) {
-                    11      { 'DoD Approved' }
-                    17      { 'DoD Approved' }
-                    21      { 'LTS - STIG Pending' }
-                    8       { 'STIG Deprecated' }
-                    default { 'NOT DoD Approved' }
-                }
-            }
-        }
-        catch { $script:JavaVersion = "Error: $_" }
-    }
 }
+#endregion
 
 #region Menu
 function Show-Menu {
     Write-Header "CNA-DACS Maintenance  |  $RootDir"
 
-    # ---- Installed version banner ----
     $tcVer  = $script:TomcatInstalledVersion
     $tcPath = if ($script:TomcatInstallPath) { $script:TomcatInstallPath } else { 'path not found' }
     $scVer  = $script:SCAgentInstalledVersion
@@ -1497,32 +1732,12 @@ function Show-Menu {
     $tcColor = if ($tcVer -eq 'Not detected' -or $tcVer -like 'Error*') { 'Yellow' } else { 'Green' }
     $scColor = if ($scVer -eq 'Not detected') { 'Yellow' } else { 'Green' }
 
-    $jVer    = $script:JavaVersion
-    $jStatus = $script:JavaDoDStatus
-    $jPath   = if ($script:JavaExePath) { $script:JavaExePath } else { 'path not found' }
-    $jLabel  = if ($jStatus) { "[$jStatus]" } else { '' }
-    $jColor  = switch ($jStatus) {
-        'DoD Approved'       { 'Green'  }
-        'LTS - STIG Pending' { 'Yellow' }
-        'STIG Deprecated'    { 'Yellow' }
-        'NOT DoD Approved'   { 'Red'    }
-        default              { 'Yellow' }
-    }
-
-    Write-Host '  Installed Software Versions:' -ForegroundColor White
+    Write-Host '  Installed Software Versions (local):' -ForegroundColor White
     Write-Host ("    Tomcat         : {0}  ({1})" -f $tcVer, $tcPath) -ForegroundColor $tcColor
     Write-Host ("    SC Agent       : {0}" -f $scVer)                  -ForegroundColor $scColor
-    Write-Host ("    Java           : {0}  {1}  ({2})" -f $jVer, $jLabel, $jPath) -ForegroundColor $jColor
-
-    $jhMachine  = [System.Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine')
-    $jreMachine = [System.Environment]::GetEnvironmentVariable('JRE_HOME',  'Machine')
-    $jhDisplay  = if ($jhMachine)  { $jhMachine  } else { '(not set)' }
-    $jrDisplay  = if ($jreMachine) { $jreMachine } else { '(not set)' }
-    $jhColor2   = if ($jhMachine)  { 'Green' } else { 'Yellow' }
-    $jrColor2   = if ($jreMachine) { 'Green' } else { 'Yellow' }
-
-    Write-Host ("    JAVA_HOME      : {0}" -f $jhDisplay) -ForegroundColor $jhColor2
-    Write-Host ("    JRE_HOME       : {0}" -f $jrDisplay) -ForegroundColor $jrColor2
+    Write-Host ''
+    Write-Host '  Connection tiers used per server:' -ForegroundColor DarkGray
+    Write-Host '    [WinRM] Full execution   [DCOM] WMI+Win32_Process   [UNC] File access only' -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  Operations:' -ForegroundColor White
     Write-Host ''
@@ -1540,522 +1755,20 @@ function Show-Menu {
     }
 
     Write-Host ''
-
     $stageStatus = if ($nvReady -and $svReady) { '[READY]   ' } else { '[PARTIAL] ' }
     $stageColor  = if ($nvReady -and $svReady) { 'Cyan'       } else { 'Yellow'     }
     Write-Host ("  [S] {0}  Stage software to all servers  (copies: {1} + NewVersion\)" -f $stageStatus, $ScriptName) -ForegroundColor $stageColor
-    Write-Host "         Dest: \\<FQDN from servers.txt>\c`$\DLA-failsafe\patching\" -ForegroundColor DarkGray
+    Write-Host "         Dest: \\<server>\e`$\DLA-failsafe\patching\" -ForegroundColor DarkGray
 
     Write-Host ''
-    Write-Host '  [A]  Run ALL (1, 2, 3) in sequence'                              -ForegroundColor Magenta
-    Write-Host '  [R]  Remote SC Agent Update  (per server from servers.txt)'       -ForegroundColor Cyan
-    Write-Host '  [J]  Java environment variables (JAVA_HOME / JRE_HOME)'           -ForegroundColor Cyan
-    Write-Host '  [Q]  Quit'                                                         -ForegroundColor Gray
+    Write-Host '  [A]  Run ALL (1, 2, 3) in sequence' -ForegroundColor Magenta
+    Write-Host '  [Q]  Quit'                           -ForegroundColor Gray
     Write-Host ''
     Write-Host '  Enter a number or any combination (commas or spaces):' -ForegroundColor White
     Write-Host '    1        Backup only'              -ForegroundColor DarkGray
     Write-Host '    2,3      SystemCenter then Tomcat' -ForegroundColor DarkGray
     Write-Host '    1 2 3    All three in sequence'    -ForegroundColor DarkGray
     Write-Host ''
-}
-
-function Get-NewVersionTomcatVersion {
-    # Read the staged NewVersion catalina.jar to get the target Tomcat version
-    $catJar = Join-Path $RootDir "NewVersion\lib\catalina.jar"
-    if (-not (Test-Path $catJar)) { return 'Not staged' }
-    try {
-        Add-Type -AssemblyName System.IO.Compression
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $fs  = [System.IO.File]::OpenRead($catJar)
-        $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
-        $mf  = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' } | Select-Object -First 1
-        if ($mf) {
-            $sr  = New-Object System.IO.StreamReader($mf.Open())
-            $ct  = $sr.ReadToEnd()
-            $sr.Close()
-            $mm  = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
-            if ($mm.Success) {
-                $zip.Dispose(); $fs.Close()
-                return $mm.Groups[1].Value.Trim()
-            }
-        }
-        $zip.Dispose(); $fs.Close()
-        return 'Unknown'
-    }
-    catch { return 'Error reading jar' }
-}
-
-function Get-RemoteServerInfo {
-    param([string]$Server)
-    $result = [pscustomobject]@{
-        Server         = $Server
-        InstanceName   = 'Unknown'
-        SCVersion      = 'Unknown'
-        TomcatVersion  = 'Unknown'
-        ScriptCurrent  = $false
-        Reachable      = $false
-        Error          = ''
-    }
-
-    # Check admin share reachability first
-    try {
-        if (-not (Test-Path "\\$Server\c$" -ErrorAction Stop)) {
-            $result.Error = 'Admin share unreachable'
-            return $result
-        }
-    }
-    catch {
-        $result.Error = $_.Exception.Message
-        return $result
-    }
-    $result.Reachable = $true
-
-    # Compare script hash via admin share (no WinRM needed for this check)
-    $localScript  = Join-Path $RootDir $ScriptName
-    $remoteScript = "\\$Server\c$\DLA-failsafe\patching\$ScriptName"
-    if (Test-Path $remoteScript) {
-        try {
-            $localHash  = (Get-FileHash $localScript  -Algorithm MD5).Hash
-            $remoteHash = (Get-FileHash $remoteScript -Algorithm MD5).Hash
-            $result.ScriptCurrent = ($localHash -eq $remoteHash)
-        }
-        catch { $result.ScriptCurrent = $false }
-    } else {
-        $result.ScriptCurrent = $false
-    }
-
-    # Get SC Agent version and Content Server instance name via Invoke-Command
-    try {
-        $info = Invoke-Command -ComputerName $Server -ScriptBlock {
-            # SC Agent version
-            $scVer = 'Unknown'
-            $p = Get-CimInstance -ClassName Win32_Product -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
-                 Select-Object -First 1
-            if ($p) {
-                $scVer = $p.Version
-            } else {
-                $paths = @(
-                    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-                    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-                )
-                foreach ($rp in $paths) {
-                    $keys = Get-ChildItem $rp -ErrorAction SilentlyContinue
-                    foreach ($k in $keys) {
-                        $props = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-                        if ($props.DisplayName -like '*System Center*' -or $props.DisplayName -like '*OTS*') {
-                            if ($props.DisplayVersion) { $scVer = $props.DisplayVersion; break }
-                        }
-                    }
-                    if ($scVer -ne 'Unknown') { break }
-                }
-            }
-
-            # Content Server instance name from Win32_Service
-            $instanceName = 'Unknown'
-            $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction SilentlyContinue
-            $csSvc = $allSvcs | Where-Object {
-                $_.Description -like '*Content Server*' -and
-                $_.Description -notlike '*Content Server Admin*'
-            } | Select-Object -First 1
-            if ($csSvc) { $instanceName = $csSvc.Name }
-
-            # Tomcat version via catalina.jar
-            $tcVer = 'Unknown'
-            $tcSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } | Select-Object -First 1
-            if ($tcSvc) {
-                $imgPath = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$($tcSvc.Name)" -ErrorAction SilentlyContinue).ImagePath
-                if ($imgPath) {
-                    $exe = ($imgPath.Trim('"') -replace '^"?([^"]+)"?.*$','$1').Split(' ')[0].Trim('"')
-                    $dir = Split-Path $exe -Parent
-                    for ($i = 0; $i -lt 5; $i++) {
-                        $catJar = Join-Path $dir 'lib\catalina.jar'
-                        if (Test-Path $catJar) {
-                            try {
-                                Add-Type -AssemblyName System.IO.Compression
-                                Add-Type -AssemblyName System.IO.Compression.FileSystem
-                                $fs  = [System.IO.File]::OpenRead($catJar)
-                                $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
-                                $mf  = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' } | Select-Object -First 1
-                                if ($mf) {
-                                    $sr = New-Object System.IO.StreamReader($mf.Open())
-                                    $ct = $sr.ReadToEnd(); $sr.Close()
-                                    $mm = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
-                                    if ($mm.Success) { $tcVer = $mm.Groups[1].Value.Trim() }
-                                }
-                                $zip.Dispose(); $fs.Close()
-                            } catch {}
-                            break
-                        }
-                        $parent = Split-Path $dir -Parent
-                        if ($parent -eq $dir) { break }
-                        $dir = $parent
-                    }
-                }
-            }
-            # Fallback: check known DACS paths
-            if ($tcVer -eq 'Unknown') {
-                $knownCats = @(
-                    'E:\Customers\Shared\DACS\tomcat10\lib\catalina.jar',
-                    'E:\Customers\Shared\DACS\tomcat\lib\catalina.jar'
-                )
-                foreach ($kc in $knownCats) {
-                    if (Test-Path $kc) {
-                        try {
-                            Add-Type -AssemblyName System.IO.Compression
-                            Add-Type -AssemblyName System.IO.Compression.FileSystem
-                            $fs  = [System.IO.File]::OpenRead($kc)
-                            $zip = New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read)
-                            $mf  = $zip.Entries | Where-Object { $_.FullName -eq 'META-INF/MANIFEST.MF' } | Select-Object -First 1
-                            if ($mf) {
-                                $sr = New-Object System.IO.StreamReader($mf.Open())
-                                $ct = $sr.ReadToEnd(); $sr.Close()
-                                $mm = [regex]::Match($ct, 'Implementation-Version:\s*(\S+)')
-                                if ($mm.Success) { $tcVer = $mm.Groups[1].Value.Trim() }
-                            }
-                            $zip.Dispose(); $fs.Close()
-                        } catch {}
-                        break
-                    }
-                }
-            }
-
-            return [pscustomobject]@{ SCVersion = $scVer; InstanceName = $instanceName; TomcatVersion = $tcVer }
-        } -ErrorAction Stop
-
-        $result.SCVersion     = $info.SCVersion
-        $result.InstanceName  = $info.InstanceName
-        $result.TomcatVersion = $info.TomcatVersion
-    }
-    catch {
-        $result.Error = "WinRM: $($_.Exception.Message)"
-    }
-
-    return $result
-}
-
-function Invoke-StageToServer {
-    param([string]$Server)
-    $remoteDest = "\\$Server\c$\DLA-failsafe\patching"
-    try {
-        if (-not (Test-Path $remoteDest)) {
-            New-Item -ItemType Directory -Path $remoteDest -Force -ErrorAction Stop | Out-Null
-        }
-        $localScript = Join-Path $RootDir $ScriptName
-        Copy-Item -Path $localScript -Destination (Join-Path $remoteDest $ScriptName) -Force -ErrorAction Stop
-        Write-Log "[$Server] Script staged via admin share." 'OK' 'Green'
-        return $true
-    }
-    catch {
-        Write-Log "[$Server] Stage failed: $_" 'ERROR' 'Red'
-        return $false
-    }
-}
-
-function Invoke-RemoteSCUpdate {
-    param([string]$Server)
-    try {
-        Write-Log "[$Server] Starting remote SC Agent update..." 'INFO' 'Gray'
-        Invoke-Command -ComputerName $Server -ScriptBlock {
-            param($scriptFile)
-            if (-not (Test-Path 'C:\Logs')) { New-Item -ItemType Directory -Path 'C:\Logs' -Force | Out-Null }
-            & powershell.exe -NonInteractive -ExecutionPolicy Bypass -File $scriptFile -RunOperation 2 2>&1
-        } -ArgumentList "C:\DLA-failsafe\patching\$ScriptName" -ErrorAction Stop
-        Write-Log "[$Server] Remote update complete." 'OK' 'Green'
-        return $true
-    }
-    catch {
-        Write-Log "[$Server] Remote update failed: $_" 'ERROR' 'Red'
-        return $false
-    }
-}
-
-function Show-RemoteSCMenu {
-    $serversFile = Join-Path $RootDir 'servers.txt'
-    if (-not (Test-Path $serversFile)) {
-        Write-Host ''
-        Write-Host '  [ERROR] servers.txt not found.' -ForegroundColor Red
-        Write-Host ''
-        Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
-        return
-    }
-
-    $servers = @(Get-ServerList -Path $serversFile)
-    if (-not $servers -or $servers.Count -eq 0) { return }
-
-    # Exclude this host from the list to prevent updating ourselves while running
-    $localName = $env:COMPUTERNAME.ToUpper()
-    $servers = @($servers | Where-Object {
-        $_.ToUpper() -notmatch "^$localName(\.|$)"
-    })
-    if ($servers.Count -eq 0) {
-        Write-Host ''
-        Write-Host '  No remote servers to update (only this host is listed in servers.txt).' -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-        try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
-        return
-    }
-
-    # Query all servers
-    Clear-Host
-    Write-Header 'Remote System Center Agent Update'
-    Write-Host ("  Local host: {0}  (excluded from remote list)" -f $env:COMPUTERNAME) -ForegroundColor DarkGray
-    Write-Host '  Querying servers...' -ForegroundColor Gray
-    Write-Host ''
-
-    $serverInfo = New-Object 'System.Collections.Generic.List[pscustomobject]'
-    $idx = 1
-    foreach ($srv in $servers) {
-        Write-Host ("  [{0}] {1}..." -f $idx, $srv) -ForegroundColor Gray
-        $info = Get-RemoteServerInfo -Server $srv
-        $info | Add-Member -NotePropertyName Index -NotePropertyValue $idx
-        $serverInfo.Add($info)
-        $idx++
-    }
-
-    # Display table
-    Clear-Host
-    Write-Header 'Remote System Center Agent Update'
-    Write-Host ("  Local host    : {0}  (excluded)" -f $env:COMPUTERNAME) -ForegroundColor DarkGray
-    $nvTcVer = Get-NewVersionTomcatVersion
-    $nvTcColor = if ($nvTcVer -eq 'Not staged') { 'Yellow' } else { 'Cyan' }
-    Write-Host ("  NewVersion TC : {0}" -f $nvTcVer) -ForegroundColor $nvTcColor
-    Write-Host ("  Local SC Agent: {0}" -f $script:SCAgentInstalledVersion) -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host ('  {0,-4} {1,-35} {2,-20} {3,-16} {4,-16} {5}' -f '#', 'Server', 'Instance', 'SC Version', 'Tomcat', 'Script') -ForegroundColor White
-    Write-Host ('  {0,-4} {1,-35} {2,-20} {3,-16} {4,-16} {5}' -f '----', '----------------------------------', '-------------------', '---------------', '---------------', '-------') -ForegroundColor DarkGray
-
-    foreach ($s in $serverInfo) {
-        if (-not $s.Reachable) {
-            $rowColor    = 'Red'
-            $scriptLabel = 'N/A'
-            $scVer       = 'Unreachable'
-            $tcVer       = 'N/A'
-        } else {
-            $scriptLabel = if ($s.ScriptCurrent) { '[Current]' } else { '[OUTDATED]' }
-            $scVer       = $s.SCVersion.Trim()
-            $tcVer       = $s.TomcatVersion.Trim()
-            $localSCVer  = $script:SCAgentInstalledVersion.Trim()
-            $localTCVer  = $nvTcVer.Trim()
-
-            # Color: yellow if any version needs update or script outdated, green if all current
-            $scNeedsUpdate = ($scVer -ne 'Unknown' -and $localSCVer -ne 'Not detected' -and $scVer -ne $localSCVer)
-            $tcNeedsUpdate = ($tcVer -ne 'Unknown' -and $localTCVer -ne 'Not staged'   -and $localTCVer -ne 'Unknown' -and $tcVer -ne $localTCVer)
-            $rowColor      = if ($scNeedsUpdate -or $tcNeedsUpdate) { 'Yellow' }
-                             elseif (-not $s.ScriptCurrent)         { 'Yellow' }
-                             else                                    { 'Green'  }
-        }
-        Write-Host ('  [{0,-2}] {1,-35} {2,-20} {3,-16} {4,-16} {5}' -f $s.Index, $s.Server, $s.InstanceName, $scVer, $tcVer, $scriptLabel) -ForegroundColor $rowColor
-    }
-
-    Write-Host ''
-    Write-Host '  [A]  Update ALL reachable servers  (auto-stage if needed)' -ForegroundColor Cyan
-    Write-Host '  [X]  Back to menu'                                          -ForegroundColor Gray
-    Write-Host ''
-    Write-Host '  Enter server number(s), [A] for all, or [X] to cancel:' -ForegroundColor White
-    $sel = (Read-Host '  Selection').Trim().ToUpper()
-    if ($sel -eq 'X') { return }
-
-    # Resolve targets
-    $targets = New-Object 'System.Collections.Generic.List[pscustomobject]'
-    if ($sel -eq 'A') {
-        foreach ($s in $serverInfo) {
-            if ($s.Reachable) { $targets.Add($s) }
-        }
-    } else {
-        $tokens = @($sel -split '[,\s]+' | Where-Object { $_ -ne '' })
-        foreach ($t in $tokens) {
-            if ($t -match '^\d+$') {
-                $match = $serverInfo | Where-Object { $_.Index -eq [int]$t } | Select-Object -First 1
-                if ($match -and $match.Reachable)      { $targets.Add($match) }
-                elseif ($match -and -not $match.Reachable) { Write-Host ("  Skipping [{0}] {1} — unreachable." -f $match.Index, $match.Server) -ForegroundColor Yellow }
-                else                                       { Write-Host ("  No server with index {0}." -f $t) -ForegroundColor Red }
-            }
-        }
-    }
-
-    if ($targets.Count -eq 0) {
-        Write-Host '  No valid targets selected.' -ForegroundColor Red
-        Start-Sleep -Seconds 2
-        return
-    }
-
-    # Confirm
-    Write-Host ''
-    Write-Host '  Targets:' -ForegroundColor White
-    foreach ($t in $targets) {
-        $isCurrent = ($t.SCVersion.Trim() -ne 'Unknown' -and
-                      $t.SCVersion.Trim() -ne 'Unreachable' -and
-                      $script:SCAgentInstalledVersion.Trim() -ne 'Not detected' -and
-                      $t.SCVersion.Trim() -eq $script:SCAgentInstalledVersion.Trim())
-        $stageNote   = if (-not $t.ScriptCurrent) { ' [will stage first]' } else { '' }
-        $currentNote = if ($isCurrent)             { ' [already current — will skip]' } else { '' }
-        $noteColor   = if ($isCurrent)             { 'Green' } else { 'Cyan' }
-        Write-Host ("    [{0}] {1}  ({2}){3}{4}" -f $t.Index, $t.Server, $t.SCVersion, $stageNote, $currentNote) -ForegroundColor $noteColor
-    }
-    Write-Host ''
-    $confirm = (Read-Host '  Proceed? (Y/N)').Trim().ToUpper()
-    if ($confirm -ne 'Y') {
-        Write-Host '  Cancelled.' -ForegroundColor Gray
-        Start-Sleep -Seconds 1
-        return
-    }
-
-    # Run
-    Write-Host ''
-    $script:_ActiveLog = New-LogPath 'RemoteSCUpdate'
-    Write-Log "Starting remote SC Agent update on $($targets.Count) server(s). Log: $($script:_ActiveLog)" 'INFO' 'White'
-
-    foreach ($t in $targets) {
-        Write-Host ''
-        Write-Host ("  ── [{0}] {1} ({2}) ──" -f $t.Index, $t.Server, $t.InstanceName) -ForegroundColor Cyan
-
-        # Skip if already on the same version as local
-        if ($t.SCVersion.Trim() -ne 'Unknown' -and
-            $t.SCVersion.Trim() -ne 'Unreachable' -and
-            $script:SCAgentInstalledVersion.Trim() -ne 'Not detected' -and
-            $t.SCVersion.Trim() -eq $script:SCAgentInstalledVersion.Trim()) {
-            Write-Log ("[$($t.Server)] Version is current ($($t.SCVersion.Trim())) — skipping.") 'OK' 'Green'
-            Write-Host ("  Version is current: {0}" -f $t.SCVersion.Trim()) -ForegroundColor Green
-            continue
-        }
-
-        # Stage if script is outdated or missing
-        if (-not $t.ScriptCurrent) {
-            Write-Log ("[$($t.Server)] Script outdated or missing — staging now...") 'WARN' 'Yellow'
-            $staged = Invoke-StageToServer -Server $t.Server
-            if (-not $staged) {
-                Write-Log ("[$($t.Server)] Skipping update — stage failed.") 'ERROR' 'Red'
-                continue
-            }
-        }
-
-        $ok = Invoke-RemoteSCUpdate -Server $t.Server
-        if ($ok) {
-            # Re-query version after update
-            $newInfo = Get-RemoteServerInfo -Server $t.Server
-            $newVer  = $newInfo.SCVersion
-            Write-Host ("  Version after update: {0}" -f $newVer) -ForegroundColor Green
-        }
-    }
-
-    Write-Log "Remote SC Agent update complete." 'OK' 'Green'
-    Write-Host ''
-    Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-    try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
-}
-
-function Set-JavaEnvironment {
-    Clear-Host
-    Write-Header 'Java Environment Variables'
-
-    $javaHome = [System.Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine')
-    $jreHome  = [System.Environment]::GetEnvironmentVariable('JRE_HOME',  'Machine')
-
-    $jhColor = if ($javaHome) { 'Green' } else { 'Yellow' }
-    $jrColor = if ($jreHome)  { 'Green' } else { 'Yellow' }
-
-    Write-Host '  Current Machine-level environment variables:' -ForegroundColor White
-    Write-Host ''
-    $jhDisplay = if ($javaHome) { $javaHome } else { '(not set)' }
-    $jrDisplay = if ($jreHome)  { $jreHome  } else { '(not set)' }
-
-    Write-Host ("    JAVA_HOME  : {0}" -f $jhDisplay) -ForegroundColor $jhColor
-    Write-Host ("    JRE_HOME   : {0}" -f $jrDisplay) -ForegroundColor $jrColor
-    Write-Host ''
-    Write-Host '  Tomcat JRE Resolution:' -ForegroundColor White
-    Write-Host ''
-
-    # Check setenv.bat
-    $setenvPath = if ($script:TomcatInstallPath) { Join-Path $script:TomcatInstallPath 'bin\setenv.bat' } else { $null }
-    if ($setenvPath -and (Test-Path $setenvPath)) {
-        $setenvContent = Get-Content $setenvPath -ErrorAction SilentlyContinue
-        $setenvJava = $setenvContent | Select-String -Pattern 'JAVA_HOME|JRE_HOME' | Select-Object -First 3
-        if ($setenvJava) {
-            Write-Host '    setenv.bat overrides:' -ForegroundColor Cyan
-            foreach ($line in $setenvJava) {
-                Write-Host ("      {0}" -f $line.Line.Trim()) -ForegroundColor Cyan
-            }
-        } else {
-            Write-Host '    setenv.bat         : exists but no JAVA_HOME/JRE_HOME override' -ForegroundColor Gray
-        }
-    } else {
-        Write-Host '    setenv.bat         : not present' -ForegroundColor Gray
-    }
-
-    # Check Tomcat service registry Parameters\Java and Parameters\Jvm
-    $svcs = @(Get-Service -Name '*Tomcat*' -ErrorAction SilentlyContinue)
-    if ($svcs.Count -eq 0) { $svcs = @(Get-Service -DisplayName '*Apache Tomcat*' -ErrorAction SilentlyContinue) }
-    foreach ($svc in $svcs) {
-        $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)\Parameters"
-        $params = Get-ItemProperty $svcKey -ErrorAction SilentlyContinue
-        if ($params) {
-            $jvmVal  = if ($params.Jvm)  { $params.Jvm  } else { '(not set)' }
-            $javaVal = if ($params.Java) { $params.Java } else { '(not set)' }
-            $jvmColor  = if ($params.Jvm)  { 'Green' } else { 'Gray' }
-            $javaColor = if ($params.Java) { 'Green' } else { 'Gray' }
-            Write-Host ("    Service [{0}]" -f $svc.Name) -ForegroundColor White
-            Write-Host ("      Parameters\Jvm   : {0}" -f $jvmVal)  -ForegroundColor $jvmColor
-            Write-Host ("      Parameters\Java  : {0}" -f $javaVal) -ForegroundColor $javaColor
-        }
-    }
-    Write-Host ''
-    Write-Host ''
-
-    $knownJava = 'E:\Customers\Shared\DACS\Java'
-    $knownJRE  = 'E:\Customers\Shared\DACS\Java\JRE'
-
-    $javaExists = Test-Path (Join-Path $knownJava 'bin\java.exe')
-    $jreExists  = Test-Path (Join-Path $knownJRE  'bin\java.exe')
-
-    $javaFoundLabel = if ($javaExists) { '[Found]'     } else { '[Not Found]' }
-    $jreFoundLabel  = if ($jreExists)  { '[Found]'     } else { '[Not Found]' }
-    $javaFoundColor = if ($javaExists) { 'Green'       } else { 'Red'         }
-    $jreFoundColor  = if ($jreExists)  { 'Green'       } else { 'Red'         }
-
-    Write-Host ("    {0}      {1}" -f $knownJava, $javaFoundLabel) -ForegroundColor $javaFoundColor
-    Write-Host ("    {0}  {1}"     -f $knownJRE,  $jreFoundLabel)  -ForegroundColor $jreFoundColor
-    Write-Host ''
-
-    if (-not $javaHome -and $javaExists) {
-        Write-Host "  [1] Set JAVA_HOME = $knownJava" -ForegroundColor Cyan
-    }
-    if (-not $jreHome -and $jreExists) {
-        Write-Host "  [2] Set JRE_HOME  = $knownJRE"  -ForegroundColor Cyan
-    }
-    if ((-not $javaHome -and $javaExists) -or (-not $jreHome -and $jreExists)) {
-        Write-Host "  [3] Set both"                    -ForegroundColor Cyan
-    }
-    Write-Host "  [X] Back to menu" -ForegroundColor Gray
-    Write-Host ''
-
-    $sel = (Read-Host '  Enter selection').Trim().ToUpper()
-
-    $setJava = ($sel -eq '1' -or $sel -eq '3') -and (-not $javaHome) -and $javaExists
-    $setJRE  = ($sel -eq '2' -or $sel -eq '3') -and (-not $jreHome)  -and $jreExists
-
-    if ($setJava) {
-        [System.Environment]::SetEnvironmentVariable('JAVA_HOME', $knownJava, 'Machine')
-        Write-Host "  JAVA_HOME set to: $knownJava" -ForegroundColor Green
-    }
-    if ($setJRE) {
-        [System.Environment]::SetEnvironmentVariable('JRE_HOME', $knownJRE, 'Machine')
-        Write-Host "  JRE_HOME set to: $knownJRE"   -ForegroundColor Green
-    }
-    if ((-not $setJava) -and (-not $setJRE) -and ($sel -ne 'X')) {
-        Write-Host '  No changes made.' -ForegroundColor Gray
-    }
-
-    if ($setJava -or $setJRE) {
-        Write-Host ''
-        Write-Host '  Note: A system restart or service restart may be required for changes to take effect.' -ForegroundColor Yellow
-    }
-
-    Write-Host ''
-    Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-    try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
 }
 
 function Invoke-Operation {
@@ -2065,10 +1778,9 @@ function Invoke-Operation {
         '2' { Invoke-SystemCenterUpdate }
         '3' { Invoke-TomcatUpgrade }
     }
-    Get-InstalledVersions
     Write-Host ''
     Write-Host '  Press any key to return to the menu...' -ForegroundColor Gray
-    try { $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') } catch { }
+    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
 }
 #endregion
 
@@ -2091,20 +1803,9 @@ if (-not (Test-Path $serversFile)) {
     Start-Sleep -Seconds 2
 }
 
-# Detect installed versions once at startup — displayed in menu header each refresh
 Write-Host ''
 Write-Host '  Detecting installed software versions...' -ForegroundColor Gray
 Get-InstalledVersions
-
-# Non-interactive mode — invoked remotely with -RunOperation
-if ($RunOperation -gt 0) {
-    switch ($RunOperation) {
-        1 { Invoke-Backup }
-        2 { Invoke-SystemCenterUpdate }
-        3 { Invoke-TomcatUpgrade }
-    }
-    exit 0
-}
 #endregion
 
 #region Main Loop
@@ -2124,13 +1825,6 @@ if ($RunOperation -gt 0) {
 
         'S' { Invoke-StageSoftware }
 
-        'J' { Set-JavaEnvironment }
-
-        'R' {
-            Show-RemoteSCMenu
-            Get-InstalledVersions
-        }
-
         'A' { '1','2','3' | ForEach-Object { Invoke-Operation -Key $_ } }
 
         default {
@@ -2140,7 +1834,7 @@ if ($RunOperation -gt 0) {
 
             if ($bad.Count -gt 0) {
                 Write-Host ''
-                Write-Host ("  Invalid entry: '{0}' - use 1, 2, 3, S, A, R, J, or Q." -f ($bad -join ',')) -ForegroundColor Red
+                Write-Host ("  Invalid entry: '{0}' - use 1, 2, 3, S, A, or Q." -f ($bad -join ',')) -ForegroundColor Red
                 Start-Sleep -Seconds 2
                 continue
             }
