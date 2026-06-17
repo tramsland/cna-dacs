@@ -1491,6 +1491,16 @@ function Show-Menu {
     Write-Host ("    Tomcat         : {0}  ({1})" -f $tcVer, $tcPath) -ForegroundColor $tcColor
     Write-Host ("    SC Agent       : {0}" -f $scVer)                  -ForegroundColor $scColor
     Write-Host ("    Java           : {0}  {1}  ({2})" -f $jVer, $jLabel, $jPath) -ForegroundColor $jColor
+
+    $jhMachine  = [System.Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine')
+    $jreMachine = [System.Environment]::GetEnvironmentVariable('JRE_HOME',  'Machine')
+    $jhDisplay  = if ($jhMachine)  { $jhMachine  } else { '(not set)' }
+    $jrDisplay  = if ($jreMachine) { $jreMachine } else { '(not set)' }
+    $jhColor2   = if ($jhMachine)  { 'Green' } else { 'Yellow' }
+    $jrColor2   = if ($jreMachine) { 'Green' } else { 'Yellow' }
+
+    Write-Host ("    JAVA_HOME      : {0}" -f $jhDisplay) -ForegroundColor $jhColor2
+    Write-Host ("    JRE_HOME       : {0}" -f $jrDisplay) -ForegroundColor $jrColor2
     Write-Host ''
     Write-Host '  Operations:' -ForegroundColor White
     Write-Host ''
