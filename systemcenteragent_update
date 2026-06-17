@@ -1282,6 +1282,8 @@ function Get-InstalledVersions {
     # Detect locally installed Tomcat version via version.bat
     $script:TomcatInstalledVersion = 'Not detected'
     $script:TomcatInstallPath      = $null
+    $script:JavaVersion            = 'Not detected'
+    $script:JavaDoDApproved        = $false
 
     $candidates = @(
         $TomcatConfig.ServiceCandidates | ForEach-Object { $_ }
@@ -1388,8 +1390,60 @@ function Get-InstalledVersions {
                     Select-Object -First 1
         if ($vContent) { $script:SCAgentInstalledVersion = $vContent.Matches[0].Groups[1].Value }
     }
+
+    # Detect Java version — check Tomcat service JVM, then JAVA_HOME, then PATH
+    $script:JavaVersion    = 'Not detected'
+    $script:JavaDoDApproved = $false
+    $javaExe = $null
+
+    # Method 1: JVM path from Tomcat service registry (Options\JvmMs or ImagePath alongside jvm.dll)
+    foreach ($svc in $svcs) {
+        $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)\Parameters"
+        $jvmPath = (Get-ItemProperty $svcKey -ErrorAction SilentlyContinue).Jvm
+        if ($jvmPath -and (Test-Path $jvmPath)) {
+            # jvm.dll lives at <java_home>\bin\server\jvm.dll or <java_home>\jre\bin\server\jvm.dll
+            $javaHome = $jvmPath
+            for ($i = 0; $i -lt 5; $i++) {
+                $javaHome = Split-Path $javaHome -Parent
+                $candidate = Join-Path $javaHome 'bin\java.exe'
+                if (Test-Path $candidate) { $javaExe = $candidate; break }
+            }
+        }
+        if ($javaExe) { break }
+    }
+
+    # Method 2: JAVA_HOME environment variable
+    if (-not $javaExe) {
+        $jh = [System.Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine')
+        if ($jh) {
+            $candidate = Join-Path $jh 'bin\java.exe'
+            if (Test-Path $candidate) { $javaExe = $candidate }
+        }
+    }
+
+    # Method 3: java.exe on system PATH
+    if (-not $javaExe) {
+        $javaExe = (Get-Command java.exe -ErrorAction SilentlyContinue)?.Source
+    }
+
+    if ($javaExe) {
+        try {
+            $jOutput = & $javaExe -version 2>&1 | Out-String
+            $jMatch  = [regex]::Match($jOutput, '(?:java|openjdk) version "([^"]+)"')
+            if ($jMatch.Success) {
+                $jVerStr = $jMatch.Groups[1].Value.Trim()
+                $script:JavaVersion = $jVerStr
+                # Extract major version — handles both 1.8.x and 11+ formats
+                $major = if ($jVerStr -match '^1\.(\d+)') { [int]$Matches[1] }
+                         elseif ($jVerStr -match '^(\d+)')  { [int]$Matches[1] }
+                         else                               { 0 }
+                # DoD approved LTS versions: 11, 17, 21
+                $script:JavaDoDApproved = $major -in @(11, 17, 21)
+            }
+        }
+        catch { $script:JavaVersion = "Error: $_" }
+    }
 }
-#endregion
 
 #region Menu
 function Show-Menu {
@@ -1403,9 +1457,15 @@ function Show-Menu {
     $tcColor = if ($tcVer -eq 'Not detected' -or $tcVer -like 'Error*') { 'Yellow' } else { 'Green' }
     $scColor = if ($scVer -eq 'Not detected') { 'Yellow' } else { 'Green' }
 
+    $jVer    = $script:JavaVersion
+    $jApproved = $script:JavaDoDApproved
+    $jLabel  = if ($jApproved) { '[DoD Approved]' } elseif ($jVer -eq 'Not detected') { '' } else { '[NOT DoD Approved]' }
+    $jColor  = if ($jApproved) { 'Green' } elseif ($jVer -eq 'Not detected') { 'Yellow' } else { 'Red' }
+
     Write-Host '  Installed Software Versions:' -ForegroundColor White
     Write-Host ("    Tomcat         : {0}  ({1})" -f $tcVer, $tcPath) -ForegroundColor $tcColor
     Write-Host ("    SC Agent       : {0}" -f $scVer)                  -ForegroundColor $scColor
+    Write-Host ("    Java           : {0}  {1}" -f $jVer, $jLabel)     -ForegroundColor $jColor
     Write-Host ''
     Write-Host '  Operations:' -ForegroundColor White
     Write-Host ''
