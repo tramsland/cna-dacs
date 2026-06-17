@@ -1391,27 +1391,45 @@ function Get-InstalledVersions {
         if ($vContent) { $script:SCAgentInstalledVersion = $vContent.Matches[0].Groups[1].Value }
     }
 
-    # Detect Java version — check Tomcat service JVM, then JAVA_HOME, then known paths, then PATH
+    # Detect Java version — mirror Tomcat's own resolution order:
+    # 1) setenv.bat JAVA_HOME/JRE_HOME override
+    # 2) JRE_HOME machine env var
+    # 3) JAVA_HOME machine env var
+    # 4) Known DACS paths
+    # 5) System PATH
     $script:JavaVersion   = 'Not detected'
     $script:JavaDoDStatus = ''
     $script:JavaExePath   = ''
+    $javaExe = $null
 
-    # Method 1: JVM path from Tomcat service registry
-    foreach ($svc in $svcs) {
-        $svcKey  = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)\Parameters"
-        $jvmPath = (Get-ItemProperty $svcKey -ErrorAction SilentlyContinue).Jvm
-        if ($jvmPath -and (Test-Path $jvmPath)) {
-            $javaHome = $jvmPath
-            for ($i = 0; $i -lt 5; $i++) {
-                $javaHome = Split-Path $javaHome -Parent
-                $candidate = Join-Path $javaHome 'bin\java.exe'
-                if (Test-Path $candidate) { $javaExe = $candidate; break }
+    # Method 1: setenv.bat in Tomcat bin dir
+    if ($script:TomcatInstallPath) {
+        $setenv = Join-Path $script:TomcatInstallPath 'bin\setenv.bat'
+        if (Test-Path $setenv) {
+            $lines = Get-Content $setenv -ErrorAction SilentlyContinue
+            foreach ($line in $lines) {
+                if ($line -match 'JRE_HOME\s*=\s*"?([^"^\s]+)"?') {
+                    $candidate = Join-Path $Matches[1].TrimEnd('\') 'bin\java.exe'
+                    if (Test-Path $candidate) { $javaExe = $candidate; break }
+                }
+                if ($line -match 'JAVA_HOME\s*=\s*"?([^"^\s]+)"?') {
+                    $candidate = Join-Path $Matches[1].TrimEnd('\') 'bin\java.exe'
+                    if (Test-Path $candidate) { $javaExe = $candidate; break }
+                }
             }
         }
-        if ($javaExe) { break }
     }
 
-    # Method 2: JAVA_HOME environment variable
+    # Method 2: JRE_HOME machine environment variable
+    if (-not $javaExe) {
+        $jrh = [System.Environment]::GetEnvironmentVariable('JRE_HOME', 'Machine')
+        if ($jrh) {
+            $candidate = Join-Path $jrh 'bin\java.exe'
+            if (Test-Path $candidate) { $javaExe = $candidate }
+        }
+    }
+
+    # Method 3: JAVA_HOME machine environment variable
     if (-not $javaExe) {
         $jh = [System.Environment]::GetEnvironmentVariable('JAVA_HOME', 'Machine')
         if ($jh) {
@@ -1420,7 +1438,7 @@ function Get-InstalledVersions {
         }
     }
 
-    # Method 3: Known DACS paths — JRE first (runtime), then JDK
+    # Method 4: Known DACS paths — JRE first (runtime), then JDK
     if (-not $javaExe) {
         $knownPaths = @(
             'E:\Customers\Shared\DACS\Java\JRE\bin\java.exe',
@@ -1431,7 +1449,7 @@ function Get-InstalledVersions {
         }
     }
 
-    # Method 4: java.exe on system PATH
+    # Method 5: java.exe on system PATH
     if (-not $javaExe) {
         $jCmd = Get-Command java.exe -ErrorAction SilentlyContinue
         if ($jCmd) { $javaExe = $jCmd.Source }
