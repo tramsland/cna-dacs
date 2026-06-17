@@ -793,202 +793,472 @@ function Invoke-Backup {
 function Invoke-SystemCenterUpdate {
     $script:_ActiveLog = New-LogPath 'SystemCenterUpdate'
 
-    Write-Header "Operation 2: System Center Agent Update"
+    Write-Header "Operation 2: System Center Agent Update (Remote — servers.txt)"
     Write-Log "Log: $($script:_ActiveLog)" 'INFO' 'Gray'
 
-    function Get-ResolvedSCServices {
-        $allSvcs   = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
-        $csSvc     = $allSvcs | Where-Object {
-            $_.Description -like '*Content Server*' -and
-            $_.Description -notlike '*Content Server Admin*'
-        } | Select-Object -First 1
-        $tomcatSvc = $allSvcs | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } |
-                     Select-Object -First 1
-        $instName  = if ($csSvc)     { $csSvc.Name }     else { $null }
-        $tomName   = if ($tomcatSvc) { $tomcatSvc.Name } else { $null }
-        if (-not $instName) { Write-Log "Content Server service not found — {INSTANCE} skipped." 'WARN' 'Yellow' }
-        if (-not $tomName)  { Write-Log "Tomcat service not found — {TOMCAT} skipped."           'WARN' 'Yellow' }
-
-        return @($SCConfig.ServiceOrder | ForEach-Object {
-            switch ($_) {
-                '{TOMCAT}'   { if ($tomName)  { $tomName  } }
-                '{INSTANCE}' { if ($instName) { $instName } }
-                default {
-                    $val = if ($instName) { $instName } else { '' }
-                    $_ -replace [regex]::Escape('{INSTANCE}'), $val
-                }
-            }
-        } | Where-Object { $_ -and $_.Trim() -ne '' })
+    # -----------------------------------------------------------------------
+    # Step 0 — Validate servers.txt
+    # -----------------------------------------------------------------------
+    $configFile = Join-Path $RootDir 'servers.txt'
+    if (-not (Test-Path $configFile)) {
+        Write-Log "servers.txt not found: $configFile" 'ERROR' 'Red'; return
     }
+    $serverGroups, $totalEntries = Parse-ServersFile -Path $configFile
+    if ($totalEntries -eq 0) {
+        Write-Log "No valid server entries in servers.txt." 'ERROR' 'Red'; return
+    }
+    Write-Log "Servers: $totalEntries across $($serverGroups.Keys.Count) zone(s)" 'INFO' 'Gray'
 
-    function Stop-SCServices {
-        param([string[]]$Names)
-        $stopped = New-Object 'System.Collections.Generic.List[string]'
-        foreach ($name in $Names) {
-            $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
-            if (-not $svc) { Write-Log "Service '$name' not found — skipping." 'WARN' 'Yellow'; continue }
-            if ($svc.Status -eq 'Running') {
-                Write-Log "Stopping '$name'..." 'INFO' 'White'
-                Stop-Service -Name $name -Force -ErrorAction Stop
-                Wait-ServiceState -Name $name -TargetState 'Stopped' `
-                    -TimeoutSec $SCConfig.StopTimeoutSec -ActionLabel 'stopped'
-                $stopped.Add($name)
+    # -----------------------------------------------------------------------
+    # Step 1 — Detect MSI version from the patch server (once, locally)
+    #          We read the version string embedded in the MSI ProductVersion
+    #          property by downloading to a temp location only if we later
+    #          find at least one server that needs it.
+    #          Strategy:
+    #            a) Try HTTP HEAD to confirm server reachable.
+    #            b) Defer actual download until first server needs upgrade.
+    # -----------------------------------------------------------------------
+    $script:_MsiLocalPath   = $null   # set once downloaded
+    $script:_MsiVersion     = $null   # ProductVersion from MSI, detected after download
+    $script:_MsiDownloaded  = $false
+    $script:_MsiTempDir     = $null
+
+    function Get-MsiProductVersion {
+        param([string]$MsiPath)
+        try {
+            $wi  = New-Object -ComObject WindowsInstaller.Installer
+            $db  = $wi.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $wi,
+                       @($MsiPath, 0))
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db,
+                       @("SELECT Value FROM Property WHERE Property='ProductVersion'"))
+            $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            $rec = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($rec) {
+                return $rec.GetType().InvokeMember('StringData', 'GetProperty', $null, $rec, @(1))
             }
-            else { Write-Log "Service '$name' already stopped." 'WARN' 'Yellow' }
         }
-        return ,$stopped
+        catch { }
+        return $null
     }
 
-    function Start-SCServices {
-        param([string[]]$Names)
-        $arr = $Names.Clone()
-        [array]::Reverse($arr)
-        foreach ($name in $arr) {
-            $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
-            if (-not $svc) {
-                Write-Log "Service '$name' not found during restart — skipping." 'WARN' 'Yellow'
-                continue
-            }
-            try {
-                Write-Log "Starting '$name'..." 'INFO' 'White'
-                Start-Service -Name $name -ErrorAction Stop
-                Wait-ServiceState -Name $name -TargetState 'Running' `
-                    -TimeoutSec $SCConfig.StartTimeoutSec -ActionLabel 'started'
-            }
-            catch { Write-Log "ERROR starting '$name': $_" 'ERROR' 'Red' }
-        }
-    }
-
-    if (-not (Test-Path $SCConfig.InstallDir)) {
-        Write-Log "Install directory not found: $($SCConfig.InstallDir)" 'ERROR' 'Red'
-        return
-    }
-
-    $stoppedServices = @()
-    $msiTemp         = $null
-
-    try {
-        # Phase 1 — Stop services
-        Write-Log "Phase 1: Stopping services..." 'INFO' 'Yellow'
-        $serviceNames    = Get-ResolvedSCServices
-        Write-Log "Order: $($serviceNames -join ' -> ')" 'INFO' 'Gray'
-        $stoppedServices = Stop-SCServices -Names $serviceNames
-        Write-Log "Services stopped." 'OK' 'Green'
-        Write-Log -Spacer
-
-        # Phase 2 — Backup install directory
-        Write-Log "Phase 2: Backing up install directory..." 'INFO' 'Yellow'
-        $backupDir  = Split-Path $SCConfig.InstallDir -Parent
-        $backupName = "$(Split-Path $SCConfig.InstallDir -Leaf)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
-        $backupPath = Join-Path $backupDir $backupName
-        Compress-Archive -Path $SCConfig.InstallDir -DestinationPath $backupPath -Force
-        Write-Log "Backup created: $backupPath" 'OK' 'Green'
-        Write-Log -Spacer
-
-        # Phase 3 — Download MSI from internal patch server
-        Write-Log "Phase 3: Downloading MSI from internal patch server..." 'INFO' 'Yellow'
-        $msiTemp = Join-Path $env:TEMP "SCA_download_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-        New-Item -ItemType Directory -Path $msiTemp -Force | Out-Null
-        $msiPath = Join-Path $msiTemp $SCConfig.MsiName
-        Write-Log "Source: $($SCConfig.MsiUrl)" 'INFO' 'Gray'
+    function Ensure-MsiDownloaded {
+        if ($script:_MsiDownloaded) { return $script:_MsiLocalPath }
+        Write-Log "Downloading MSI from $($SCConfig.MsiUrl) ..." 'INFO' 'Yellow'
+        $script:_MsiTempDir = Join-Path $env:TEMP "SCA_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        New-Item -ItemType Directory -Path $script:_MsiTempDir -Force | Out-Null
+        $dest = Join-Path $script:_MsiTempDir $SCConfig.MsiName
         try {
             $wc = New-Object System.Net.WebClient
-            $wc.DownloadFile($SCConfig.MsiUrl, $msiPath)
+            $wc.DownloadFile($SCConfig.MsiUrl, $dest)
         }
         catch { throw "MSI download failed: $_" }
-        if (-not (Test-Path $msiPath) -or (Get-Item $msiPath).Length -eq 0) {
+        if (-not (Test-Path $dest) -or (Get-Item $dest).Length -eq 0) {
             throw "Downloaded MSI is missing or empty."
         }
-        Write-Log "MSI downloaded ($([math]::Round((Get-Item $msiPath).Length / 1MB, 2)) MB)." 'OK' 'Green'
-        Write-Log -Spacer
-
-        # Phase 4 — Uninstall current agent
-        Write-Log "Phase 4: Uninstalling current agent..." 'INFO' 'Yellow'
-        $installed = Get-CimInstance -ClassName Win32_Product |
-                     Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
-                     Select-Object -First 1
-        if ($installed) {
-            Write-Log "Found: '$($installed.Name)'  Code: $($installed.IdentifyingNumber)" 'INFO' 'Gray'
-            $uninstLog = Join-Path $LogDir "sc_agent_uninstall_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-            $proc = Start-Process 'msiexec.exe' `
-                -ArgumentList "/qn /l*vx `"$uninstLog`" /x `"$($installed.IdentifyingNumber)`"" `
-                -Wait -PassThru
-            if ($proc.ExitCode -ne 0) { throw "Uninstall failed (exit $($proc.ExitCode)). See: $uninstLog" }
-            Write-Log "Uninstall complete." 'OK' 'Green'
+        $sizeMB = [math]::Round((Get-Item $dest).Length / 1MB, 2)
+        Write-Log "MSI downloaded: $dest ($sizeMB MB)" 'OK' 'Green'
+        $script:_MsiLocalPath  = $dest
+        $script:_MsiDownloaded = $true
+        $script:_MsiVersion    = Get-MsiProductVersion -MsiPath $dest
+        if ($script:_MsiVersion) {
+            Write-Log "MSI ProductVersion: $($script:_MsiVersion)" 'INFO' 'Gray'
         }
         else {
-            Write-Log "No matching product found via Win32_Product — skipping MSI uninstall." 'WARN' 'Yellow'
+            Write-Log "Could not read ProductVersion from MSI — version-skip check disabled." 'WARN' 'Yellow'
         }
-        Write-Log -Spacer
+        return $dest
+    }
 
-        # Phase 5 — Empty install directory
-        Write-Log "Phase 5: Emptying install directory..." 'INFO' 'Yellow'
-        Get-ChildItem -Path $SCConfig.InstallDir -Force -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop
-                Write-Log "  Removed: $($_.Name)" 'INFO' 'Gray'
+    # -----------------------------------------------------------------------
+    # Scriptblock: detect installed SC agent version on a remote server.
+    # Tries registry first (fast), then Win32_Product (slow fallback).
+    # Returns version string or $null.
+    # -----------------------------------------------------------------------
+    $detectVersionBlock = {
+        param([string]$InstallDir)
+        # Method 1 — Uninstall registry keys (fast)
+        $regPaths = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
+        foreach ($rp in $regPaths) {
+            if (-not (Test-Path $rp)) { continue }
+            foreach ($key in (Get-ChildItem $rp -ErrorAction SilentlyContinue)) {
+                $p = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+                if ($p.DisplayName -like '*System Center*' -or $p.DisplayName -like '*OTS*') {
+                    if ($p.DisplayVersion) { return $p.DisplayVersion }
+                }
             }
-        Write-Log "Install directory emptied." 'OK' 'Green'
-        Write-Log -Spacer
-
-        # Phase 6 — Install new agent
-        Write-Log "Phase 6: Installing new agent..." 'INFO' 'Yellow'
-        $installLog  = Join-Path $LogDir "sc_agent_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-        $installArgs = "/qn /l*vx `"$installLog`" /i `"$msiPath`" " +
-                       "HTTP_PORT_NUMBER=`"$($SCConfig.HttpPort)`" " +
-                       "SERVER_NAME=`"$($SCConfig.ServerName)`" " +
-                       "INSTALLDIR=`"$($SCConfig.MsiInstallDir)`""
-        $proc = Start-Process 'msiexec.exe' -ArgumentList $installArgs -Wait -PassThru
-        if ($proc.ExitCode -ne 0) { throw "Install failed (exit $($proc.ExitCode)). See: $installLog" }
-        Write-Log "Install complete. Log: $installLog" 'OK' 'Green'
-        Write-Log -Spacer
-
-        # Phase 7 — Restore configuration.conf.ini from backup zip
-        Write-Log "Phase 7: Restoring '$($SCConfig.RestoreFile)' from backup..." 'INFO' 'Yellow'
-        $tempExtract = Join-Path $env:TEMP "SCA_restore_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-        New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($backupPath)
+        }
+        # Method 2 — Win32_Product (slower)
         try {
-            $zipEntry = $zip.Entries | Where-Object { $_.Name -ieq $SCConfig.RestoreFile } |
-                        Select-Object -First 1
-            if (-not $zipEntry) { throw "'$($SCConfig.RestoreFile)' not found in backup zip." }
-            [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
-                $zipEntry,
-                (Join-Path $tempExtract $SCConfig.RestoreFile),
-                $true
+            $prod = Get-CimInstance -ClassName Win32_Product -ErrorAction Stop |
+                    Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
+                    Select-Object -First 1
+            if ($prod) { return $prod.Version }
+        }
+        catch { }
+        # Method 3 — version.txt in install dir
+        $vf = Join-Path $InstallDir 'version.txt'
+        if (Test-Path $vf) {
+            $m = Get-Content $vf -TotalCount 5 |
+                 Select-String '(\d+\.\d+[\.\d]*)' | Select-Object -First 1
+            if ($m) { return $m.Matches[0].Groups[1].Value }
+        }
+        return $null
+    }
+
+    # -----------------------------------------------------------------------
+    # Scriptblock: full SC agent update — runs on the remote server.
+    # Receives the MSI path (already on the remote machine via UNC copy).
+    # Returns a result hashtable.
+    # -----------------------------------------------------------------------
+    $updateBlock = {
+        param(
+            [string]$MsiRemotePath,
+            [string]$InstallDir,
+            [string]$LocalhostDir,
+            [string]$MsiInstallDir,
+            [string]$HttpPort,
+            [string]$ServerName,
+            [string]$RestoreFile,
+            [string]$CopyFile,
+            [string[]]$ServiceOrder,
+            [int]$StopTimeoutSec,
+            [int]$StartTimeoutSec,
+            [string]$RemoteLogDir
+        )
+
+        $h = $env:COMPUTERNAME
+        $msgs = New-Object 'System.Collections.Generic.List[string]'
+        $ok   = $true
+
+        function Add-Msg  { param($m,$l='INFO') $msgs.Add("[$l] ($h) $m") }
+        function Throw-Op { param($m) $ok = $false; throw $m }
+
+        function Resolve-Services {
+            $all  = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
+            $cs   = $all | Where-Object {
+                $_.Description -like '*Content Server*' -and
+                $_.Description -notlike '*Content Server Admin*'
+            } | Select-Object -First 1
+            $tc   = $all | Where-Object { $_.DisplayName -like '*Apache*Tomcat*' } |
+                    Select-Object -First 1
+            $inst = if ($cs) { $cs.Name } else { $null }
+            $tom  = if ($tc) { $tc.Name } else { $null }
+            return @($ServiceOrder | ForEach-Object {
+                switch ($_) {
+                    '{TOMCAT}'   { if ($tom)  { $tom  } }
+                    '{INSTANCE}' { if ($inst) { $inst } }
+                    default {
+                        $v = if ($inst) { $inst } else { '' }
+                        $_ -replace [regex]::Escape('{INSTANCE}'), $v
+                    }
+                }
+            } | Where-Object { $_ -and $_.Trim() -ne '' })
+        }
+
+        function Wait-Svc {
+            param([string]$n, [string]$s, [int]$t, [string]$a)
+            $svc = Get-Service -Name $n -ErrorAction Stop
+            $svc.WaitForStatus($s, [TimeSpan]::FromSeconds($t))
+            Add-Msg "Service '$n' $a." 'OK'
+        }
+
+        $stopped = New-Object 'System.Collections.Generic.List[string]'
+        $backupPath = $null
+
+        try {
+            # Phase 1 — resolve + stop services
+            Add-Msg "Resolving services..."
+            $svcNames = Resolve-Services
+            Add-Msg "Service order: $($svcNames -join ' -> ')"
+            foreach ($sn in $svcNames) {
+                $svc = Get-Service -Name $sn -ErrorAction SilentlyContinue
+                if (-not $svc) { Add-Msg "Service '$sn' not found — skipping." 'WARN'; continue }
+                if ($svc.Status -eq 'Running') {
+                    Add-Msg "Stopping '$sn'..."
+                    Stop-Service -Name $sn -Force -ErrorAction Stop
+                    Wait-Svc $sn 'Stopped' $StopTimeoutSec 'stopped'
+                    $stopped.Add($sn)
+                }
+                else { Add-Msg "Service '$sn' already stopped." 'WARN' }
+            }
+
+            # Phase 2 — backup install dir
+            if (-not (Test-Path $InstallDir)) {
+                Add-Msg "Install dir not found: $InstallDir — skipping backup." 'WARN'
+            }
+            else {
+                $backupDir  = Split-Path $InstallDir -Parent
+                $backupName = "$(Split-Path $InstallDir -Leaf)_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+                $backupPath = Join-Path $backupDir $backupName
+                Add-Msg "Backing up to $backupPath ..."
+                Compress-Archive -Path $InstallDir -DestinationPath $backupPath -Force
+                Add-Msg "Backup complete." 'OK'
+            }
+
+            # Phase 3 — uninstall current agent
+            Add-Msg "Checking for installed SC agent..."
+            $installed = $null
+            # Registry first
+            $regPaths = @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
             )
-        }
-        finally { $zip.Dispose() }
-        Move-Item -Path (Join-Path $tempExtract $SCConfig.RestoreFile) `
-                  -Destination (Join-Path $SCConfig.InstallDir $SCConfig.RestoreFile) -Force
-        Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Log "Restored '$($SCConfig.RestoreFile)' to install root." 'OK' 'Green'
-        Write-Log -Spacer
+            $prodCode = $null
+            foreach ($rp in $regPaths) {
+                if (-not (Test-Path $rp)) { continue }
+                foreach ($key in (Get-ChildItem $rp -ErrorAction SilentlyContinue)) {
+                    $p = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+                    if ($p.DisplayName -like '*System Center*' -or $p.DisplayName -like '*OTS*') {
+                        $prodCode = $p.PSChildName
+                        Add-Msg "Found via registry: '$($p.DisplayName)' ($prodCode)"
+                        break
+                    }
+                }
+                if ($prodCode) { break }
+            }
+            if (-not $prodCode) {
+                # Fall back to Win32_Product
+                try {
+                    $installed = Get-CimInstance -ClassName Win32_Product -ErrorAction Stop |
+                                 Where-Object { $_.Name -like '*System Center*' -or $_.Name -like '*OTS*' } |
+                                 Select-Object -First 1
+                    if ($installed) { $prodCode = $installed.IdentifyingNumber }
+                }
+                catch { Add-Msg "Win32_Product query failed: $_" 'WARN' }
+            }
+            if ($prodCode) {
+                Add-Msg "Uninstalling product code $prodCode ..."
+                $unLog = Join-Path $RemoteLogDir "sc_uninstall_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+                $proc  = Start-Process 'msiexec.exe' `
+                    -ArgumentList "/qn /l*vx `"$unLog`" /x `"$prodCode`"" -Wait -PassThru
+                if ($proc.ExitCode -ne 0) { Throw-Op "Uninstall failed (exit $($proc.ExitCode)). Log: $unLog" }
+                Add-Msg "Uninstall complete." 'OK'
+            }
+            else { Add-Msg "No SC agent found via registry or Win32_Product — skipping uninstall." 'WARN' }
 
-        # Phase 8 — Copy conf.ini from localhost\configuration\
-        Write-Log "Phase 8: Copying '$($SCConfig.CopyFile)' from localhost folder..." 'INFO' 'Yellow'
-        $confSource = Join-Path $SCConfig.LocalhostDir "configuration\$($SCConfig.CopyFile)"
-        $confDest   = Join-Path $SCConfig.InstallDir $SCConfig.CopyFile
-        if (-not (Test-Path $confSource)) { throw "'$($SCConfig.CopyFile)' not found at: $confSource" }
-        Copy-Item -Path $confSource -Destination $confDest -Force
-        Write-Log "Copied '$confSource' -> '$confDest'" 'OK' 'Green'
-        Write-Log -Spacer
+            # Phase 4 — empty install directory
+            if (Test-Path $InstallDir) {
+                Add-Msg "Emptying install directory $InstallDir ..."
+                Get-ChildItem -Path $InstallDir -Force -ErrorAction SilentlyContinue |
+                    ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop }
+                Add-Msg "Install directory emptied." 'OK'
+            }
+
+            # Phase 5 — install new agent from pushed MSI
+            if (-not (Test-Path $MsiRemotePath)) { Throw-Op "MSI not found at remote path: $MsiRemotePath" }
+            Add-Msg "Installing from $MsiRemotePath ..."
+            $instLog  = Join-Path $RemoteLogDir "sc_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+            $instArgs = "/qn /l*vx `"$instLog`" /i `"$MsiRemotePath`" " +
+                        "HTTP_PORT_NUMBER=`"$HttpPort`" " +
+                        "SERVER_NAME=`"$ServerName`" " +
+                        "INSTALLDIR=`"$MsiInstallDir`""
+            $proc = Start-Process 'msiexec.exe' -ArgumentList $instArgs -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { Throw-Op "Install failed (exit $($proc.ExitCode)). Log: $instLog" }
+            Add-Msg "Install complete. Log: $instLog" 'OK'
+
+            # Phase 6 — restore configuration.conf.ini from backup zip
+            if ($backupPath -and (Test-Path $backupPath)) {
+                Add-Msg "Restoring '$RestoreFile' from backup zip..."
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $tmpEx = Join-Path $env:TEMP "SCA_restore_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                New-Item -ItemType Directory -Path $tmpEx -Force | Out-Null
+                $zip = [System.IO.Compression.ZipFile]::OpenRead($backupPath)
+                try {
+                    $entry = $zip.Entries | Where-Object { $_.Name -ieq $RestoreFile } |
+                             Select-Object -First 1
+                    if (-not $entry) { throw "'$RestoreFile' not found in backup zip." }
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile(
+                        $entry, (Join-Path $tmpEx $RestoreFile), $true)
+                }
+                finally { $zip.Dispose() }
+                Move-Item (Join-Path $tmpEx $RestoreFile) (Join-Path $InstallDir $RestoreFile) -Force
+                Remove-Item $tmpEx -Recurse -Force -ErrorAction SilentlyContinue
+                Add-Msg "Restored '$RestoreFile'." 'OK'
+            }
+            else { Add-Msg "No backup available — skipping '$RestoreFile' restore." 'WARN' }
+
+            # Phase 7 — copy conf.ini from localhost\configuration\
+            $confSrc  = Join-Path $LocalhostDir "configuration\$CopyFile"
+            $confDest = Join-Path $InstallDir $CopyFile
+            if (Test-Path $confSrc) {
+                Copy-Item -Path $confSrc -Destination $confDest -Force
+                Add-Msg "Copied '$CopyFile' from localhost folder." 'OK'
+            }
+            else { Add-Msg "'$CopyFile' not found at $confSrc — skipping." 'WARN' }
+        }
+        catch {
+            Add-Msg "FATAL: $_" 'ERROR'
+            $ok = $false
+        }
+        finally {
+            # Phase 8 — restart services (always)
+            if ($stopped.Count -gt 0) {
+                $arr = $stopped.ToArray(); [array]::Reverse($arr)
+                foreach ($sn in $arr) {
+                    $svc = Get-Service -Name $sn -ErrorAction SilentlyContinue
+                    if (-not $svc) { Add-Msg "Service '$sn' not found during restart." 'WARN'; continue }
+                    try {
+                        Add-Msg "Starting '$sn'..."
+                        Start-Service -Name $sn -ErrorAction Stop
+                        Wait-Svc $sn 'Running' $StartTimeoutSec 'started'
+                    }
+                    catch { Add-Msg "ERROR starting '$sn': $_" 'ERROR'; $ok = $false }
+                }
+            }
+        }
+
+        return [pscustomobject]@{ Success = $ok; Messages = $msgs.ToArray() }
     }
-    catch {
-        Write-Log "FATAL ERROR: $_" 'ERROR' 'Red'
-        Write-Log "Services will still be restarted." 'WARN' 'Yellow'
-    }
-    finally {
-        Write-Log "Phase 9: Restarting services..." 'INFO' 'Yellow'
-        if ($stoppedServices.Count -gt 0) { Start-SCServices -Names $stoppedServices }
-        else { Write-Log "No services to restart." 'WARN' 'Yellow' }
-        if ($msiTemp -and (Test-Path $msiTemp)) {
-            Remove-Item $msiTemp -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "Temp MSI folder cleaned up." 'OK' 'Green'
+
+    # -----------------------------------------------------------------------
+    # Main loop — iterate servers, connect, version-check, update if needed
+    # -----------------------------------------------------------------------
+    $pass = 0; $fail = 0; $skip = 0
+    $prevGroup = $null
+
+    foreach ($group in $serverGroups.Keys) {
+        foreach ($fqdn in $serverGroups[$group]) {
+
+            if ($group -ne $prevGroup) {
+                Write-Log "# Zone: $group" 'INFO' 'Magenta'
+                $prevGroup = $group
+            }
+            Write-Log "--- $fqdn ---" 'INFO' 'Cyan'
+
+            # Connect
+            $ctx = Connect-RemoteServer -Hostname $fqdn
+            if (-not $ctx) { Write-Log "  SKIPPED — no connection." 'ERROR' 'Red'; $fail++; continue }
+            Write-ConnectionBanner -Ctx $ctx
+
+            if ($ctx.Tier -eq 'UNC') {
+                Write-Log "  SKIPPED — UNC-only, cannot run MSI installer." 'WARN' 'Yellow'
+                Disconnect-RemoteServer -Ctx $ctx; $skip++; continue
+            }
+
+            # Version check — skip if already current
+            $installedVer = $null
+            try {
+                $installedVer = Invoke-RCmd -Ctx $ctx -Block $detectVersionBlock `
+                                    -Args @($SCConfig.InstallDir)
+                if ($installedVer) {
+                    Write-Log "  Installed SC agent version: $installedVer" 'INFO' 'Gray'
+                }
+                else {
+                    Write-Log "  SC agent version not detected — will proceed with update." 'WARN' 'Yellow'
+                }
+            }
+            catch {
+                Write-Log "  Version detection failed: $_ — proceeding anyway." 'WARN' 'Yellow'
+            }
+
+            # Download MSI now if not yet done (deferred until first server needs it)
+            $msiLocalPath = $null
+            try { $msiLocalPath = Ensure-MsiDownloaded }
+            catch {
+                Write-Log "  SKIPPED — MSI download failed: $_" 'ERROR' 'Red'
+                Disconnect-RemoteServer -Ctx $ctx; $fail++; continue
+            }
+
+            # Skip if versions match
+            if ($installedVer -and $script:_MsiVersion -and ($installedVer -eq $script:_MsiVersion)) {
+                Write-Log "  Already on version $installedVer — skipping." 'OK' 'Green'
+                Disconnect-RemoteServer -Ctx $ctx; $skip++; continue
+            }
+
+            # Push MSI to remote server via UNC
+            $remoteMsiDir  = 'C:\Windows\Temp\SCA_Deploy'
+            $remoteMsiPath = "$remoteMsiDir\$($SCConfig.MsiName)"
+            $uncMsiDir     = "\\$fqdn\C`$\Windows\Temp\SCA_Deploy"
+            $uncMsiPath    = "$uncMsiDir\$($SCConfig.MsiName)"
+
+            Write-Log "  Pushing MSI to $uncMsiDir ..." 'INFO' 'White'
+            try {
+                if (-not (Test-Path $uncMsiDir)) {
+                    New-Item -ItemType Directory -Path $uncMsiDir -Force | Out-Null
+                }
+                Copy-Item -Path $msiLocalPath -Destination $uncMsiPath -Force
+                Write-Log "  MSI staged at $remoteMsiPath" 'OK' 'Green'
+            }
+            catch {
+                Write-Log "  SKIPPED — could not push MSI via UNC: $_" 'ERROR' 'Red'
+                Disconnect-RemoteServer -Ctx $ctx; $fail++; continue
+            }
+
+            # Ensure remote log dir exists
+            $remoteLogDir = 'C:\Logs'
+            $uncLogDir    = "\\$fqdn\C`$\Logs"
+            if (-not (Test-Path $uncLogDir)) {
+                New-Item -ItemType Directory -Path $uncLogDir -Force -ErrorAction SilentlyContinue | Out-Null
+            }
+
+            # Run the update block remotely
+            Write-Log "  Running update (this may take several minutes)..." 'INFO' 'White'
+            $result = $null
+            try {
+                $result = Invoke-RCmd -Ctx $ctx -Block $updateBlock -Args @(
+                    $remoteMsiPath,
+                    $SCConfig.InstallDir,
+                    $SCConfig.LocalhostDir,
+                    $SCConfig.MsiInstallDir,
+                    $SCConfig.HttpPort,
+                    $SCConfig.ServerName,
+                    $SCConfig.RestoreFile,
+                    $SCConfig.CopyFile,
+                    $SCConfig.ServiceOrder,
+                    $SCConfig.StopTimeoutSec,
+                    $SCConfig.StartTimeoutSec,
+                    $remoteLogDir
+                )
+            }
+            catch {
+                Write-Log "  Remote execution error: $_" 'ERROR' 'Red'
+                $fail++
+                Disconnect-RemoteServer -Ctx $ctx
+                # Clean up pushed MSI
+                Remove-Item $uncMsiPath -Force -ErrorAction SilentlyContinue
+                continue
+            }
+
+            # Log messages returned from remote block
+            if ($result -and $result.Messages) {
+                foreach ($msg in $result.Messages) {
+                    $c = if     ($msg -match '\[ERROR\]') { 'Red'    }
+                         elseif ($msg -match '\[WARN\]')  { 'Yellow' }
+                         elseif ($msg -match '\[OK\]')    { 'Green'  }
+                         else                             { 'Gray'   }
+                    Write-Log $msg 'INFO' $c
+                }
+            }
+
+            if ($result -and $result.Success) {
+                Write-Log "  RESULT: SUCCESS — $fqdn" 'OK' 'Green'
+                $pass++
+            }
+            else {
+                Write-Log "  RESULT: FAILED — $fqdn" 'ERROR' 'Red'
+                $fail++
+            }
+
+            # Clean up pushed MSI from remote temp
+            Remove-Item $uncMsiPath -Force -ErrorAction SilentlyContinue
+            try { Remove-Item $uncMsiDir -Force -ErrorAction SilentlyContinue } catch { }
+
+            Disconnect-RemoteServer -Ctx $ctx
         }
     }
 
+    # Clean up local MSI temp dir
+    if ($script:_MsiTempDir -and (Test-Path $script:_MsiTempDir)) {
+        Remove-Item $script:_MsiTempDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "Local MSI temp folder cleaned up." 'OK' 'Green'
+    }
+
+    Write-Host ''
+    Write-Host ("  SC Agent Update complete — Success: {0}   Failed: {1}   Skipped: {2}   Total: {3}" `
+        -f $pass, $fail, $skip, ($pass+$fail+$skip)) -ForegroundColor Cyan
     Write-Log "System Center update complete. Log: $($script:_ActiveLog)" 'OK' 'Green'
 }
 #endregion
