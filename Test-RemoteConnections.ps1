@@ -94,18 +94,19 @@ Write-Host "  Target server FQDN (e.g. server01.dacs.dla.mil): " -ForegroundColo
 $TargetServer = (Read-Host).Trim()
 if (-not $TargetServer) { Write-Host "  No server entered. Exiting." -ForegroundColor Red; exit 1 }
 
-Write-Host "  NewVersion folder path for Tomcat test (leave blank to skip): " -ForegroundColor White -NoNewline
-$NewVersionPath = (Read-Host).Trim()
+Write-Host "  NewVersion folder path for Tomcat test (leave blank = C:\DLA-failsafe\patching\NewVersion): " -ForegroundColor White -NoNewline
+$NewVersionInput = (Read-Host).Trim()
+$NewVersionPath  = if ($NewVersionInput) { $NewVersionInput } else { 'C:\DLA-failsafe\patching\NewVersion' }
 
-Write-Host "  SC Agent MSI URL (leave blank for default patch.dacs.dla.mil): " -ForegroundColor White -NoNewline
-$MsiUrlInput = (Read-Host).Trim()
-$MsiUrl  = if ($MsiUrlInput) { $MsiUrlInput } else { 'https://patch.dacs.dla.mil/downloadAgent/?ostype=win&filetype=installer' }
-$MsiName = 'OpenText_SystemCenter_Agent.msi'
+$PatchingRoot = 'C:\DLA-failsafe\patching'
+$MsiName      = 'OpenText_SystemCenter_Agent.msi'
+$MsiLocalPath = Join-Path $PatchingRoot $MsiName
 
 Write-Host ""
-Write-Host "  Target  : $TargetServer"  -ForegroundColor White
-Write-Host "  MSI URL : $MsiUrl"        -ForegroundColor Gray
-if ($NewVersionPath) { Write-Host "  Tomcat  : $NewVersionPath" -ForegroundColor Gray }
+Write-Host "  Target       : $TargetServer"   -ForegroundColor White
+Write-Host "  Patching dir : $PatchingRoot"   -ForegroundColor Gray
+Write-Host "  SC Agent MSI : $MsiLocalPath"   -ForegroundColor Gray
+if ($NewVersionPath) { Write-Host "  Tomcat       : $NewVersionPath" -ForegroundColor Gray }
 #endregion
 
 #============================================================
@@ -556,13 +557,12 @@ catch {
     Add-Result '5. SystemCenter' 'SC Agent detection' 'FAIL' $_.Exception.Message
 }
 
-# 5b — Test MSI URL (HEAD request from admin console)
-try {
-    $resp = Invoke-WebRequest -Uri $MsiUrl -Method Head -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-    Add-Result '5. SystemCenter' 'MSI URL reachable (HEAD)' 'PASS' "HTTP $($resp.StatusCode)"
-}
-catch {
-    Add-Result '5. SystemCenter' 'MSI URL reachable (HEAD)' 'WARN' $_.Exception.Message
+# 5b — Verify MSI exists in local patching folder
+if (Test-Path $MsiLocalPath) {
+    $sizeMB = [math]::Round((Get-Item $MsiLocalPath).Length / 1MB, 2)
+    Add-Result '5. SystemCenter' 'MSI found in patching folder' 'PASS' "$MsiLocalPath ($sizeMB MB)"
+} else {
+    Add-Result '5. SystemCenter' 'MSI found in patching folder' 'FAIL' "Not found: $MsiLocalPath"
 }
 
 # 5c — Test UNC staging path write
@@ -577,24 +577,15 @@ catch {
 }
 
 # 5d — Live uninstall + reinstall
-if (Confirm-Action "LIVE TEST: Download MSI, push to $TargetServer, uninstall current SC Agent, reinstall?`n     (All services stopped and restarted. This is the real operation.)") {
+if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uninstall current SC Agent, reinstall?`n     (All services stopped and restarted. This is the real operation.)") {
 
-    $tmpDir  = Join-Path $env:TEMP "SCA_Diag_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-    $msiPath = Join-Path $tmpDir $MsiName
-    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-
-    Write-Host "  Downloading MSI from $MsiUrl ..." -ForegroundColor Yellow
-    try {
-        (New-Object System.Net.WebClient).DownloadFile($MsiUrl, $msiPath)
-        $sizeMB = [math]::Round((Get-Item $msiPath).Length / 1MB, 2)
-        Add-Result '5. SystemCenter' 'MSI download' 'PASS' "$msiPath ($sizeMB MB)"
-    }
-    catch {
-        Add-Result '5. SystemCenter' 'MSI download' 'FAIL' $_.Exception.Message
-        $msiPath = $null
-    }
-
-    if ($msiPath) {
+    # Verify MSI present locally before doing anything
+    if (-not (Test-Path $MsiLocalPath)) {
+        Add-Result '5. SystemCenter' 'MSI pre-check' 'FAIL' "MSI not found at $MsiLocalPath — aborting"
+    } else {
+        $sizeMB = [math]::Round((Get-Item $MsiLocalPath).Length / 1MB, 2)
+        Add-Result '5. SystemCenter' 'MSI pre-check' 'PASS' "$MsiLocalPath ($sizeMB MB)"
+        $msiPath = $MsiLocalPath
         # Push MSI via UNC
         $remoteDeployDir = "\\$TargetServer\c$\Windows\Temp\SCA_Deploy"
         $remoteMsiUnc    = "$remoteDeployDir\$MsiName"
@@ -728,10 +719,9 @@ if (Confirm-Action "LIVE TEST: Download MSI, push to $TargetServer, uninstall cu
                 Add-Result '5. SystemCenter' 'SC remote exec' 'FAIL' $_.Exception.Message
             }
 
-            # Cleanup
+            # Cleanup remote staging folder
             Remove-Item "\\$TargetServer\c$\Windows\Temp\SCA_Deploy" -Recurse -Force -ErrorAction SilentlyContinue
         }
-        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 } else {
     Add-Result '5. SystemCenter' 'SC reinstall' 'INFO' 'Skipped by user'
