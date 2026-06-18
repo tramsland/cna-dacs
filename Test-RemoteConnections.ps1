@@ -90,10 +90,34 @@ Write-Host "  ================================================================" 
 Write-Host "   CNA-DACS Remote Connection Diagnostic" -ForegroundColor Cyan
 Write-Host "  ================================================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Target server FQDN (e.g. server01.dacs.dla.mil): " -ForegroundColor White -NoNewline
-$TargetServer = (Read-Host).Trim()
-if (-not $TargetServer) { Write-Host "  No server entered. Exiting." -ForegroundColor Red; exit 1 }
 
+# Locate servers.txt in the same directory as this script
+$ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ServersFile  = Join-Path $ScriptDir 'servers.txt'
+
+if (-not (Test-Path $ServersFile)) {
+    Write-Host "  [ERROR] servers.txt not found at $ServersFile" -ForegroundColor Red
+    Write-Host "  Create servers.txt in the same folder as this script with:" -ForegroundColor Yellow
+    Write-Host "    [SectionHeader]" -ForegroundColor Gray
+    Write-Host "    server01.dacs.dla.mil" -ForegroundColor Gray
+    Write-Host "    server02.dacs.dla.mil" -ForegroundColor Gray
+    pause; exit 1
+}
+
+# Parse servers.txt — skip [headers], blank lines, and comments (#)
+$ServerList = Get-Content $ServersFile |
+    Where-Object { $_ -notmatch '^\s*\[' -and $_.Trim() -ne '' -and $_ -notmatch '^\s*#' } |
+    ForEach-Object { $_.Trim() }
+
+if ($ServerList.Count -eq 0) {
+    Write-Host "  [ERROR] No server FQDNs found in $ServersFile" -ForegroundColor Red
+    pause; exit 1
+}
+
+Write-Host "  Found $($ServerList.Count) server(s) in servers.txt:" -ForegroundColor White
+foreach ($s in $ServerList) { Write-Host "    $s" -ForegroundColor Gray }
+
+Write-Host ""
 Write-Host "  NewVersion folder path for Tomcat test (leave blank = C:\DLA-failsafe\patching\NewVersion): " -ForegroundColor White -NoNewline
 $NewVersionInput = (Read-Host).Trim()
 $NewVersionPath  = if ($NewVersionInput) { $NewVersionInput } else { 'C:\DLA-failsafe\patching\NewVersion' }
@@ -106,19 +130,21 @@ $MsiLocalPath = Join-Path $PatchingRoot $MsiName
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
 Write-Host ""
-Write-Host "  Target       : $TargetServer"   -ForegroundColor White
-Write-Host "  Patching dir : $PatchingRoot"   -ForegroundColor Gray
-Write-Host "  SC Agent MSI : $MsiLocalPath"   -ForegroundColor Gray
-Write-Host "  Log dir      : $LogDir"         -ForegroundColor Gray
-if ($NewVersionPath) { Write-Host "  Tomcat       : $NewVersionPath" -ForegroundColor Gray }
+Write-Host "  Patching dir : $PatchingRoot"  -ForegroundColor Gray
+Write-Host "  SC Agent MSI : $MsiLocalPath"  -ForegroundColor Gray
+Write-Host "  Log dir      : $LogDir"        -ForegroundColor Gray
+Write-Host "  Tomcat src   : $NewVersionPath" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  Press ENTER to begin tests across all servers, CTRL+C to abort." -ForegroundColor Yellow
+Read-Host | Out-Null
 #endregion
 
-#============================================================
-# SECTION 1 — CONNECTIVITY TESTS
-#============================================================
-Write-Section "1. CONNECTIVITY TESTS"
+# ============================================================
+# MASTER RESULTS — tracks pass/warn/fail across all servers
+# ============================================================
+$AllServerResults = [System.Collections.Generic.List[pscustomobject]]::new()
 
-# Helper: raw TCP port test
+# Helper: raw TCP port test (defined once outside loop)
 function Test-TcpPort {
     param([string]$Server, [int]$Port, [int]$TimeoutMs = 3000)
     try {
@@ -129,6 +155,28 @@ function Test-TcpPort {
         $tcp.Close(); return $false
     } catch { return $false }
 }
+
+foreach ($TargetServer in $ServerList) {
+
+    # Reset per-server state
+    $script:Results            = [System.Collections.Generic.List[pscustomobject]]::new()
+    $winrmOk                   = $false
+    $dcomOk                    = $false
+    $WinRMSession              = $null
+    $CimSession                = $null
+    $ConnectionTier            = 'NONE'
+    $script:DiscoveredServices = $null
+
+    Write-Host ""
+    Write-Host ('=' * 70) -ForegroundColor Cyan
+    Write-Host "  SERVER: $TargetServer" -ForegroundColor Cyan
+    Write-Host ('=' * 70) -ForegroundColor Cyan
+
+#============================================================
+# SECTION 1 — CONNECTIVITY TESTS
+#============================================================
+Write-Section "1. CONNECTIVITY TESTS"
+
 
 # 1a — DNS
 try {
@@ -926,40 +974,96 @@ if (-not $tcSvc) {
     }
 }
 
-#============================================================
-# CLEANUP
-#============================================================
-if ($WinRMSession) { Remove-PSSession $WinRMSession -ErrorAction SilentlyContinue }
-if ($CimSession)   { Remove-CimSession $CimSession  -ErrorAction SilentlyContinue }
+    #============================================================
+    # PER-SERVER CLEANUP
+    #============================================================
+    if ($WinRMSession) { Remove-PSSession $WinRMSession -ErrorAction SilentlyContinue }
+    if ($CimSession)   { Remove-CimSession $CimSession  -ErrorAction SilentlyContinue }
 
-#============================================================
-# FINAL SUMMARY
-#============================================================
-Write-Host ""
-Write-Host ('=' * 70) -ForegroundColor Cyan
-Write-Host "  DIAGNOSTIC SUMMARY  -  $TargetServer" -ForegroundColor Cyan
-Write-Host ('=' * 70) -ForegroundColor Cyan
-Write-Host ""
-
-$grouped = $script:Results | Group-Object Section
-foreach ($g in $grouped) {
-    Write-Host "  $($g.Name)" -ForegroundColor White
-    foreach ($r in $g.Group) {
-        $c = switch ($r.Status) {
-            'PASS' {'Green'} 'WARN' {'Yellow'} 'FAIL' {'Red'} default {'Gray'}
-        }
-        $pad    = ' ' * [math]::Max(0, 44 - $r.Label.Length)
-        $detail = if ($r.Detail) { "  $($r.Detail)" } else { '' }
-        Write-Host ("    {0}{1}[{2}]{3}" -f $r.Label, $pad, $r.Status, $detail) -ForegroundColor $c
-    }
+    #============================================================
+    # PER-SERVER SUMMARY
+    #============================================================
     Write-Host ""
+    Write-Host ('=' * 70) -ForegroundColor Cyan
+    Write-Host "  SUMMARY  -  $TargetServer" -ForegroundColor Cyan
+    Write-Host ('=' * 70) -ForegroundColor Cyan
+    Write-Host ""
+
+    $grouped = $script:Results | Group-Object Section
+    foreach ($g in $grouped) {
+        Write-Host "  $($g.Name)" -ForegroundColor White
+        foreach ($r in $g.Group) {
+            $c = switch ($r.Status) {
+                'PASS' {'Green'} 'WARN' {'Yellow'} 'FAIL' {'Red'} default {'Gray'}
+            }
+            $pad    = ' ' * [math]::Max(0, 44 - $r.Label.Length)
+            $detail = if ($r.Detail) { "  $($r.Detail)" } else { '' }
+            Write-Host ("    {0}{1}[{2}]{3}" -f $r.Label, $pad, $r.Status, $detail) -ForegroundColor $c
+        }
+        Write-Host ""
+    }
+
+    $counts = $script:Results | Group-Object Status
+    $pass  = ($counts | Where-Object Name -eq 'PASS'  | Select-Object -ExpandProperty Count) + 0
+    $warn  = ($counts | Where-Object Name -eq 'WARN'  | Select-Object -ExpandProperty Count) + 0
+    $fail  = ($counts | Where-Object Name -eq 'FAIL'  | Select-Object -ExpandProperty Count) + 0
+    $tier  = $ConnectionTier
+
+    Write-Host "  Totals:  " -ForegroundColor White -NoNewline
+    Write-Host "PASS=$pass   " -ForegroundColor Green  -NoNewline
+    Write-Host "WARN=$warn   " -ForegroundColor Yellow -NoNewline
+    Write-Host "FAIL=$fail"   -ForegroundColor Red
+    Write-Host ""
+
+    # Stash for master summary
+    $AllServerResults.Add([pscustomobject]@{
+        Server = $TargetServer
+        Tier   = $tier
+        Pass   = $pass
+        Warn   = $warn
+        Fail   = $fail
+        Results = $script:Results.ToArray()
+    })
+
+    # Reset per-server results for next iteration
+    $script:Results = [System.Collections.Generic.List[pscustomobject]]::new()
+
+} # end foreach $TargetServer
+
+#============================================================
+# MASTER SUMMARY — all servers
+#============================================================
+Write-Host ""
+Write-Host ('*' * 70) -ForegroundColor Cyan
+Write-Host "  MASTER SUMMARY  -  $($AllServerResults.Count) server(s) tested" -ForegroundColor Cyan
+Write-Host ('*' * 70) -ForegroundColor Cyan
+Write-Host ""
+Write-Host ("  {0,-45} {1,-8} {2,-5} {3,-5} {4,-5}" -f 'Server','Tier','PASS','WARN','FAIL') -ForegroundColor White
+Write-Host ("  {0}" -f ('-' * 68)) -ForegroundColor DarkGray
+
+foreach ($sr in $AllServerResults) {
+    $col = if     ($sr.Fail -gt 0) { 'Red'    }
+           elseif ($sr.Warn -gt 0) { 'Yellow' }
+           else                     { 'Green'  }
+    Write-Host ("  {0,-45} {1,-8} {2,-5} {3,-5} {4,-5}" -f `
+        $sr.Server, $sr.Tier, $sr.Pass, $sr.Warn, $sr.Fail) -ForegroundColor $col
 }
 
-$counts = $script:Results | Group-Object Status
-Write-Host "  Totals:  " -ForegroundColor White -NoNewline
-foreach ($c in $counts | Sort-Object Name) {
-    $col = switch ($c.Name) {'PASS' {'Green'} 'WARN' {'Yellow'} 'FAIL' {'Red'} default {'Gray'}}
-    Write-Host "$($c.Name)=$($c.Count)   " -ForegroundColor $col -NoNewline
-}
 Write-Host ""
+$totalPass = ($AllServerResults | Measure-Object -Property Pass -Sum).Sum
+$totalWarn = ($AllServerResults | Measure-Object -Property Warn -Sum).Sum
+$totalFail = ($AllServerResults | Measure-Object -Property Fail -Sum).Sum
+Write-Host "  Grand totals:  " -ForegroundColor White -NoNewline
+Write-Host "PASS=$totalPass   " -ForegroundColor Green  -NoNewline
+Write-Host "WARN=$totalWarn   " -ForegroundColor Yellow -NoNewline
+Write-Host "FAIL=$totalFail"   -ForegroundColor Red
+Write-Host ""
+
+# Save master summary CSV to log dir
+$csvPath = Join-Path $LogDir "diag_summary_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+$AllServerResults | Select-Object Server,Tier,Pass,Warn,Fail |
+    Export-Csv -Path $csvPath -NoTypeInformation -ErrorAction SilentlyContinue
+if (Test-Path $csvPath) {
+    Write-Host "  Summary saved to: $csvPath" -ForegroundColor Gray
+}
 Write-Host ""
