@@ -99,13 +99,17 @@ $NewVersionInput = (Read-Host).Trim()
 $NewVersionPath  = if ($NewVersionInput) { $NewVersionInput } else { 'C:\DLA-failsafe\patching\NewVersion' }
 
 $PatchingRoot = 'C:\DLA-failsafe\patching'
+$LogDir       = 'C:\DLA-failsafe\patching\Logs'
 $MsiName      = 'OpenText_SystemCenter_Agent.msi'
 $MsiLocalPath = Join-Path $PatchingRoot $MsiName
+
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
 Write-Host ""
 Write-Host "  Target       : $TargetServer"   -ForegroundColor White
 Write-Host "  Patching dir : $PatchingRoot"   -ForegroundColor Gray
 Write-Host "  SC Agent MSI : $MsiLocalPath"   -ForegroundColor Gray
+Write-Host "  Log dir      : $LogDir"         -ForegroundColor Gray
 if ($NewVersionPath) { Write-Host "  Tomcat       : $NewVersionPath" -ForegroundColor Gray }
 #endregion
 
@@ -611,7 +615,8 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
                     [string]$HttpPort,
                     [string]$ServerName,
                     [string[]]$SvcNames,
-                    [int]$TimeoutSec
+                    [int]$TimeoutSec,
+                    [string]$LogDir
                 )
                 $log = [System.Collections.Generic.List[string]]::new()
                 $ok  = $true
@@ -641,8 +646,8 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
 
                     # Uninstall current agent
                     if ($ProductCode -and $ProductCode.Trim() -ne '') {
-                        if (-not (Test-Path 'C:\Logs')) { New-Item -ItemType Directory -Path 'C:\Logs' -Force | Out-Null }
-                        $unLog = "C:\Logs\sc_uninstall_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+                        if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+                        $unLog = "$LogDir\sc_uninstall_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
                         $proc  = Start-Process 'msiexec.exe' `
                             -ArgumentList "/qn /l*vx `"$unLog`" /x `"$ProductCode`"" `
                             -Wait -PassThru
@@ -664,8 +669,8 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
 
                     # Install new agent
                     if (-not (Test-Path $MsiPath)) { throw "MSI not found at $MsiPath" }
-                    if (-not (Test-Path 'C:\Logs')) { New-Item -ItemType Directory -Path 'C:\Logs' -Force | Out-Null }
-                    $instLog  = "C:\Logs\sc_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+                    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+                    $instLog  = "$LogDir\sc_install_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
                     $instArgs = "/qn /l*vx `"$instLog`" /i `"$MsiPath`" " +
                                 "HTTP_PORT_NUMBER=`"$HttpPort`" SERVER_NAME=`"$ServerName`""
                     $proc = Start-Process 'msiexec.exe' -ArgumentList $instArgs -Wait -PassThru
@@ -696,6 +701,9 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
             $allSvcNames = @($script:DiscoveredServices |
                 Select-Object -ExpandProperty Name | Where-Object { $_ })
 
+            # Remote log dir mirrors patching folder structure
+            $remoteLogDir = 'C:\DLA-failsafe\patching\Logs'
+
             try {
                 $scLog = @(Invoke-Remote -Block $scInstallBlock -Args @(
                     $remoteMsiLocal,
@@ -704,7 +712,8 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
                     '443',
                     'patch.dacs.dla.mil',
                     $allSvcNames,
-                    60
+                    60,
+                    $remoteLogDir
                 ) -TimeoutSec 600)
 
                 foreach ($line in $scLog) {
