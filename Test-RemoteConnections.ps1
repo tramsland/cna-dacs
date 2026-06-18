@@ -114,61 +114,114 @@ if ($NewVersionPath) { Write-Host "  Tomcat       : $NewVersionPath" -Foreground
 #endregion
 
 #============================================================
-# SECTION 1 — CONNECTIVITY
+# SECTION 1 — CONNECTIVITY TESTS
 #============================================================
 Write-Section "1. CONNECTIVITY TESTS"
 
-# 1a — Ping
-$pingOk = Test-Connection -ComputerName $TargetServer -Count 2 -Quiet
+# Helper: raw TCP port test
+function Test-TcpPort {
+    param([string]$Server, [int]$Port, [int]$TimeoutMs = 3000)
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $ar  = $tcp.BeginConnect($Server, $Port, $null, $null)
+        $ok  = $ar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+        if ($ok -and $tcp.Connected) { $tcp.Close(); return $true }
+        $tcp.Close(); return $false
+    } catch { return $false }
+}
+
+# 1a — DNS
+try {
+    $dns = [System.Net.Dns]::GetHostAddresses($TargetServer)
+    $ip  = ($dns | Select-Object -First 1).IPAddressToString
+    Add-Result '1. Connectivity' 'DNS resolution' 'PASS' "Resolved to $ip"
+} catch {
+    Add-Result '1. Connectivity' 'DNS resolution' 'FAIL' $_.Exception.Message
+    Write-Host "  [FATAL] Cannot resolve $TargetServer" -ForegroundColor Red; exit 1
+}
+
+# 1b — Ping
+$pingOk = Test-Connection -ComputerName $TargetServer -Count 2 -Quiet -ErrorAction SilentlyContinue
 Add-Result '1. Connectivity' 'ICMP Ping' `
     $(if ($pingOk) {'PASS'} else {'WARN'}) `
-    $(if ($pingOk) {'Reachable'} else {'No ICMP response (may still work)'})
+    $(if ($pingOk) {'Reachable'} else {'No ICMP — firewall may block ping, continuing anyway'})
 
-# 1b — WinRM
-$winrmOk     = $false
+# 1c — TCP port probes
+foreach ($p in @(
+    @{Port=5985; Name='WinRM HTTP'},
+    @{Port=5986; Name='WinRM HTTPS'},
+    @{Port=135;  Name='RPC/DCOM'},
+    @{Port=445;  Name='SMB (UNC)'},
+    @{Port=139;  Name='NetBIOS'}
+)) {
+    $ok = Test-TcpPort -Server $TargetServer -Port $p.Port
+    Add-Result '1. Connectivity' "TCP $($p.Port) ($($p.Name))" `
+        $(if ($ok) {'PASS'} else {'FAIL'}) `
+        $(if ($ok) {'Open'} else {'Closed or filtered'})
+}
+
+# 1d — WinRM PSSession
+$winrmOk      = $false
 $WinRMSession = $null
 try {
-    $WinRMSession = New-PSSession -ComputerName $TargetServer -ErrorAction Stop
+    $so           = New-PSSessionOption -OpenTimeout 10000 -OperationTimeout 30000
+    $WinRMSession = New-PSSession -ComputerName $TargetServer -SessionOption $so -ErrorAction Stop
     $winrmOk      = $true
-    Add-Result '1. Connectivity' 'WinRM (port 5985)' 'PASS' 'PSSession established'
-}
-catch {
-    Add-Result '1. Connectivity' 'WinRM (port 5985)' 'FAIL' $_.Exception.Message
+    Add-Result '1. Connectivity' 'WinRM PSSession' 'PASS' 'Session established'
+} catch {
+    $em = $_.Exception.Message -replace '\s+',' '
+    Add-Result '1. Connectivity' 'WinRM PSSession' 'FAIL' $em
+    if     ($em -like '*Access is denied*')             { Write-Host "    HINT: Run on console: winrm set winrm/config/client '@{TrustedHosts=""$TargetServer""}'" -ForegroundColor Yellow }
+    elseif ($em -like '*No connection*' -or $em -like '*refused*') { Write-Host "    HINT: Run on target: Enable-PSRemoting -Force" -ForegroundColor Yellow }
+    elseif ($em -like '*WinRM cannot*' -or $em -like '*cannot connect*') { Write-Host "    HINT: Run on console: winrm set winrm/config/client '@{TrustedHosts=""*""}'" -ForegroundColor Yellow }
 }
 
-# 1c — DCOM / CIM
+# 1e — DCOM / CIM
 $dcomOk     = $false
 $CimSession = $null
 try {
     $opt        = New-CimSessionOption -Protocol Dcom
     $CimSession = New-CimSession -ComputerName $TargetServer -SessionOption $opt -ErrorAction Stop
     $dcomOk     = $true
-    Add-Result '1. Connectivity' 'DCOM / CIM (port 135)' 'PASS' 'CimSession established'
-}
-catch {
-    Add-Result '1. Connectivity' 'DCOM / CIM (port 135)' 'FAIL' $_.Exception.Message
+    Add-Result '1. Connectivity' 'DCOM CimSession' 'PASS' 'Session established'
+} catch {
+    $em = $_.Exception.Message -replace '\s+',' '
+    Add-Result '1. Connectivity' 'DCOM CimSession' 'FAIL' $em
+    if     ($em -like '*Access is denied*')        { Write-Host "    HINT: Run as Domain Admin or use -Credential" -ForegroundColor Yellow }
+    elseif ($em -like '*RPC server*unavailable*')  { Write-Host "    HINT: TCP 135 blocked or RemoteRegistry stopped on target" -ForegroundColor Yellow }
 }
 
-# 1d — UNC e$
-$uncBase = "\\$TargetServer\e$"
-$uncEOk  = Test-Path $uncBase
-Add-Result '1. Connectivity' "UNC e$ share" `
-    $(if ($uncEOk) {'PASS'} else {'FAIL'}) `
-    $(if ($uncEOk) {'Share reachable'} else {'Cannot reach e$'})
-
-# 1e — UNC c$ (needed for DCOM temp staging)
+# 1f — UNC c$
 $uncC   = "\\$TargetServer\c$"
-$uncCOk = Test-Path $uncC
-Add-Result '1. Connectivity' "UNC c$ share" `
-    $(if ($uncCOk) {'PASS'} else {'WARN'}) `
-    $(if ($uncCOk) {'Share reachable'} else {'Cannot reach c$ - DCOM exec staging may fail'})
+$uncCOk = $false
+try   { $uncCOk = Test-Path $uncC -ErrorAction Stop }
+catch { Add-Result '1. Connectivity' 'UNC c$ share' 'FAIL' $_.Exception.Message }
+if ($uncCOk) { Add-Result '1. Connectivity' 'UNC c$ share' 'PASS' 'Accessible' }
+else         { Add-Result '1. Connectivity' 'UNC c$ share' 'FAIL' 'Not reachable — SMB blocked or insufficient rights' }
 
-$ConnectionTier = if ($winrmOk) {'WinRM'} elseif ($dcomOk) {'DCOM'} elseif ($uncEOk) {'UNC'} else {'NONE'}
+# 1g — UNC e$
+$uncBase = "\\$TargetServer\e$"
+$uncEOk  = $false
+try   { $uncEOk = Test-Path $uncBase -ErrorAction Stop } catch { }
+Add-Result '1. Connectivity' 'UNC e$ share' `
+    $(if ($uncEOk) {'PASS'} else {'WARN'}) `
+    $(if ($uncEOk) {'Accessible'} else {'Not found — drive may not exist on target'})
+
+# 1h — UNC DLA-failsafe patching path
+$uncPatching = "\\$TargetServer\c$\DLA-failsafe\patching"
+$uncPatchOk  = $false
+try   { $uncPatchOk = Test-Path $uncPatching -ErrorAction Stop } catch { }
+Add-Result '1. Connectivity' 'UNC DLA-failsafe\patching' `
+    $(if ($uncPatchOk) {'PASS'} else {'WARN'}) `
+    $(if ($uncPatchOk) {'Path exists on target'} else {'Path not found — may need staging'})
+
+$ConnectionTier = if ($winrmOk) {'WinRM'} elseif ($dcomOk) {'DCOM'} elseif ($uncCOk) {'UNC'} else {'NONE'}
 Add-Result '1. Connectivity' 'Best available tier' 'INFO' $ConnectionTier
 
 if ($ConnectionTier -eq 'NONE') {
     Write-Host ""
-    Write-Host "  [FATAL] No connection method succeeded. Cannot continue." -ForegroundColor Red
+    Write-Host "  [FATAL] No connection method available. Cannot continue." -ForegroundColor Red
+    Write-Host "  Check: firewall rules, TrustedHosts, admin credentials, WinRM/DCOM service state." -ForegroundColor Yellow
     exit 1
 }
 
@@ -234,137 +287,173 @@ Write-Section "2. SERVICE DISCOVERY + HOME DIRECTORY MAPPING"
 $script:DiscoveredServices = $null
 
 $discoverBlock = {
-    $out = [System.Collections.Generic.List[pscustomobject]]::new()
-
-    function Find-AncestorDir {
-        param([string]$Start, [string]$Name, [int]$Max = 8)
-        $d = $Start
-        for ($i = 0; $i -lt $Max; $i++) {
-            if ([IO.Path]::GetFileName($d) -ieq $Name) { return $d }
-            $child = Join-Path $d $Name
-            if (Test-Path $child -PathType Container) { return $child }
-            $p = Split-Path $d -Parent
-            if (-not $p -or $p -eq $d) { break }
-            $d = $p
-        }
-        return $null
-    }
+    $out  = [System.Collections.Generic.List[pscustomobject]]::new()
+    $diag = [System.Collections.Generic.List[string]]::new()
 
     function Get-ExeDir {
         param([string]$PathName)
         if (-not $PathName) { return $null }
         $exe = $PathName -replace '^"([^"]+)".*$','$1' `
-                         -replace '^([^\s"]+\.exe).*$','$1'
-        return Split-Path $exe -Parent
+                         -replace "^([^\s"]+\.exe).*$",'$1'
+        $dir = Split-Path $exe -Parent -ErrorAction SilentlyContinue
+        return $dir
     }
 
-    try { $allSvcs = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop }
-    catch { $allSvcs = Get-WmiObject -Class Win32_Service -ErrorAction Stop }
+    function Find-HomeDir {
+        param([string]$ExeDir, [string[]]$Candidates, [string]$SubDirCheck = '')
+        # First try walking up from exe dir
+        $d = $ExeDir
+        for ($i = 0; $i -lt 6; $i++) {
+            if (-not $d) { break }
+            $check = if ($SubDirCheck) { Join-Path $d $SubDirCheck } else { $d }
+            if (Test-Path $check) { return $d }
+            $d = Split-Path $d -Parent -ErrorAction SilentlyContinue
+        }
+        # Then try known candidate paths
+        foreach ($c in $Candidates) {
+            if (Test-Path $c) { return $c }
+        }
+        return $null
+    }
 
-    # ---- Content Server (not Admin) ----
+    # Get all services — try CIM first, fall back to WMI
+    $allSvcs = $null
+    try {
+        $allSvcs = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)
+        $diag.Add("INFO Service list via CIM: $($allSvcs.Count) services")
+    } catch {
+        try {
+            $allSvcs = @(Get-WmiObject -Class Win32_Service -ErrorAction Stop)
+            $diag.Add("INFO Service list via WMI: $($allSvcs.Count) services")
+        } catch {
+            $diag.Add("FAIL Cannot enumerate services: $_")
+            return (@{ Services=@(); Diag=$diag } | ConvertTo-Json -Depth 5)
+        }
+    }
+
+    # Dump all service names/display names to aid debugging
+    $diag.Add("INFO All services with Tomcat/Content/OpenText/OTS in name or display:")
+    $allSvcs | Where-Object {
+        $_.Name -match 'tomcat|content|opentext|ots|systemcenter' -or
+        $_.DisplayName -match 'tomcat|content|opentext|ots|system center'
+    } | ForEach-Object {
+        $diag.Add("  SVC name=$($_.Name) display=$($_.DisplayName) state=$($_.State)")
+    }
+
+    # ---- Content Server ----
     $csSvc = $allSvcs | Where-Object {
-        ($_.Description -like '*Content Server*' -or $_.Name -like '*ContentServer*') -and
-        $_.Description -notlike '*Content Server Admin*' -and
-        $_.Name -notlike '*Admin*'
+        ($_.Description -like '*Content Server*' -or
+         $_.Name        -like '*ContentServer*'  -or
+         $_.DisplayName -like '*Content Server*') -and
+        $_.Name        -notlike '*Admin*' -and
+        $_.DisplayName -notlike '*Admin*'
     } | Select-Object -First 1
 
     if ($csSvc) {
         $exeDir  = Get-ExeDir $csSvc.PathName
-        $homeDir = if ($exeDir) { Find-AncestorDir $exeDir 'contentserver' } else { $null }
+        $homeDir = Find-HomeDir -ExeDir $exeDir `
+            -Candidates @('E:\Customers\dacs\shared\contentserver','E:\otcs\cs') `
+            -SubDirCheck 'module'
+        $diag.Add("INFO ContentServer: $($csSvc.Name) exe=$exeDir home=$homeDir")
         $out.Add([pscustomobject]@{
-            Role = 'ContentServer'; Name = $csSvc.Name
-            DisplayName = $csSvc.DisplayName; Status = $csSvc.State
-            PathName = $csSvc.PathName; HomeDir = $homeDir
+            Role='ContentServer'; Name=$csSvc.Name; DisplayName=$csSvc.DisplayName
+            Status=$csSvc.State; PathName=$csSvc.PathName; HomeDir=$homeDir
         })
-    }
+    } else { $diag.Add("WARN No ContentServer service found") }
 
     # ---- Content Server Admin ----
     $csAdminSvc = $allSvcs | Where-Object {
-        $_.Description -like '*Content Server Admin*' -or
-        ($_.Name -like '*Admin*' -and $_.Description -like '*Content Server*')
+        ($_.Description -like '*Content Server Admin*' -or
+         $_.DisplayName -like '*Content Server Admin*' -or
+         ($_.Name -like '*Admin*' -and ($_.DisplayName -like '*Content*' -or $_.Description -like '*Content*')))
     } | Select-Object -First 1
 
     if ($csAdminSvc) {
+        $exeDir = Get-ExeDir $csAdminSvc.PathName
+        $diag.Add("INFO ContentServerAdmin: $($csAdminSvc.Name) exe=$exeDir")
         $out.Add([pscustomobject]@{
-            Role = 'ContentServerAdmin'; Name = $csAdminSvc.Name
-            DisplayName = $csAdminSvc.DisplayName; Status = $csAdminSvc.State
-            PathName = $csAdminSvc.PathName; HomeDir = $null
+            Role='ContentServerAdmin'; Name=$csAdminSvc.Name; DisplayName=$csAdminSvc.DisplayName
+            Status=$csAdminSvc.State; PathName=$csAdminSvc.PathName; HomeDir=$null
         })
-    }
+    } else { $diag.Add("WARN No ContentServerAdmin service found") }
 
-    # ---- Tomcat (all instances) ----
+    # ---- Tomcat ----
     $tcSvcs = @($allSvcs | Where-Object {
-        $_.DisplayName -like '*Apache Tomcat*' -or
-        $_.DisplayName -like '*Tomcat*' -or
-        $_.Name        -like '*Tomcat*'
+        $_.DisplayName -like '*Tomcat*' -or $_.Name -like '*Tomcat*' -or
+        $_.DisplayName -like '*Apache Tomcat*'
     })
+    if ($tcSvcs.Count -eq 0) { $diag.Add("WARN No Tomcat service found") }
     foreach ($tc in $tcSvcs) {
         $exeDir  = Get-ExeDir $tc.PathName
-        $homeDir = $null
-        if ($exeDir) {
-            # Tomcat root is typically 2 levels up: root\bin\exe
-            $root = Split-Path (Split-Path $exeDir -Parent) -Parent
-            if ((Test-Path "$root\bin") -and (Test-Path "$root\lib")) {
-                $homeDir = $root
-            }
-        }
-        if (-not $homeDir) {
-            foreach ($c in @('E:\Customers\dacs\shared\tomcat10','E:\Customers\dacs\shared\tomcat')) {
-                if ((Test-Path "$c\bin") -and (Test-Path "$c\lib")) { $homeDir = $c; break }
-            }
-        }
+        $homeDir = Find-HomeDir -ExeDir $exeDir `
+            -Candidates @('E:\Customers\dacs\shared\tomcat10','E:\Customers\dacs\shared\tomcat') `
+            -SubDirCheck 'lib'
+        $diag.Add("INFO Tomcat: $($tc.Name) exe=$exeDir home=$homeDir")
         $out.Add([pscustomobject]@{
-            Role = 'Tomcat'; Name = $tc.Name
-            DisplayName = $tc.DisplayName; Status = $tc.State
-            PathName = $tc.PathName; HomeDir = $homeDir
+            Role='Tomcat'; Name=$tc.Name; DisplayName=$tc.DisplayName
+            Status=$tc.State; PathName=$tc.PathName; HomeDir=$homeDir
         })
     }
 
     # ---- System Center Agent ----
     $scSvc = $allSvcs | Where-Object {
         $_.Name        -like '*OTSystemCenter*' -or
+        $_.Name        -like '*SystemCenter*'   -or
         $_.DisplayName -like '*System Center*'  -or
         $_.DisplayName -like '*OpenText System*'
     } | Select-Object -First 1
 
     if ($scSvc) {
-        $homeDir = @(
-            'E:\Customers\dacs\shared\systemcenteragent',
-            'C:\Program Files\OpenText\SystemCenter',
-            'C:\Program Files (x86)\OpenText\SystemCenter'
-        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
+        $exeDir  = Get-ExeDir $scSvc.PathName
+        $homeDir = Find-HomeDir -ExeDir $exeDir `
+            -Candidates @(
+                'E:\Customers\dacs\shared\systemcenteragent',
+                'C:\Program Files\OpenText\SystemCenter',
+                'C:\Program Files (x86)\OpenText\SystemCenter'
+            )
+        $diag.Add("INFO SystemCenter: $($scSvc.Name) exe=$exeDir home=$homeDir")
         $out.Add([pscustomobject]@{
-            Role = 'SystemCenter'; Name = $scSvc.Name
-            DisplayName = $scSvc.DisplayName; Status = $scSvc.State
-            PathName = $scSvc.PathName; HomeDir = $homeDir
+            Role='SystemCenter'; Name=$scSvc.Name; DisplayName=$scSvc.DisplayName
+            Status=$scSvc.State; PathName=$scSvc.PathName; HomeDir=$homeDir
         })
-    }
+    } else { $diag.Add("WARN No SystemCenter service found") }
 
-    return ($out | ConvertTo-Json -Depth 5)
+    return (@{ Services=$out; Diag=$diag } | ConvertTo-Json -Depth 5)
 }
 
 try {
     $rawJson = Invoke-Remote -Block $discoverBlock
     $jsonStr = ($rawJson -join '') -replace '^\s+|\s+$',''
-    $discovered = $jsonStr | ConvertFrom-Json
 
-    if ($discovered -and @($discovered).Count -gt 0) {
-        $script:DiscoveredServices = @($discovered)
-        Add-Result '2. Discovery' 'Remote execution' 'PASS' "Results received via $ConnectionTier"
+    # Strip any BOM or stray characters before first {
+    $jsonStr = $jsonStr -replace '^[^{]*({.*})[^}]*$','$1'
 
+    $result = $jsonStr | ConvertFrom-Json
+
+    # Print diagnostic lines from the remote block
+    if ($result.Diag) {
+        foreach ($d in $result.Diag) {
+            $p = ($d -split '\s+',2); $s = $p[0]; $msg = if ($p.Count -gt 1) {$p[1]} else {''}
+            $col = switch ($s) {'FAIL' {'Red'} 'WARN' {'Yellow'} default {'Gray'}}
+            Write-Host "    [diag] $d" -ForegroundColor $col
+        }
+    }
+
+    $discovered = @($result.Services)
+    if ($discovered.Count -gt 0) {
+        $script:DiscoveredServices = $discovered
+        Add-Result '2. Discovery' 'Remote execution' 'PASS' "$($discovered.Count) service(s) found via $ConnectionTier"
         foreach ($svc in $script:DiscoveredServices) {
-            Add-Result '2. Discovery' "$($svc.Role) - Name"    'INFO' $svc.Name
-            Add-Result '2. Discovery' "$($svc.Role) - Status"  'INFO' $svc.Status
-            Add-Result '2. Discovery' "$($svc.Role) - HomeDir" `
+            Add-Result '2. Discovery' "$($svc.Role) name"    'INFO' $svc.Name
+            Add-Result '2. Discovery' "$($svc.Role) status"  'INFO' $svc.Status
+            Add-Result '2. Discovery' "$($svc.Role) HomeDir" `
                 $(if ($svc.HomeDir) {'PASS'} else {'WARN'}) `
-                $(if ($svc.HomeDir) { $svc.HomeDir } else { 'Not resolved — check PathName or candidates' })
+                $(if ($svc.HomeDir) {$svc.HomeDir} else {'Not resolved — check diag lines above'})
         }
     } else {
-        Add-Result '2. Discovery' 'Service discovery' 'WARN' 'No matching services found on target'
+        Add-Result '2. Discovery' 'Service discovery' 'WARN' 'No matching services found — see diag lines above for all service names on target'
     }
-}
-catch {
+} catch {
     Add-Result '2. Discovery' 'Remote execution' 'FAIL' $_.Exception.Message
 }
 
