@@ -342,7 +342,7 @@ $discoverBlock = {
         param([string]$PathName)
         if (-not $PathName) { return $null }
         $exe = $PathName -replace '^"([^"]+)".*$','$1' `
-                         -replace "^([^\s"]+\.exe).*$",'$1'
+                         -replace '^([^\\s"]+\.exe).*$','$1'
         $dir = Split-Path $exe -Parent -ErrorAction SilentlyContinue
         return $dir
     }
