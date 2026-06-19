@@ -341,10 +341,16 @@ $discoverBlock = {
     function Get-ExeDir {
         param([string]$PathName)
         if (-not $PathName) { return $null }
-        $exe = $PathName -replace '^"([^"]+)".*$','$1' `
-                         -replace '^([^\\s"]+\.exe).*$','$1'
-        $dir = Split-Path $exe -Parent -ErrorAction SilentlyContinue
-        return $dir
+        # Strip leading/trailing quotes, then trim any arguments after the exe
+        $clean = $PathName.Trim().TrimStart('"').Split('"')[0]
+        $clean = $clean.Trim()
+        # If it ends in .exe grab the directory, otherwise return as-is
+        if ($clean -match '\.exe') {
+            $idx = $clean.ToLower().IndexOf('.exe')
+            $exePath = $clean.Substring(0, $idx + 4)
+            return [System.IO.Path]::GetDirectoryName($exePath)
+        }
+        return [System.IO.Path]::GetDirectoryName($clean)
     }
 
     function Find-HomeDir {
@@ -898,7 +904,9 @@ if (-not $tcSvc) {
     Add-Result '6. Tomcat' 'NewVersion file count' 'INFO' "$($newFiles.Count) file(s)"
 
     if ($tcSvc.HomeDir) {
-        $uncTomcat  = "\\$TargetServer\$($tcSvc.HomeDir -replace '^([A-Za-z]):\\','$1$\')"
+        $tcHomeDrive    = $tcSvc.HomeDir.Substring(0,1).ToLower() + '$'
+        $tcHomeRelative = $tcSvc.HomeDir.Substring(3)
+        $uncTomcat      = "\\\\$TargetServer\\$tcHomeDrive\\$tcHomeRelative"
         $uncTomcatOk = Test-Path $uncTomcat
         Add-Result '6. Tomcat' 'UNC path to Tomcat home' `
             $(if ($uncTomcatOk) {'PASS'} else {'FAIL'}) $uncTomcat
@@ -941,7 +949,9 @@ if (-not $tcSvc) {
         }
 
         # Copy files via UNC
-        $uncDest = "\\$TargetServer\$($tcHome -replace '^([A-Za-z]):\\','$1$\')"
+        $tcDestDrive    = $tcHome.Substring(0,1).ToLower() + '$'
+        $tcDestRelative = $tcHome.Substring(3)
+        $uncDest        = "\\\\$TargetServer\\$tcDestDrive\\$tcDestRelative"
         try {
             Copy-Item -Path "$NewVersionPath\*" -Destination $uncDest -Recurse -Force
             Add-Result '6. Tomcat' 'File overwrite via UNC' 'PASS' "$NewVersionPath -> $uncDest"
