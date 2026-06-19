@@ -335,142 +335,167 @@ Write-Section "2. SERVICE DISCOVERY + HOME DIRECTORY MAPPING"
 $script:DiscoveredServices = $null
 
 $discoverBlock = {
-    $out  = [System.Collections.Generic.List[pscustomobject]]::new()
-    $diag = [System.Collections.Generic.List[string]]::new()
+    $out  = New-Object System.Collections.ArrayList
+    $diag = New-Object System.Collections.ArrayList
 
-    function Get-ExeDir {
-        param([string]$PathName)
-        if (-not $PathName) { return $null }
-        # Strip leading/trailing quotes, then trim any arguments after the exe
-        $clean = $PathName.Trim().TrimStart('"').Split('"')[0]
-        $clean = $clean.Trim()
-        # If it ends in .exe grab the directory, otherwise return as-is
-        if ($clean -match '\.exe') {
-            $idx = $clean.ToLower().IndexOf('.exe')
-            $exePath = $clean.Substring(0, $idx + 4)
-            return [System.IO.Path]::GetDirectoryName($exePath)
-        }
-        return [System.IO.Path]::GetDirectoryName($clean)
-    }
-
-    function Find-HomeDir {
-        param([string]$ExeDir, [string[]]$Candidates, [string]$SubDirCheck = '')
-        # First try walking up from exe dir
-        $d = $ExeDir
-        for ($i = 0; $i -lt 6; $i++) {
-            if (-not $d) { break }
-            $check = if ($SubDirCheck) { Join-Path $d $SubDirCheck } else { $d }
-            if (Test-Path $check) { return $d }
-            $d = Split-Path $d -Parent -ErrorAction SilentlyContinue
-        }
-        # Then try known candidate paths
-        foreach ($c in $Candidates) {
-            if (Test-Path $c) { return $c }
-        }
-        return $null
-    }
-
-    # Get all services — try CIM first, fall back to WMI
+    # Get all services - CIM first, WMI fallback
     $allSvcs = $null
     try {
         $allSvcs = @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)
-        $diag.Add("INFO Service list via CIM: $($allSvcs.Count) services")
+        $null = $diag.Add("INFO Service list via CIM: $($allSvcs.Count) services")
     } catch {
         try {
             $allSvcs = @(Get-WmiObject -Class Win32_Service -ErrorAction Stop)
-            $diag.Add("INFO Service list via WMI: $($allSvcs.Count) services")
+            $null = $diag.Add("INFO Service list via WMI: $($allSvcs.Count) services")
         } catch {
-            $diag.Add("FAIL Cannot enumerate services: $_")
+            $null = $diag.Add("FAIL Cannot enumerate services: $_")
             return (@{ Services=@(); Diag=$diag } | ConvertTo-Json -Depth 5)
         }
     }
 
-    # Dump all service names/display names to aid debugging
-    $diag.Add("INFO All services with Tomcat/Content/OpenText/OTS in name or display:")
+    # Log all relevant services for diagnostics
+    $null = $diag.Add("INFO Services matching Tomcat/Content/OpenText/SystemCenter:")
     $allSvcs | Where-Object {
-        $_.Name -match 'tomcat|content|opentext|ots|systemcenter' -or
+        $_.Name        -match 'tomcat|content|opentext|ots|systemcenter' -or
         $_.DisplayName -match 'tomcat|content|opentext|ots|system center'
     } | ForEach-Object {
-        $diag.Add("  SVC name=$($_.Name) display=$($_.DisplayName) state=$($_.State)")
+        $null = $diag.Add("  SVC name=$($_.Name) display=$($_.DisplayName) state=$($_.State)")
     }
+
+    # Helper: get exe directory from service PathName (no regex, PS5.1 safe)
+    # Inline since PS5.1 does not support nested functions inside scriptblocks
+    # Usage pattern repeated per role below
 
     # ---- Content Server ----
     $csSvc = $allSvcs | Where-Object {
-        ($_.Description -like '*Content Server*' -or
-         $_.Name        -like '*ContentServer*'  -or
-         $_.DisplayName -like '*Content Server*') -and
-        $_.Name        -notlike '*Admin*' -and
-        $_.DisplayName -notlike '*Admin*'
+        (($_.Description -like '*Content Server*') -or
+         ($_.Name        -like '*ContentServer*')  -or
+         ($_.DisplayName -like '*Content Server*')) -and
+        ($_.Name        -notlike '*Admin*') -and
+        ($_.DisplayName -notlike '*Admin*')
     } | Select-Object -First 1
 
     if ($csSvc) {
-        $exeDir  = Get-ExeDir $csSvc.PathName
-        $homeDir = Find-HomeDir -ExeDir $exeDir `
-            -Candidates @('E:\Customers\dacs\shared\contentserver','E:\otcs\cs') `
-            -SubDirCheck 'module'
-        $diag.Add("INFO ContentServer: $($csSvc.Name) exe=$exeDir home=$homeDir")
-        $out.Add([pscustomobject]@{
+        $pn = $csSvc.PathName
+        if ($pn) {
+            $pn = $pn.Trim()
+            if ($pn.StartsWith('"')) { $pn = $pn.Substring(1).Split('"')[0] }
+            $dotExe = $pn.ToLower().IndexOf('.exe')
+            if ($dotExe -ge 0) { $pn = $pn.Substring(0, $dotExe + 4) }
+            $csExeDir = [System.IO.Path]::GetDirectoryName($pn)
+        } else { $csExeDir = $null }
+        $csHome = $null
+        $csCands = @('E:\Customers\dacs\shared\contentserver','E:\otcs\cs')
+        if ($csExeDir) {
+            $d = $csExeDir
+            for ($i = 0; $i -lt 6; $i++) {
+                if (-not $d) { break }
+                if (Test-Path (Join-Path $d 'module')) { $csHome = $d; break }
+                $d = Split-Path $d -Parent -ErrorAction SilentlyContinue
+            }
+        }
+        if (-not $csHome) { foreach ($c in $csCands) { if (Test-Path $c) { $csHome = $c; break } } }
+        $null = $diag.Add("INFO ContentServer: $($csSvc.Name) exe=$csExeDir home=$csHome")
+        $null = $out.Add([pscustomobject]@{
             Role='ContentServer'; Name=$csSvc.Name; DisplayName=$csSvc.DisplayName
-            Status=$csSvc.State; PathName=$csSvc.PathName; HomeDir=$homeDir
+            Status=$csSvc.State; PathName=$csSvc.PathName; HomeDir=$csHome
         })
-    } else { $diag.Add("WARN No ContentServer service found") }
+    } else { $null = $diag.Add("WARN No ContentServer service found") }
 
     # ---- Content Server Admin ----
     $csAdminSvc = $allSvcs | Where-Object {
-        ($_.Description -like '*Content Server Admin*' -or
-         $_.DisplayName -like '*Content Server Admin*' -or
-         ($_.Name -like '*Admin*' -and ($_.DisplayName -like '*Content*' -or $_.Description -like '*Content*')))
+        ($_.Description -like '*Content Server Admin*') -or
+        ($_.DisplayName -like '*Content Server Admin*') -or
+        (($_.Name -like '*Admin*') -and (($_.DisplayName -like '*Content*') -or ($_.Description -like '*Content*')))
     } | Select-Object -First 1
 
     if ($csAdminSvc) {
-        $exeDir = Get-ExeDir $csAdminSvc.PathName
-        $diag.Add("INFO ContentServerAdmin: $($csAdminSvc.Name) exe=$exeDir")
-        $out.Add([pscustomobject]@{
+        $pn = $csAdminSvc.PathName
+        if ($pn) {
+            $pn = $pn.Trim()
+            if ($pn.StartsWith('"')) { $pn = $pn.Substring(1).Split('"')[0] }
+            $dotExe = $pn.ToLower().IndexOf('.exe')
+            if ($dotExe -ge 0) { $pn = $pn.Substring(0, $dotExe + 4) }
+            $csAdminExeDir = [System.IO.Path]::GetDirectoryName($pn)
+        } else { $csAdminExeDir = $null }
+        $null = $diag.Add("INFO ContentServerAdmin: $($csAdminSvc.Name) exe=$csAdminExeDir")
+        $null = $out.Add([pscustomobject]@{
             Role='ContentServerAdmin'; Name=$csAdminSvc.Name; DisplayName=$csAdminSvc.DisplayName
             Status=$csAdminSvc.State; PathName=$csAdminSvc.PathName; HomeDir=$null
         })
-    } else { $diag.Add("WARN No ContentServerAdmin service found") }
+    } else { $null = $diag.Add("WARN No ContentServerAdmin service found") }
 
     # ---- Tomcat ----
     $tcSvcs = @($allSvcs | Where-Object {
-        $_.DisplayName -like '*Tomcat*' -or $_.Name -like '*Tomcat*' -or
-        $_.DisplayName -like '*Apache Tomcat*'
+        ($_.DisplayName -like '*Tomcat*') -or ($_.Name -like '*Tomcat*') -or
+        ($_.DisplayName -like '*Apache Tomcat*')
     })
-    if ($tcSvcs.Count -eq 0) { $diag.Add("WARN No Tomcat service found") }
+    if ($tcSvcs.Count -eq 0) { $null = $diag.Add("WARN No Tomcat service found") }
     foreach ($tc in $tcSvcs) {
-        $exeDir  = Get-ExeDir $tc.PathName
-        $homeDir = Find-HomeDir -ExeDir $exeDir `
-            -Candidates @('E:\Customers\dacs\shared\tomcat10','E:\Customers\dacs\shared\tomcat') `
-            -SubDirCheck 'lib'
-        $diag.Add("INFO Tomcat: $($tc.Name) exe=$exeDir home=$homeDir")
-        $out.Add([pscustomobject]@{
+        $pn = $tc.PathName
+        if ($pn) {
+            $pn = $pn.Trim()
+            if ($pn.StartsWith('"')) { $pn = $pn.Substring(1).Split('"')[0] }
+            $dotExe = $pn.ToLower().IndexOf('.exe')
+            if ($dotExe -ge 0) { $pn = $pn.Substring(0, $dotExe + 4) }
+            $tcExeDir = [System.IO.Path]::GetDirectoryName($pn)
+        } else { $tcExeDir = $null }
+        $tcHome = $null
+        $tcCands = @('E:\Customers\dacs\shared\tomcat10','E:\Customers\dacs\shared\tomcat')
+        if ($tcExeDir) {
+            $d = $tcExeDir
+            for ($i = 0; $i -lt 6; $i++) {
+                if (-not $d) { break }
+                if (Test-Path (Join-Path $d 'lib')) { $tcHome = $d; break }
+                $d = Split-Path $d -Parent -ErrorAction SilentlyContinue
+            }
+        }
+        if (-not $tcHome) { foreach ($c in $tcCands) { if (Test-Path $c) { $tcHome = $c; break } } }
+        $null = $diag.Add("INFO Tomcat: $($tc.Name) exe=$tcExeDir home=$tcHome")
+        $null = $out.Add([pscustomobject]@{
             Role='Tomcat'; Name=$tc.Name; DisplayName=$tc.DisplayName
-            Status=$tc.State; PathName=$tc.PathName; HomeDir=$homeDir
+            Status=$tc.State; PathName=$tc.PathName; HomeDir=$tcHome
         })
     }
 
     # ---- System Center Agent ----
     $scSvc = $allSvcs | Where-Object {
-        $_.Name        -like '*OTSystemCenter*' -or
-        $_.Name        -like '*SystemCenter*'   -or
-        $_.DisplayName -like '*System Center*'  -or
-        $_.DisplayName -like '*OpenText System*'
+        ($_.Name        -like '*OTSystemCenter*') -or
+        ($_.Name        -like '*SystemCenter*')   -or
+        ($_.DisplayName -like '*System Center*')  -or
+        ($_.DisplayName -like '*OpenText System*')
     } | Select-Object -First 1
 
     if ($scSvc) {
-        $exeDir  = Get-ExeDir $scSvc.PathName
-        $homeDir = Find-HomeDir -ExeDir $exeDir `
-            -Candidates @(
-                'E:\Customers\dacs\shared\systemcenteragent',
-                'C:\Program Files\OpenText\SystemCenter',
-                'C:\Program Files (x86)\OpenText\SystemCenter'
-            )
-        $diag.Add("INFO SystemCenter: $($scSvc.Name) exe=$exeDir home=$homeDir")
-        $out.Add([pscustomobject]@{
+        $pn = $scSvc.PathName
+        if ($pn) {
+            $pn = $pn.Trim()
+            if ($pn.StartsWith('"')) { $pn = $pn.Substring(1).Split('"')[0] }
+            $dotExe = $pn.ToLower().IndexOf('.exe')
+            if ($dotExe -ge 0) { $pn = $pn.Substring(0, $dotExe + 4) }
+            $scExeDir = [System.IO.Path]::GetDirectoryName($pn)
+        } else { $scExeDir = $null }
+        $scHome = $null
+        $scCands = @(
+            'E:\Customers\dacs\shared\systemcenteragent',
+            'C:\Program Files\OpenText\SystemCenter',
+            'C:\Program Files (x86)\OpenText\SystemCenter'
+        )
+        if ($scExeDir) {
+            $d = $scExeDir
+            for ($i = 0; $i -lt 6; $i++) {
+                if (-not $d) { break }
+                if (Test-Path $d) { $scHome = $d; break }
+                $d = Split-Path $d -Parent -ErrorAction SilentlyContinue
+            }
+        }
+        if (-not $scHome) { foreach ($c in $scCands) { if (Test-Path $c) { $scHome = $c; break } } }
+        $null = $diag.Add("INFO SystemCenter: $($scSvc.Name) exe=$scExeDir home=$scHome")
+        $null = $out.Add([pscustomobject]@{
             Role='SystemCenter'; Name=$scSvc.Name; DisplayName=$scSvc.DisplayName
-            Status=$scSvc.State; PathName=$scSvc.PathName; HomeDir=$homeDir
+            Status=$scSvc.State; PathName=$scSvc.PathName; HomeDir=$scHome
         })
-    } else { $diag.Add("WARN No SystemCenter service found") }
+    } else { $null = $diag.Add("WARN No SystemCenter service found") }
 
     return (@{ Services=$out; Diag=$diag } | ConvertTo-Json -Depth 5)
 }
@@ -553,10 +578,6 @@ if (-not $script:DiscoveredServices) {
             $stopped = [System.Collections.Generic.List[string]]::new()
             $ok      = $true
 
-            function WaitSvc { param($n,$state,$t)
-                $svc = Get-Service -Name $n -ErrorAction Stop
-                $svc.WaitForStatus($state, [TimeSpan]::FromSeconds($t))
-            }
 
             foreach ($n in $Names) {
                 $svc = Get-Service -Name $n -ErrorAction SilentlyContinue
@@ -564,7 +585,7 @@ if (-not $script:DiscoveredServices) {
                 if ($svc.Status -ne 'Running') { $log.Add("INFO $n already stopped"); continue }
                 try {
                     Stop-Service -Name $n -Force -ErrorAction Stop
-                    WaitSvc $n 'Stopped' $TimeoutSec
+                    (Get-Service -Name $n -ErrorAction Stop).WaitForStatus('Stopped', [TimeSpan]::FromSeconds($TimeoutSec))
                     $stopped.Add($n)
                     $log.Add("PASS Stopped $n")
                 }
@@ -575,7 +596,7 @@ if (-not $script:DiscoveredServices) {
             foreach ($n in $arr) {
                 try {
                     Start-Service -Name $n -ErrorAction Stop
-                    WaitSvc $n 'Running' $TimeoutSec
+                    (Get-Service -Name $n -ErrorAction Stop).WaitForStatus('Running', [TimeSpan]::FromSeconds($TimeoutSec))
                     $log.Add("PASS Started $n")
                 }
                 catch { $log.Add("FAIL Start ${n}: $_"); $ok = $false }
@@ -631,7 +652,8 @@ if ($homeDirs.Count -eq 0) {
                 $zipPath = Join-Path $parent "${leaf}_backup_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
                 try {
                     Compress-Archive -Path $d -DestinationPath $zipPath -Force
-                    $sizeMB = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
+                    $sizeBytes = (Get-Item $zipPath).Length
+                    $sizeMB = [math]::Round($sizeBytes / 1048576, 2)
                     $log.Add("PASS $d -> $zipPath ($sizeMB MB)")
                 }
                 catch { $log.Add("FAIL Compress ${d}: $_") }
@@ -706,7 +728,7 @@ catch {
 
 # 5b — Verify MSI exists in local patching folder
 if (Test-Path $MsiLocalPath) {
-    $sizeMB = [math]::Round((Get-Item $MsiLocalPath).Length / 1MB, 2)
+    $sizeMB = [math]::Round((Get-Item $MsiLocalPath).Length / 1048576, 2)
     Add-Result '5. SystemCenter' 'MSI found in patching folder' 'PASS' "$MsiLocalPath ($sizeMB MB)"
 } else {
     Add-Result '5. SystemCenter' 'MSI found in patching folder' 'FAIL' "Not found: $MsiLocalPath"
@@ -730,7 +752,7 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
     if (-not (Test-Path $MsiLocalPath)) {
         Add-Result '5. SystemCenter' 'MSI pre-check' 'FAIL' "MSI not found at $MsiLocalPath — aborting"
     } else {
-        $sizeMB = [math]::Round((Get-Item $MsiLocalPath).Length / 1MB, 2)
+        $sizeMB = [math]::Round((Get-Item $MsiLocalPath).Length / 1048576, 2)
         Add-Result '5. SystemCenter' 'MSI pre-check' 'PASS' "$MsiLocalPath ($sizeMB MB)"
         $msiPath = $MsiLocalPath
         # Push MSI via UNC
@@ -764,10 +786,6 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
                 $log = [System.Collections.Generic.List[string]]::new()
                 $ok  = $true
 
-                function WaitSvc { param($n,$state,$t)
-                    (Get-Service -Name $n -ErrorAction Stop).WaitForStatus(
-                        $state, [TimeSpan]::FromSeconds($t))
-                }
 
                 $stopped = [System.Collections.Generic.List[string]]::new()
                 try {
@@ -780,7 +798,7 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
                         }
                         try {
                             Stop-Service -Name $n -Force -ErrorAction Stop
-                            WaitSvc $n 'Stopped' $TimeoutSec
+                            (Get-Service -Name $n -ErrorAction Stop).WaitForStatus('Stopped', [TimeSpan]::FromSeconds($TimeoutSec))
                             $stopped.Add($n)
                             $log.Add("PASS Stopped $n")
                         }
@@ -831,7 +849,7 @@ if (Confirm-Action "LIVE TEST: Push MSI from $PatchingRoot to $TargetServer, uni
                     foreach ($n in $arr) {
                         try {
                             Start-Service -Name $n -ErrorAction Stop
-                            WaitSvc $n 'Running' $TimeoutSec
+                            (Get-Service -Name $n -ErrorAction Stop).WaitForStatus('Running', [TimeSpan]::FromSeconds($TimeoutSec))
                             $log.Add("PASS Started $n")
                         }
                         catch { $log.Add("FAIL Start ${n}: $_"); $ok = $false }
