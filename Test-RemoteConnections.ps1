@@ -263,7 +263,39 @@ Add-Result '1. Connectivity' 'UNC DLA-failsafe\patching' `
     $(if ($uncPatchOk) {'PASS'} else {'WARN'}) `
     $(if ($uncPatchOk) {'Path exists on target'} else {'Path not found — may need staging'})
 
-$ConnectionTier = if ($winrmOk) {'WinRM'} elseif ($dcomOk) {'DCOM'} elseif ($uncCOk) {'UNC'} else {'NONE'}
+# 1i — Scheduled Task test (SMB-only execution tier)
+# Write a tiny probe script via UNC, run it via schtasks, verify output
+$schedOk    = $false
+$schedError = ''
+if (-not $winrmOk -and -not $dcomOk -and $uncCOk) {
+    $guid       = [guid]::NewGuid().ToString('N').Substring(0,12)
+    $probeUnc   = "\\$TargetServer\c$\Windows\Temp\probe_$guid.ps1"
+    $probeOutUnc= "\\$TargetServer\c$\Windows\Temp\probe_out_$guid.txt"
+    $probeRem   = "C:\Windows\Temp\probe_$guid.ps1"
+    $probeOutRem= "C:\Windows\Temp\probe_out_$guid.txt"
+    $taskName   = "DiagProbe_$guid"
+    try {
+        Set-Content -Path $probeUnc -Value "'SCHEDOK' | Out-File '$probeOutRem' -Encoding utf8" -Encoding UTF8 -ErrorAction Stop
+        $createOut = & schtasks.exe /Create /S $TargetServer /TN $taskName /TR "powershell.exe -NonInteractive -ExecutionPolicy Bypass -File `"$probeRem`"" /SC ONCE /ST 00:00 /RU SYSTEM /F 2>&1
+        $runOut    = & schtasks.exe /Run /S $TargetServer /TN $taskName 2>&1
+        Start-Sleep -Seconds 6
+        $probeResult = Get-Content $probeOutUnc -ErrorAction SilentlyContinue
+        & schtasks.exe /Delete /S $TargetServer /TN $taskName /F 2>&1 | Out-Null
+        Remove-Item $probeUnc,$probeOutUnc -Force -ErrorAction SilentlyContinue
+        if ($probeResult -match 'SCHEDOK') {
+            $schedOk = $true
+        } else {
+            $schedError = "Probe ran but output not found — schtasks may lack SYSTEM write rights to Temp"
+        }
+    } catch {
+        $schedError = $_.Exception.Message -replace '\s+',' '
+    }
+    Add-Result '1. Connectivity' 'SchedTask (SMB tier)' `
+        $(if ($schedOk) {'PASS'} else {'FAIL'}) `
+        $(if ($schedOk) {'Scheduled task execution works via SMB'} else {$schedError})
+}
+
+$ConnectionTier = if ($winrmOk) {'WinRM'} elseif ($dcomOk) {'DCOM'} elseif ($schedOk) {'SchedTask'} elseif ($uncCOk) {'UNC'} else {'NONE'}
 Add-Result '1. Connectivity' 'Best available tier' 'INFO' $ConnectionTier
 
 if ($ConnectionTier -eq 'NONE') {
@@ -274,8 +306,9 @@ if ($ConnectionTier -eq 'NONE') {
 }
 
 #region Invoke-Remote helper
-# Provides WinRM -> DCOM fallback for running scriptblocks on the target.
-# UNC-only connections cannot execute code and will throw.
+# Tier 1 — WinRM  (Invoke-Command, port 5985)
+# Tier 2 — DCOM   (Win32_Process via WMI, port 135)
+# Tier 3 — SchedTask (schtasks.exe over SMB, port 445 only)
 function Invoke-Remote {
     param(
         [scriptblock]$Block,
@@ -283,12 +316,12 @@ function Invoke-Remote {
         [int]$TimeoutSec = 120
     )
 
-    # --- WinRM ---
+    # --- Tier 1: WinRM ---
     if ($winrmOk) {
         return Invoke-Command -Session $WinRMSession -ScriptBlock $Block -ArgumentList $Args
     }
 
-    # --- DCOM: write ps1 via UNC, launch via Win32_Process, read output ---
+    # --- Tier 2: DCOM via Win32_Process ---
     if ($dcomOk) {
         $guid   = [guid]::NewGuid().ToString('N')
         $ps1Unc = "\\$TargetServer\c$\Windows\Temp\diag_$guid.ps1"
@@ -323,7 +356,67 @@ function Invoke-Remote {
         return $out
     }
 
-    throw "No remote execution available (UNC-only connection)"
+    # --- Tier 3: Scheduled Task over SMB (445 only, no WinRM/DCOM needed) ---
+    if ($schedOk) {
+        $guid    = [guid]::NewGuid().ToString('N')
+        $ps1Unc  = "\\$TargetServer\c$\Windows\Temp\diag_$guid.ps1"
+        $outUnc  = "\\$TargetServer\c$\Windows\Temp\diag_out_$guid.txt"
+        $ps1Rem  = "C:\Windows\Temp\diag_$guid.ps1"
+        $outRem  = "C:\Windows\Temp\diag_out_$guid.txt"
+        $taskName = "Diag_$guid"
+
+        # Serialize args as assignment statements prepended to the script body
+        $argLines = for ($i = 0; $i -lt $Args.Count; $i++) {
+            "`$a$i = $(ConvertTo-Json $Args[$i] -Depth 5 -Compress)"
+        }
+        $argPass = if ($Args.Count -gt 0) {
+            (0..($Args.Count-1) | ForEach-Object { "`$a$_" }) -join ','
+        } else { '' }
+        $body = "$(($argLines) -join "`n")`n& {`n$($Block.ToString())`n} $argPass 2>&1 | Out-File '$outRem' -Encoding utf8"
+
+        try {
+            Set-Content -Path $ps1Unc -Value $body -Encoding UTF8 -ErrorAction Stop
+
+            # Create and immediately run the task as SYSTEM
+            $createResult = & schtasks.exe /Create /S $TargetServer /TN $taskName `
+                /TR "powershell.exe -NonInteractive -ExecutionPolicy Bypass -File `"$ps1Rem`"" `
+                /SC ONCE /ST 00:00 /RU SYSTEM /F 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "schtasks /Create failed (rc=$LASTEXITCODE): $createResult"
+            }
+
+            $runResult = & schtasks.exe /Run /S $TargetServer /TN $taskName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "schtasks /Run failed (rc=$LASTEXITCODE): $runResult"
+            }
+
+            # Poll for output file — task runs async
+            $elapsed = 0
+            $pollInterval = 3
+            while ($elapsed -lt $TimeoutSec) {
+                Start-Sleep -Seconds $pollInterval
+                $elapsed += $pollInterval
+                if (Test-Path $outUnc) {
+                    # Give it one extra second to finish writing
+                    Start-Sleep -Seconds 1
+                    break
+                }
+            }
+            if (-not (Test-Path $outUnc)) {
+                throw "Timed out after ${TimeoutSec}s waiting for output file"
+            }
+
+            $out = Get-Content $outUnc -ErrorAction Stop
+        } catch {
+            throw "SchedTask tier failed: $($_.Exception.Message)"
+        } finally {
+            & schtasks.exe /Delete /S $TargetServer /TN $taskName /F 2>&1 | Out-Null
+            Remove-Item $ps1Unc,$outUnc -Force -ErrorAction SilentlyContinue
+        }
+        return $out
+    }
+
+    throw "No remote execution available — WinRM, DCOM and SchedTask all failed. TCP 445 open but no execution path succeeded."
 }
 #endregion
 
