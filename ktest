@@ -1,0 +1,310 @@
+# =============================================================================
+# Test-OTCSConnection.ps1
+# OpenText Content Server 26.1 - Connection & API Diagnostics
+# PowerShell 5.1 compatible
+# Run this BEFORE the main export script to verify connectivity
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION - Update these before running
+# -----------------------------------------------------------------------------
+$BaseUrl  = "https://yourserver/otcs/cs.exe"   # e.g. https://myserver/otcs/cs.exe
+$Username = "admin"
+
+# -----------------------------------------------------------------------------
+# SECURE PASSWORD PROMPT
+# -----------------------------------------------------------------------------
+$securePassword = Read-Host -Prompt "Enter password for '$Username'" -AsSecureString
+$credential     = New-Object System.Management.Automation.PSCredential($Username, $securePassword)
+$Password       = $credential.GetNetworkCredential().Password
+
+# -----------------------------------------------------------------------------
+# SSL - uncomment if using self-signed cert
+# -----------------------------------------------------------------------------
+# Add-Type @"
+# using System.Net;
+# using System.Security.Cryptography.X509Certificates;
+# public class TrustAllCerts : ICertificatePolicy {
+#     public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate,
+#         WebRequest request, int certificateProblem) { return true; }
+# }
+# "@
+# [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
+# [System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
+
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
+
+$script:PassCount = 0
+$script:FailCount = 0
+
+function Write-Header {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host "================================================================" -ForegroundColor DarkCyan
+    Write-Host "  $Title" -ForegroundColor DarkCyan
+    Write-Host "================================================================" -ForegroundColor DarkCyan
+}
+
+function Write-Result {
+    param([string]$Label, [bool]$Success, [string]$Detail = "")
+    if ($Success) {
+        Write-Host "  [PASS] $Label" -ForegroundColor Green
+        $script:PassCount++
+    } else {
+        Write-Host "  [FAIL] $Label" -ForegroundColor Red
+        $script:FailCount++
+    }
+    if ($Detail) {
+        Write-Host "         $Detail" -ForegroundColor Gray
+    }
+}
+
+function Get-RawErrorBody {
+    param($Exception)
+    try {
+        $stream = $Exception.Response.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($stream)
+        $raw    = $reader.ReadToEnd()
+        if ([string]::IsNullOrWhiteSpace($raw)) { return "(empty response body)" }
+        return $raw
+    } catch {
+        return "(could not read response body)"
+    }
+}
+
+function Invoke-TestRequest {
+    param(
+        [string]$Uri,
+        [string]$Method      = "GET",
+        [hashtable]$Headers  = @{},
+        $RequestBody         = $null
+    )
+    $result = [PSCustomObject]@{
+        Success    = $false
+        StatusCode = $null
+        Body       = $null
+        Data       = $null
+        Error      = $null
+    }
+    try {
+        $params = @{
+            Uri         = $Uri
+            Method      = $Method
+            Headers     = $Headers
+            ErrorAction = "Stop"
+        }
+        if ($null -ne $RequestBody) {
+            $params.Body        = $RequestBody
+            $params.ContentType = "application/x-www-form-urlencoded"
+        }
+        $response         = Invoke-RestMethod @params
+        $result.Success   = $true
+        $result.StatusCode = 200
+        $result.Data      = $response
+    }
+    catch {
+        $result.StatusCode = $_.Exception.Response.StatusCode.value__
+        $result.Error      = $_.Exception.Message
+        $result.Body       = Get-RawErrorBody $_.Exception
+    }
+    return $result
+}
+
+# =============================================================================
+# TEST 1 - Basic network connectivity (no auth)
+# =============================================================================
+Write-Header "TEST 1: Basic Network Connectivity"
+Write-Host "  Checking if server is reachable at: $BaseUrl" -ForegroundColor Gray
+
+$r = Invoke-TestRequest -Uri "$BaseUrl/api/v1"
+if ($r.Success) {
+    Write-Result "Server reachable at $BaseUrl/api/v1" $true
+    Write-Host "         Response: $($r.Data | ConvertTo-Json -Depth 2 -Compress)" -ForegroundColor Gray
+} elseif ($r.StatusCode -in @(400, 401, 403)) {
+    # Server responded (even with error) means it's reachable
+    Write-Result "Server reachable (responded with $($r.StatusCode))" $true "This is OK - means the URL is correct"
+} else {
+    Write-Result "Server NOT reachable" $false "Status: $($r.StatusCode) | Error: $($r.Error)"
+    Write-Host ""
+    Write-Host "  Cannot continue - check BaseUrl and network connectivity." -ForegroundColor Red
+    exit 1
+}
+
+# =============================================================================
+# TEST 2 - Authentication methods
+# =============================================================================
+Write-Header "TEST 2: Authentication"
+
+$ticket = $null
+
+# 2a - POST to /api/v1/auth (standard)
+Write-Host "  [2a] Trying POST /api/v1/auth ..." -ForegroundColor Gray
+$authBody = @{ username = $Username; password = $Password }
+$r = Invoke-TestRequest -Uri "$BaseUrl/api/v1/auth" -Method POST -RequestBody $authBody
+if ($r.Success -and $r.Data.ticket) {
+    $ticket = $r.Data.ticket
+    Write-Result "Auth via POST /api/v1/auth" $true "Ticket obtained (length: $($ticket.Length))"
+} else {
+    Write-Result "Auth via POST /api/v1/auth" $false "Status: $($r.StatusCode) | Body: $($r.Body)"
+
+    # 2b - Try /api/v2/auth
+    Write-Host "  [2b] Trying POST /api/v2/auth ..." -ForegroundColor Gray
+    $r = Invoke-TestRequest -Uri "$BaseUrl/api/v2/auth" -Method POST -RequestBody $authBody
+    if ($r.Success -and $r.Data.ticket) {
+        $ticket = $r.Data.ticket
+        Write-Result "Auth via POST /api/v2/auth" $true "Ticket obtained (length: $($ticket.Length))"
+    } else {
+        Write-Result "Auth via POST /api/v2/auth" $false "Status: $($r.StatusCode) | Body: $($r.Body)"
+
+        # 2c - Try livelink.exe path
+        Write-Host "  [2c] Trying livelink.exe path ..." -ForegroundColor Gray
+        $altBase = $BaseUrl -replace "cs\.exe","livelink.exe"
+        $r = Invoke-TestRequest -Uri "$altBase/api/v1/auth" -Method POST -RequestBody $authBody
+        if ($r.Success -and $r.Data.ticket) {
+            $ticket = $r.Data.ticket
+            Write-Result "Auth via livelink.exe/api/v1/auth" $true "Ticket obtained - update BaseUrl to use livelink.exe!"
+            $BaseUrl = $altBase
+        } else {
+            Write-Result "Auth via livelink.exe/api/v1/auth" $false "Status: $($r.StatusCode) | Body: $($r.Body)"
+            Write-Host ""
+            Write-Host "  Cannot continue without a valid ticket." -ForegroundColor Red
+            exit 1
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "  Ticket (first 30 chars): $($ticket.Substring(0, [Math]::Min(30,$ticket.Length)))..." -ForegroundColor Gray
+
+# =============================================================================
+# TEST 3 - Ticket delivery methods
+# =============================================================================
+Write-Header "TEST 3: Ticket Delivery Method"
+
+$headerVariants = @(
+    @{ Name = "OTCSTicket header (mixed case)";  Headers = @{ "OTCSTicket"   = $ticket } },
+    @{ Name = "otcsticket header (lowercase)";   Headers = @{ "otcsticket"   = $ticket } },
+    @{ Name = "OTCS-Ticket header (hyphenated)"; Headers = @{ "OTCS-Ticket"  = $ticket } }
+)
+
+$workingHeader = $null
+foreach ($variant in $headerVariants) {
+    $r = Invoke-TestRequest -Uri "$BaseUrl/api/v1/auth/validate" -Headers $variant.Headers
+    if ($r.Success) {
+        Write-Result $variant.Name $true "Validated OK"
+        $workingHeader = $variant.Headers
+        break
+    } else {
+        # A 400/401 means the server got our request - try members endpoint instead
+        $r2 = Invoke-TestRequest -Uri "$BaseUrl/api/v2/members?limit=1" -Headers $variant.Headers
+        if ($r2.Success -or $r2.StatusCode -eq 400) {
+            Write-Result $variant.Name $true "Server accepted this header format (status: $($r2.StatusCode))"
+            $workingHeader = $variant.Headers
+            break
+        } else {
+            Write-Result $variant.Name $false "Status: $($r.StatusCode)"
+        }
+    }
+}
+
+# Fallback - ticket in query string
+if (-not $workingHeader) {
+    Write-Host "  [Trying ticket as query string parameter] ..." -ForegroundColor Gray
+    $r = Invoke-TestRequest -Uri "$BaseUrl/api/v2/members?limit=1&OTCSTicket=$ticket"
+    if ($r.Success) {
+        Write-Result "OTCSTicket as query string" $true "Use ticket in URL instead of header"
+        $workingHeader = @{}   # no header needed
+    } else {
+        Write-Result "OTCSTicket as query string" $false "Status: $($r.StatusCode) | Body: $($r.Body)"
+    }
+}
+
+if (-not $workingHeader) {
+    Write-Host ""
+    Write-Host "  No working ticket delivery method found." -ForegroundColor Red
+    exit 1
+}
+
+$headers = $workingHeader
+
+# =============================================================================
+# TEST 4 - Members endpoint variants
+# =============================================================================
+Write-Header "TEST 4: Members Endpoint (Users & Groups)"
+
+$endpointTests = @(
+    @{ Label = "GET /api/v2/members?where_type=0 (users)";       Uri = "$BaseUrl/api/v2/members?where_type=0&limit=5" },
+    @{ Label = "GET /api/v2/members?where_type=1 (groups)";      Uri = "$BaseUrl/api/v2/members?where_type=1&limit=5" },
+    @{ Label = "GET /api/v1/members?type=0 (v1 users)";          Uri = "$BaseUrl/api/v1/members?type=0&limit=5" },
+    @{ Label = "GET /api/v1/members?type=1 (v1 groups)";         Uri = "$BaseUrl/api/v1/members?type=1&limit=5" },
+    @{ Label = "GET /api/v2/members (no filter)";                 Uri = "$BaseUrl/api/v2/members?limit=5" },
+    @{ Label = "GET /api/v1/members (no filter)";                 Uri = "$BaseUrl/api/v1/members?limit=5" }
+)
+
+$workingEndpoints = @()
+foreach ($test in $endpointTests) {
+    $r = Invoke-TestRequest -Uri $test.Uri -Headers $headers
+    if ($r.Success) {
+        $count = 0
+        if ($r.Data.results)       { $count = $r.Data.results.Count }
+        elseif ($r.Data.data)      { $count = $r.Data.data.Count }
+        Write-Result $test.Label $true "Returned $count record(s)"
+        $workingEndpoints += $test
+    } else {
+        Write-Result $test.Label $false "Status: $($r.StatusCode) | Body: $($r.Body)"
+    }
+}
+
+# =============================================================================
+# TEST 5 - Inspect response shape of first working endpoint
+# =============================================================================
+if ($workingEndpoints.Count -gt 0) {
+    Write-Header "TEST 5: Response Shape Inspection"
+    $best = $workingEndpoints[0]
+    Write-Host "  Inspecting response from: $($best.Uri)" -ForegroundColor Gray
+
+    $r = Invoke-TestRequest -Uri $best.Uri -Headers $headers
+    if ($r.Success) {
+        $json = $r.Data | ConvertTo-Json -Depth 6
+        Write-Host ""
+        Write-Host "--- RAW RESPONSE (first working endpoint) ---" -ForegroundColor Yellow
+        Write-Host $json
+        Write-Host "---------------------------------------------" -ForegroundColor Yellow
+
+        # Check response shape
+        if ($r.Data.results)  { Write-Result "Response uses 'results' array"      $true "Shape: results[].data.properties" }
+        if ($r.Data.data)     { Write-Result "Response uses 'data' array"          $true "Shape: data[]" }
+        if ($r.Data.members)  { Write-Result "Response uses 'members' array"       $true "Shape: members[]" }
+    }
+} else {
+    Write-Header "TEST 5: Response Shape Inspection"
+    Write-Host "  Skipped - no working endpoints found in Test 4." -ForegroundColor Yellow
+}
+
+# =============================================================================
+# SUMMARY
+# =============================================================================
+Write-Header "DIAGNOSTIC SUMMARY"
+Write-Host "  PASSED : $($script:PassCount)" -ForegroundColor Green
+Write-Host "  FAILED : $($script:FailCount)" -ForegroundColor Red
+Write-Host ""
+if ($ticket) {
+    Write-Host "  Working ticket  : YES (length $($ticket.Length))" -ForegroundColor Green
+} else {
+    Write-Host "  Working ticket  : NO" -ForegroundColor Red
+}
+if ($workingEndpoints.Count -gt 0) {
+    Write-Host "  Working endpoints found: $($workingEndpoints.Count)" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  Use these settings in the main script:" -ForegroundColor Yellow
+    foreach ($ep in $workingEndpoints) {
+        Write-Host "    $($ep.Uri)" -ForegroundColor White
+    }
+} else {
+    Write-Host "  Working endpoints found: NONE" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Recommendation: Check with your OTCS admin for the correct API path." -ForegroundColor Yellow
+}
+Write-Host ""
