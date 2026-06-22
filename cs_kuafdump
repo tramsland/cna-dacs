@@ -70,9 +70,9 @@ function Get-ResponseBody {
 function Invoke-OTCSRequest {
     param(
         [string]$Uri,
-        [string]$Method  = "GET",
+        [string]$Method     = "GET",
         [hashtable]$Headers,
-        [hashtable]$Body  = $null
+        $RequestBody        = $null    # loosely typed - avoids string/hashtable conflicts
     )
     try {
         $params = @{
@@ -81,17 +81,17 @@ function Invoke-OTCSRequest {
             Headers     = $Headers
             ErrorAction = "Stop"
         }
-        if ($Body) {
-            $params.Body        = $Body
+        if ($null -ne $RequestBody) {
+            $params.Body        = $RequestBody
             $params.ContentType = "application/x-www-form-urlencoded"
         }
         return Invoke-RestMethod @params
     }
     catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        $body       = Get-ResponseBody $_.Exception
+        $statusCode  = $_.Exception.Response.StatusCode.value__
+        $errDetail   = Get-ResponseBody $_.Exception
         Write-Log "API call failed [$statusCode]: $Uri" "ERROR"
-        Write-Log "  Response body: $body" "ERROR"
+        Write-Log "  Response body: $errDetail" "ERROR"
         return $null
     }
 }
@@ -128,10 +128,10 @@ function Get-OTCSTicket {
     Write-Log "Authenticating as '$($Config.Username)' on $($Config.BaseUrl)" "INFO"
 
     $uri  = "$($Config.BaseUrl)/api/v1/auth"
-    $body = @{ username = $Config.Username; password = $Config.Password }
+    $authBody = @{ username = $Config.Username; password = $Config.Password }
 
     try {
-        $response = Invoke-RestMethod -Uri $uri -Method POST -Body $body -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $uri -Method POST -Body $authBody -ErrorAction Stop
         if ($response.ticket) {
             Write-Log "Authentication successful." "SUCCESS"
             return $response.ticket
@@ -141,9 +141,9 @@ function Get-OTCSTicket {
     }
     catch {
         $statusCode = $_.Exception.Response.StatusCode.value__
-        $body       = Get-ResponseBody $_.Exception
+        $errDetail  = Get-ResponseBody $_.Exception
         Write-Log "Authentication failed [$statusCode]: $($_.Exception.Message)" "ERROR"
-        Write-Log "  Response body: $body" "ERROR"
+        Write-Log "  Response body: $errDetail" "ERROR"
         return $null
     }
 }
