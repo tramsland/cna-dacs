@@ -8,18 +8,18 @@
 # CONFIGURATION - Update these values before running
 # -----------------------------------------------------------------------------
 $Config = @{
-    BaseUrl         = "https://yourserver/otcs/cs.exe"   # Base OTCS URL
-    Username        = "admin"                              # OTCS username
-    SkipSSLCheck    = $false                               # Set $true for self-signed certs
-    OutputFolder    = "C:\OTCS_Export"                     # Folder for CSV output
-    PageSize        = 100                                  # Results per page (max 100)
+    BaseUrl      = "https://yourserver/otcs/cs.exe"   # Base OTCS URL
+    Username     = "admin"                             # OTCS username
+    SkipSSLCheck = $false                              # Set $true for self-signed certs
+    OutputFolder = "C:\OTCS_Export"                    # Folder for CSV output
+    PageSize     = 100                                 # Results per page (max 100)
 }
 
 # -----------------------------------------------------------------------------
 # SECURE PASSWORD PROMPT
 # -----------------------------------------------------------------------------
-$securePassword = Read-Host -Prompt "Enter password for '$($Config.Username)'" -AsSecureString
-$credential     = New-Object System.Management.Automation.PSCredential($Config.Username, $securePassword)
+$securePassword  = Read-Host -Prompt "Enter password for '$($Config.Username)'" -AsSecureString
+$credential      = New-Object System.Management.Automation.PSCredential($Config.Username, $securePassword)
 $Config.Password = $credential.GetNetworkCredential().Password
 
 # -----------------------------------------------------------------------------
@@ -37,126 +37,78 @@ public class TrustAllCerts : ICertificatePolicy {
 }
 "@
     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCerts
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    [System.Net.ServicePointManager]::SecurityProtocol  = [System.Net.SecurityProtocolType]::Tls12
 }
 
 # -----------------------------------------------------------------------------
-# HELPER FUNCTIONS
+# HELPERS
 # -----------------------------------------------------------------------------
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $color = switch ($Level) {
-        "INFO"    { "Cyan" }
-        "SUCCESS" { "Green" }
+        "INFO"    { "Cyan"   }
+        "SUCCESS" { "Green"  }
         "WARN"    { "Yellow" }
-        "ERROR"   { "Red" }
-        default   { "White" }
+        "ERROR"   { "Red"    }
+        default   { "White"  }
     }
     Write-Host "[$timestamp][$Level] $Message" -ForegroundColor $color
+}
+
+function Get-ResponseBody {
+    # Reads the raw body from a failed WebException for better error detail
+    param($Exception)
+    try {
+        $stream = $Exception.Response.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($stream)
+        return $reader.ReadToEnd()
+    } catch { return "(unable to read response body)" }
 }
 
 function Invoke-OTCSRequest {
     param(
         [string]$Uri,
-        [string]$Method = "GET",
+        [string]$Method  = "GET",
         [hashtable]$Headers,
-        [hashtable]$Body = $null
+        [hashtable]$Body  = $null
     )
     try {
         $params = @{
             Uri         = $Uri
             Method      = $Method
             Headers     = $Headers
-            ContentType = "application/x-www-form-urlencoded"
             ErrorAction = "Stop"
         }
-        if ($Body) { $params.Body = $Body }
-
-        $response = Invoke-RestMethod @params
-        return $response
+        if ($Body) {
+            $params.Body        = $Body
+            $params.ContentType = "application/x-www-form-urlencoded"
+        }
+        return Invoke-RestMethod @params
     }
     catch {
         $statusCode = $_.Exception.Response.StatusCode.value__
-        Write-Log "API call failed [$statusCode]: $Uri - $($_.Exception.Message)" "ERROR"
+        $body       = Get-ResponseBody $_.Exception
+        Write-Log "API call failed [$statusCode]: $Uri" "ERROR"
+        Write-Log "  Response body: $body" "ERROR"
         return $null
     }
 }
 
-function Get-OTCSTicket {
-    param([hashtable]$Config)
-
-    Write-Log "Authenticating to Content Server: $($Config.BaseUrl)" "INFO"
-
-    $authUri  = "$($Config.BaseUrl)/api/v1/auth"
-    $authBody = @{
-        username = $Config.Username
-        password = $Config.Password
+function Get-PropValue {
+    # Safely navigate nested OTCS response shapes:
+    #   results[].data.properties  (v2 standard)
+    #   results[].data             (v2 flat)
+    #   item directly              (v1)
+    param($Item)
+    if ($Item.PSObject.Properties["data"]) {
+        $d = $Item.data
+        if ($d.PSObject.Properties["properties"]) { return $d.properties }
+        return $d
     }
-
-    try {
-        $response = Invoke-RestMethod -Uri $authUri -Method POST -Body $authBody -ErrorAction Stop
-        if ($response.ticket) {
-            Write-Log "Authentication successful. Ticket obtained." "SUCCESS"
-            return $response.ticket
-        }
-        else {
-            Write-Log "Authentication response received but no ticket found." "ERROR"
-            return $null
-        }
-    }
-    catch {
-        Write-Log "Authentication failed: $($_.Exception.Message)" "ERROR"
-        return $null
-    }
-}
-
-function Get-AllPages {
-    <#
-    .SYNOPSIS
-        Handles paged API responses, iterating until all records are retrieved.
-    #>
-    param(
-        [string]$BaseUri,
-        [hashtable]$Headers,
-        [int]$PageSize = 100
-    )
-
-    $allResults = @()
-    $page = 1
-
-    do {
-        $pagedUri = "$BaseUri&limit=$PageSize&page=$page"
-        Write-Log "  Fetching page $page from: $pagedUri" "INFO"
-        $response = Invoke-OTCSRequest -Uri $pagedUri -Headers $Headers
-
-        if (-not $response) { break }
-
-        # Handle both v1 and v2 response shapes
-        if ($response.data) {
-            $items = $response.data
-        }
-        elseif ($response.results) {
-            $items = $response.results
-        }
-        else {
-            break
-        }
-
-        if ($items.Count -eq 0) { break }
-
-        $allResults += $items
-        Write-Log "  Page $page returned $($items.Count) records (total so far: $($allResults.Count))" "INFO"
-
-        # If fewer results than page size, we're done
-        if ($items.Count -lt $PageSize) { break }
-
-        $page++
-
-    } while ($true)
-
-    return $allResults
+    if ($Item.PSObject.Properties["properties"]) { return $Item.properties }
+    return $Item
 }
 
 function Ensure-OutputFolder {
@@ -168,133 +120,164 @@ function Ensure-OutputFolder {
 }
 
 # -----------------------------------------------------------------------------
-# MAIN DATA RETRIEVAL FUNCTIONS
+# AUTHENTICATION
+# -----------------------------------------------------------------------------
+
+function Get-OTCSTicket {
+    param([hashtable]$Config)
+    Write-Log "Authenticating as '$($Config.Username)' on $($Config.BaseUrl)" "INFO"
+
+    $uri  = "$($Config.BaseUrl)/api/v1/auth"
+    $body = @{ username = $Config.Username; password = $Config.Password }
+
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method POST -Body $body -ErrorAction Stop
+        if ($response.ticket) {
+            Write-Log "Authentication successful." "SUCCESS"
+            return $response.ticket
+        }
+        Write-Log "Auth response had no ticket. Response: $($response | ConvertTo-Json -Depth 3)" "ERROR"
+        return $null
+    }
+    catch {
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        $body       = Get-ResponseBody $_.Exception
+        Write-Log "Authentication failed [$statusCode]: $($_.Exception.Message)" "ERROR"
+        Write-Log "  Response body: $body" "ERROR"
+        return $null
+    }
+}
+
+# -----------------------------------------------------------------------------
+# DATA RETRIEVAL
 # -----------------------------------------------------------------------------
 
 function Get-OTCSUsers {
     param([hashtable]$Headers, [string]$BaseUrl, [int]$PageSize)
-
-    Write-Log "Retrieving all users..." "INFO"
-
-    $uri = "$BaseUrl/api/v2/members?where_type=0&$"   # type 0 = users
-    # Use search endpoint for users
-    $uri = "$BaseUrl/api/v2/members?where_type=0&fields=properties&"
+    Write-Log "--- Retrieving Users ---" "INFO"
 
     $allUsers = @()
-    $page = 1
+    $page     = 1
 
     do {
-        $pagedUri = "$BaseUrl/api/v2/members?where_type=0&fields=properties&limit=$PageSize&page=$page"
-        $response = Invoke-OTCSRequest -Uri $pagedUri -Headers $Headers
-
+        # where_type=0 → Users only
+        $uri      = "$BaseUrl/api/v2/members?where_type=0&limit=$PageSize&page=$page"
+        Write-Log "  GET $uri" "INFO"
+        $response = Invoke-OTCSRequest -Uri $uri -Headers $Headers
         if (-not $response) { break }
 
-        $items = if ($response.results) { $response.results } elseif ($response.data) { $response.data } else { $null }
-        if (-not $items -or $items.Count -eq 0) { break }
+        $items = if ($response.results) { $response.results }
+                 elseif ($response.data) { $response.data }
+                 else { $null }
+
+        if (-not $items -or $items.Count -eq 0) {
+            Write-Log "  No more users on page $page." "INFO"
+            break
+        }
 
         foreach ($item in $items) {
-            $props = if ($item.data.properties) { $item.data.properties } else { $item }
+            $p = Get-PropValue $item
             $allUsers += [PSCustomObject]@{
-                ID           = $props.id
-                LoginName    = $props.name
-                DisplayName  = $props.display_name
-                FirstName    = $props.first_name
-                LastName     = $props.last_name
-                Email        = $props.business_email
-                Department   = $props.group_id
-                Type         = "User"
-                Enabled      = -not $props.deleted
-                CreatedDate  = $props.create_date
-                ModifiedDate = $props.modify_date
+                ID           = $p.id
+                LoginName    = $p.name
+                DisplayName  = $p.display_name
+                FirstName    = $p.first_name
+                LastName     = $p.last_name
+                Email        = $p.business_email
+                GroupID      = $p.group_id
+                Enabled      = if ($null -ne $p.deleted) { -not $p.deleted } else { $true }
+                CreatedDate  = $p.create_date
+                ModifiedDate = $p.modify_date
             }
         }
 
-        Write-Log "  Users page $page : $($items.Count) records" "INFO"
+        Write-Log "  Page $page : $($items.Count) users (running total: $($allUsers.Count))" "INFO"
         if ($items.Count -lt $PageSize) { break }
         $page++
 
     } while ($true)
 
-    Write-Log "Total users retrieved: $($allUsers.Count)" "SUCCESS"
+    Write-Log "Total users: $($allUsers.Count)" "SUCCESS"
     return $allUsers
 }
 
 function Get-OTCSGroups {
     param([hashtable]$Headers, [string]$BaseUrl, [int]$PageSize)
-
-    Write-Log "Retrieving all groups..." "INFO"
+    Write-Log "--- Retrieving Groups ---" "INFO"
 
     $allGroups = @()
-    $page = 1
+    $page      = 1
 
     do {
-        $pagedUri = "$BaseUrl/api/v2/members?where_type=1&fields=properties&limit=$PageSize&page=$page"
-        $response = Invoke-OTCSRequest -Uri $pagedUri -Headers $Headers
-
+        # where_type=1 → Groups only
+        $uri      = "$BaseUrl/api/v2/members?where_type=1&limit=$PageSize&page=$page"
+        Write-Log "  GET $uri" "INFO"
+        $response = Invoke-OTCSRequest -Uri $uri -Headers $Headers
         if (-not $response) { break }
 
-        $items = if ($response.results) { $response.results } elseif ($response.data) { $response.data } else { $null }
-        if (-not $items -or $items.Count -eq 0) { break }
+        $items = if ($response.results) { $response.results }
+                 elseif ($response.data) { $response.data }
+                 else { $null }
+
+        if (-not $items -or $items.Count -eq 0) {
+            Write-Log "  No more groups on page $page." "INFO"
+            break
+        }
 
         foreach ($item in $items) {
-            $props = if ($item.data.properties) { $item.data.properties } else { $item }
+            $p = Get-PropValue $item
             $allGroups += [PSCustomObject]@{
-                ID           = $props.id
-                Name         = $props.name
-                DisplayName  = $props.display_name
-                Type         = "Group"
-                CreatedDate  = $props.create_date
-                ModifiedDate = $props.modify_date
+                ID           = $p.id
+                Name         = $p.name
+                DisplayName  = $p.display_name
+                CreatedDate  = $p.create_date
+                ModifiedDate = $p.modify_date
             }
         }
 
-        Write-Log "  Groups page $page : $($items.Count) records" "INFO"
+        Write-Log "  Page $page : $($items.Count) groups (running total: $($allGroups.Count))" "INFO"
         if ($items.Count -lt $PageSize) { break }
         $page++
 
     } while ($true)
 
-    Write-Log "Total groups retrieved: $($allGroups.Count)" "SUCCESS"
+    Write-Log "Total groups: $($allGroups.Count)" "SUCCESS"
     return $allGroups
 }
 
 function Get-OTCSGroupMemberships {
-    param(
-        [hashtable]$Headers,
-        [string]$BaseUrl,
-        [array]$Groups,
-        [int]$PageSize
-    )
-
-    Write-Log "Retrieving group memberships for $($Groups.Count) groups..." "INFO"
+    param([hashtable]$Headers, [string]$BaseUrl, [array]$Groups, [int]$PageSize)
+    Write-Log "--- Retrieving Group Memberships for $($Groups.Count) groups ---" "INFO"
 
     $allMemberships = @()
 
     foreach ($group in $Groups) {
-        Write-Log "  Getting members of group: '$($group.Name)' (ID: $($group.ID))" "INFO"
-
+        Write-Log "  Group: '$($group.Name)' (ID: $($group.ID))" "INFO"
         $page = 1
-        do {
-            $uri = "$BaseUrl/api/v2/members/$($group.ID)/members?fields=properties&limit=$PageSize&page=$page"
-            $response = Invoke-OTCSRequest -Uri $uri -Headers $Headers
 
+        do {
+            $uri      = "$BaseUrl/api/v2/members/$($group.ID)/members?limit=$PageSize&page=$page"
+            $response = Invoke-OTCSRequest -Uri $uri -Headers $Headers
             if (-not $response) { break }
 
-            $items = if ($response.results) { $response.results } elseif ($response.data) { $response.data } else { $null }
+            $items = if ($response.results) { $response.results }
+                     elseif ($response.data) { $response.data }
+                     else { $null }
+
             if (-not $items -or $items.Count -eq 0) { break }
 
             foreach ($member in $items) {
-                $props = if ($member.data.properties) { $member.data.properties } else { $member }
-                $memberType = if ($props.type -eq 1) { "Group" } else { "User" }
+                $p          = Get-PropValue $member
+                $memberType = if ($p.type -eq 1) { "Group" } else { "User" }
 
                 $allMemberships += [PSCustomObject]@{
-                    GroupID      = $group.ID
-                    GroupName    = $group.Name
-                    MemberID     = $props.id
-                    MemberName   = $props.name
-                    MemberType   = $memberType
-                    DisplayName  = $props.display_name
-                    Email        = $props.business_email
+                    GroupID     = $group.ID
+                    GroupName   = $group.Name
+                    MemberID    = $p.id
+                    MemberName  = $p.name
+                    MemberType  = $memberType
+                    DisplayName = $p.display_name
+                    Email       = $p.business_email
                 }
             }
 
@@ -304,25 +287,21 @@ function Get-OTCSGroupMemberships {
         } while ($true)
     }
 
-    Write-Log "Total membership records retrieved: $($allMemberships.Count)" "SUCCESS"
+    Write-Log "Total membership records: $($allMemberships.Count)" "SUCCESS"
     return $allMemberships
 }
 
 # -----------------------------------------------------------------------------
-# OUTPUT FUNCTIONS
+# OUTPUT
 # -----------------------------------------------------------------------------
 
 function Write-ConsoleReport {
-    param(
-        [array]$Users,
-        [array]$Groups,
-        [array]$Memberships
-    )
+    param([array]$Users, [array]$Groups, [array]$Memberships)
 
     Write-Host ""
     Write-Host "================================================================" -ForegroundColor Magenta
-    Write-Host "  OPENTEXT CONTENT SERVER - USERS & GROUPS REPORT" -ForegroundColor Magenta
-    Write-Host "  Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Magenta
+    Write-Host "  OPENTEXT CONTENT SERVER - USERS & GROUPS REPORT"               -ForegroundColor Magenta
+    Write-Host "  Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"          -ForegroundColor Magenta
     Write-Host "================================================================" -ForegroundColor Magenta
 
     Write-Host ""
@@ -341,63 +320,58 @@ function Write-ConsoleReport {
 }
 
 function Export-ToCSV {
-    param(
-        [array]$Users,
-        [array]$Groups,
-        [array]$Memberships,
-        [string]$OutputFolder
-    )
+    param([array]$Users, [array]$Groups, [array]$Memberships, [string]$OutputFolder)
 
-    $timestamp    = Get-Date -Format "yyyyMMdd_HHmmss"
-    $usersFile    = Join-Path $OutputFolder "Users_$timestamp.csv"
-    $groupsFile   = Join-Path $OutputFolder "Groups_$timestamp.csv"
-    $membersFile  = Join-Path $OutputFolder "GroupMemberships_$timestamp.csv"
+    $ts          = Get-Date -Format "yyyyMMdd_HHmmss"
+    $usersFile   = Join-Path $OutputFolder "Users_$ts.csv"
+    $groupsFile  = Join-Path $OutputFolder "Groups_$ts.csv"
+    $membersFile = Join-Path $OutputFolder "GroupMemberships_$ts.csv"
 
     $Users       | Export-Csv -Path $usersFile   -NoTypeInformation -Encoding UTF8
     $Groups      | Export-Csv -Path $groupsFile  -NoTypeInformation -Encoding UTF8
     $Memberships | Export-Csv -Path $membersFile -NoTypeInformation -Encoding UTF8
 
-    Write-Log "CSV files exported:" "SUCCESS"
-    Write-Log "  Users       -> $usersFile" "SUCCESS"
-    Write-Log "  Groups      -> $groupsFile" "SUCCESS"
+    Write-Log "CSV exports:" "SUCCESS"
+    Write-Log "  Users       -> $usersFile"   "SUCCESS"
+    Write-Log "  Groups      -> $groupsFile"  "SUCCESS"
     Write-Log "  Memberships -> $membersFile" "SUCCESS"
 }
 
 # -----------------------------------------------------------------------------
-# MAIN EXECUTION
+# MAIN
 # -----------------------------------------------------------------------------
 
-Write-Log "Starting OpenText Content Server export..." "INFO"
-Write-Log "Target: $($Config.BaseUrl)" "INFO"
+Write-Log "========================================" "INFO"
+Write-Log " OpenText Content Server 26.1 Export"    "INFO"
+Write-Log " Target: $($Config.BaseUrl)"              "INFO"
+Write-Log "========================================" "INFO"
 
-# Ensure output folder exists
 Ensure-OutputFolder -Path $Config.OutputFolder
 
-# Step 1: Authenticate
+# Step 1 - Authenticate
 $ticket = Get-OTCSTicket -Config $Config
 if (-not $ticket) {
-    Write-Log "Cannot proceed without a valid authentication ticket. Exiting." "ERROR"
+    Write-Log "Cannot continue without a valid ticket. Check credentials and URL." "ERROR"
     exit 1
 }
-
 $headers = @{ "OTCSTicket" = $ticket }
 
-# Step 2: Get all users
+# Step 2 - Users
 $users = Get-OTCSUsers -Headers $headers -BaseUrl $Config.BaseUrl -PageSize $Config.PageSize
 
-# Step 3: Get all groups
+# Step 3 - Groups
 $groups = Get-OTCSGroups -Headers $headers -BaseUrl $Config.BaseUrl -PageSize $Config.PageSize
 
-# Step 4: Get group memberships
+# Step 4 - Memberships
 $memberships = @()
 if ($groups.Count -gt 0) {
     $memberships = Get-OTCSGroupMemberships -Headers $headers -BaseUrl $Config.BaseUrl -Groups $groups -PageSize $Config.PageSize
 }
 
-# Step 5: Output to console
+# Step 5 - Console report
 Write-ConsoleReport -Users $users -Groups $groups -Memberships $memberships
 
-# Step 6: Export to CSV
+# Step 6 - CSV export
 Export-ToCSV -Users $users -Groups $groups -Memberships $memberships -OutputFolder $Config.OutputFolder
 
 Write-Log "Export complete!" "SUCCESS"
